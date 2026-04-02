@@ -1,4 +1,5 @@
-## Voxel Research & Investigation## Core References
+## Voxel Research & Investigation
+## Core References
 
 * Voxely Blog: Focuses on voxel-based global illumination and engine architecture.
 * Inigo Quilez (IQ) Articles: Essential for SDF (Signed Distance Field) math and ray-marching optimizations.
