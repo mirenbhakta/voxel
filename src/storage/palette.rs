@@ -12,14 +12,15 @@ use crate::storage::{FromVoxelStream, IntoVoxelStream};
 
 /// Palette-compressed voxel storage.
 ///
-/// A table of unique values paired with a per-voxel index array. Effective
-/// when the number of distinct values is much smaller than the total voxel
-/// count.
+/// A table of unique values paired with a per-voxel `u8` index array,
+/// supporting up to 256 unique values. Effective when the number of distinct
+/// values is small relative to the total voxel count. When the unique count
+/// exceeds 256, the chunk should be stored in a different format.
 pub struct Palette<S: VoxelIndexer, T> {
     /// The unique values.
     entries : Vec<T>,
     /// Per-voxel index into `entries`.
-    indices : Vec<u16>,
+    indices : Vec<u8>,
     /// The indexing strategy.
     _marker : PhantomData<S>,
 }
@@ -53,7 +54,7 @@ pub struct PaletteIter<T> {
     /// The shared palette entries.
     entries : Vec<T>,
     /// The remaining indices to resolve.
-    indices : std::vec::IntoIter<u16>,
+    indices : std::vec::IntoIter<u8>,
 }
 
 impl<T: Clone> Iterator for PaletteIter<T> {
@@ -96,14 +97,18 @@ impl<S: VoxelIndexer, T: Eq + std::hash::Hash + Clone> FromVoxelStream for Palet
     ) -> Self
     {
         let mut entries = Vec::new();
-        let mut map: HashMap<T, u16> = HashMap::new();
+        let mut map: HashMap<T, u8> = HashMap::new();
         let mut indices = Vec::with_capacity(count);
 
         for value in stream.take(count) {
             let idx = match map.get(&value) {
                 Some(&idx) => idx,
                 None => {
-                    let idx = entries.len() as u16;
+                    assert!(
+                        entries.len() < 256,
+                        "palette overflow: more than 256 unique values",
+                    );
+                    let idx = entries.len() as u8;
                     map.insert(value.clone(), idx);
                     entries.push(value);
                     idx
