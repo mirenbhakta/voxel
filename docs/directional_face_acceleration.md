@@ -2,8 +2,9 @@
 
 A surface representation and rendering architecture for voxel worlds that
 exploits the axis-aligned nature of voxel faces. Surfaces are derived from
-occupancy bitmasks, stored as directional face bitmasks, and rendered via
-indirect rasterization with no traditional mesh generation step.
+occupancy bitmasks, merged into greedy quads by a GPU compute shader, and
+rendered via indirect rasterization with per-pixel material lookup from a
+volumetric palette.
 
 
 ## Problem
@@ -117,7 +118,22 @@ A 32x32x32 chunk stores its voxel occupancy as a bitmask:
 
     32 layers x 32x32 bits = 32 x 128 bytes = 4 KB per chunk
 
-This is the only authored data. Everything below is derived from it.
+This is the only authored geometry data. Everything below is derived from it.
+
+### Source of Truth: Volumetric Material
+
+A 32x32x32 byte array storing palette indices. 32 KB per chunk. Each entry
+is a local palette index (0-255) that maps to a global block ID through the
+chunk's local palette.
+
+The local palette allows the global block ID domain to be arbitrarily wide
+(16-bit, 32-bit, or larger) while per-voxel storage cost stays at 1 byte.
+A chunk with fewer than 256 distinct materials -- the common case -- pays
+no more than 1 byte per voxel regardless of the global ID space.
+
+The volumetric material array is persistent on GPU. The fragment shader
+reads material directly from this array using world-space position. The
+build compute shader also reads it during the greedy merge step.
 
 ### Derived: Directional Face Bitmasks
 
@@ -139,54 +155,53 @@ algorithm.
 Per direction: 32 layers x 32x32 bits = 4 KB.
 All 6 directions: ~24 KB per chunk.
 
+These bitmasks serve dual purpose: input to the greedy merge during the
+build step, and acceleration structure for ray traversal.
+
 Edge case: the last layer (e.g., x=31) requires the neighboring chunk's x=0
 slice for the boundary comparison. One 32x32 bitmask fetch from the neighbor.
-
-### Derived: Layer Face Counts
-
-Precomputed popcount per layer, per direction:
-
-    layer_face_count[layer] = popcount(face_bitmask[layer])
-
-Per direction: 32 x u16 = 64 bytes.
-All 6 directions: 384 bytes per chunk.
-
-Recomputed only for affected layers when a voxel changes.
 
 ### Derived: Layer Occupancy
 
 A single u32 per direction indicating which of the 32 layers have any faces:
 
-    layer_occupancy = bitwise OR of (layer_face_count[i] != 0) for each layer
+    layer_occupancy = bitwise OR reduction of face_bitmask words per layer
 
-6 x u32 = 24 bytes per chunk. Used for fast layer skipping (findFirstBit).
+6 x u32 = 24 bytes per chunk. Used for fast layer skipping (findFirstBit)
+during ray traversal.
 
-### Derived: Layer Prefix Sums
+### Derived: Quad Buffer
 
-Prefix sum of layer face counts, per direction:
+Produced by the build step's greedy merge. Each entry is a packed quad
+descriptor encoding position and extent:
 
-    prefix[dir][0] = 0
-    prefix[dir][i] = prefix[dir][i-1] + layer_face_count[dir][i-1]
+    position:  col 5 bits, row 5 bits, layer 5 bits
+    extent:    width-1 5 bits, height-1 5 bits
+    total:     25 bits, fits in a u32 with room to spare
 
-Per direction: 32 x u32 = 128 bytes.
-All 6 directions: 768 bytes per chunk.
+Organized by chunk and direction. Direction is implicit from the draw
+command metadata (gl_DrawID), not stored per quad.
 
-Used by the vertex shader to binary-search from instance ID to layer index.
-Recomputed only for affected directions when a voxel changes.
+Variable size per chunk-direction pair but bounded. Each 32x32 layer
+contains at most 1024 faces pre-merge; the greedy merge reduces this
+substantially. A flat wall merges to a single quad. Typical chunks
+produce a few KB of quad data.
 
 
 ### Total GPU-Side Data Per Chunk
 
-    Occupancy:            4 KB  (source, also needed for game logic)
-    Face bitmasks:       24 KB  (6 directions)
-    Layer face counts:  384 B   (6 directions)
-    Layer prefix sums:  768 B   (6 directions)
-    Layer occupancy:     24 B   (6 directions)
+    Occupancy:            4 KB   (source, ray traversal + game logic)
+    Volumetric material: 32 KB   (source, palette-indexed)
+    Face bitmasks:       24 KB   (6 directions, ray traversal + build)
+    Layer occupancy:     24 B    (6 directions, ray traversal)
+    Quad buffer:         variable (greedy-merged, typically a few KB)
     ────────────────────────────
-    Total:              ~29 KB
+    Fixed total:        ~60 KB + quad buffer
 
-Constant regardless of geometric complexity.
-For 256 loaded chunks: ~7.5 MB.
+For 256 loaded chunks: ~15 MB fixed + quad buffers.
+
+Ray traversal uses a subset of this data: occupancy (4 KB), face bitmasks
+(24 KB), and layer occupancy (24 B) -- roughly 28 KB per chunk.
 
 
 ## Rendering Pipeline
@@ -197,50 +212,153 @@ The traditional voxel pipeline is:
 
     occupancy -> mesh generation -> vertex/index buffers -> render
 
-This architecture eliminates mesh generation entirely:
+This architecture eliminates traditional mesh generation:
 
-    occupancy -> face bitmasks -> render
+    occupancy -> face bitmasks -> greedy merge -> quad buffer -> render
 
-There are no vertex buffers, no index buffers, no mesh data. The face bitmasks
-are the renderable representation. The GPU reads them directly.
+There are no vertex buffers, no index buffers, no mesh data in the
+conventional sense. The quad buffer is a flat array of packed descriptors
+produced by a compute shader. The face bitmasks are an intermediate form
+consumed by the build step, not a renderable representation.
 
-### Indirect Rasterization
+### Build Step (On Edit)
 
-A compute shader prepares draw commands by summing the precomputed layer face
-counts:
+A compute shader runs when chunk occupancy changes. It performs:
 
-    Per chunk, per direction:
-      total_faces = sum(layer_face_count[0..31])
-      if total_faces > 0:
-        emit indirect draw entry
+1. Read the occupancy bitmask.
+2. Derive face bitmasks via AND-NOT between adjacent layers (same as before,
+   including X-direction bit shift + shared memory transpose).
+3. Perform material-agnostic greedy merge on the face bitmasks.
+4. Write packed quad descriptors to the quad buffer.
+5. Compute layer occupancy from the face bitmasks (for ray traversal).
 
-The vertex/mesh shader maps an instance ID to a specific face by walking the
-bitmask: prefix sum of popcounts identifies the layer, then bit scan within
-the layer identifies the position. From direction + layer index + bit position,
-the world-space quad vertices are trivially computed.
+The greedy merge operates purely on geometry -- it does not consider material
+boundaries. This is possible because material is resolved per-pixel in the
+fragment shader via volumetric lookup, not per-quad. The merge produces
+maximally large quads regardless of material distribution. A 32x32 flat wall
+of 5 different materials merges into a single quad.
 
-### Single Multi-Draw-Indirect
+For local edits, the rebuild can be scoped to 4x4x4 subchunk blocks. Only
+the affected face layers and quad buffer regions need recomputation. A
+single voxel edit touches a few KB of data.
 
-All visible chunk-direction pairs are batched into a single MultiDrawIndirect
-call. The compute shader writes one draw command per non-empty chunk-direction
-pair and atomically increments the draw count.
+### Filter Step (Per Frame)
 
-The entire renderer is two GPU commands per frame:
+A compute shader runs each frame to determine visibility:
 
-    1. Compute dispatch: sum layer counts, write indirect buffer
-    2. MultiDrawIndirect: render everything
+1. For each chunk, test against the view frustum (AABB test).
+2. For each direction, backface test (dot product with view direction).
+3. Hierarchical Z-buffer occlusion culling.
+
+Hi-Z culling is particularly effective here because all geometry is
+axis-aligned quads. In a general pipeline, Hi-Z tests project bounding
+boxes (8 corners) to get a conservative screen-space rectangle. With
+axis-aligned quads, the geometry IS its own bound. Each chunk-direction
+pair covers a planar slab -- 4 coplanar corners, exact screen-space
+projection, single depth value. No conservative approximation needed.
+
+For each visible chunk-direction pair, the filter shader emits one
+MultiDrawIndirect command pointing into the quad buffer.
+
+### Render Step (Per Frame)
+
+The vertex shader reads a packed quad descriptor from the quad buffer,
+unpacks position and extent, and expands to 6 vertices (two triangles).
+Direction comes from draw command metadata (gl_DrawID). Roughly 20-30
+instructions, comparable to a plain vertex shader.
+
+The fragment shader computes the voxel position from world-space
+coordinates and reads the material from the volumetric material array:
+
+    ivec3 voxel = ivec3(floor(worldPos)) & 31;
+    uint material = material_volume[voxel.z * 1024 + voxel.y * 32 + voxel.x];
+
+The material index feeds into the texture atlas or color palette for
+final shading.
+
+The entire renderer is three GPU commands per frame:
+
+    1. Compute dispatch: filter visibility, write MDI commands
+    2. MultiDrawIndirect: render all visible quads
+    3. (The build dispatch only runs on edit, not per frame)
+
 
 ### Voxel Edit Path
 
 When a voxel changes:
 
-    1. Flip the occupancy bit (CPU or compute)
-    2. AND-NOT to recompute affected face bitmask layers (1-3 per direction)
-    3. popcount to update those layer_face_count entries
-    4. Next frame, the compute shader picks up the new counts automatically
+    1. Flip the occupancy bit
+    2. AND-NOT to recompute affected face bitmask layers (scoped to
+       4x4x4 subchunk)
+    3. Re-run greedy merge for affected layers
+    4. Patch the quad buffer
+    5. Next frame, the filter shader picks up the changes automatically
 
-No remeshing. No buffer reallocation. A voxel edit touches a few hundred bytes
-of derived data.
+No remeshing. No buffer reallocation. A voxel edit touches a few KB of
+derived data. Cross-chunk propagation: boundary voxels affect at most 3
+face-neighbor chunks (one per axis where the voxel sits on the chunk edge).
+
+
+## 2x2 Quad Technique
+
+A single quad can render 4 discrete voxel textures using world-space UV
+partitioning. A 2x2 group of coplanar faces maps to one quad whose 4
+corners align with the 4 original voxel cell centers. The fragment shader
+uses `floor(worldPos)` to determine which quadrant the pixel falls in and
+samples the corresponding material's texture.
+
+The greedy merge can group 2x2 blocks of faces into single quads where all
+4 cells are occupied. Partially occupied 2x2 groups (at surface edges) fall
+back to individual quads. At higher voxel resolution, the surface is
+smoother relative to the grid, so a larger fraction of groups are fully
+occupied.
+
+Two applications:
+
+- **Resolution doubling.** A 64x64x64 chunk produces roughly the same
+  instance count as a 32x32x32 chunk with 1x1 quads. Doubled voxel
+  resolution per axis at the same rendering cost.
+
+- **LOD transitions.** A LOD 1 quad covers a 2x2 area of LOD 0 voxels
+  with full material fidelity. Each quadrant displays its own discrete
+  material, preserving visual sharpness without blending.
+
+
+## LOD
+
+Coarser bitmask levels are natural mip levels of the occupancy:
+
+    LOD 0: 32x32x32 occupancy + full material palette    (36 KB CPU)
+    LOD 1: 16x16x16 occupancy + averaged RGBA per voxel  (16.5 KB CPU)
+    LOD 2:  8x8x8   occupancy + averaged RGBA per voxel  (2 KB CPU)
+    LOD 3:  4x4x4   occupancy + averaged RGBA per voxel  (264 B CPU)
+
+The face derivation, greedy merge, and quad buffer pipeline are
+resolution-agnostic. They work identically at any bitmask resolution.
+
+### Material Handling by LOD Level
+
+- **LOD 0:** Discrete material palette indices. The fragment shader does a
+  texture atlas lookup using the palette index.
+- **LOD 1+:** Pre-baked averaged colors, computed when the chunk transitions
+  from a finer LOD. The fragment shader reads flat color directly -- no atlas
+  lookup.
+
+At LOD 1, the 2x2 quad technique can render 4 discrete averaged colors per
+quad with hard edges between them, preserving visual sharpness without
+blending artifacts.
+
+### Occupancy Downsampling
+
+Rule: "any surface voxel in the 2x2x2 group is solid." This preserves the
+surface shell at the cost of slight thickening. Thin features that
+disappear at lower LODs are subpixel at the distances where those LODs
+activate.
+
+### LOD Transitions
+
+Dithered cross-fade between adjacent LOD levels. Opaque geometry only -- no
+alpha blending, no sort order issues.
 
 
 ## Ray Traversal
@@ -265,53 +383,76 @@ grid. The layer occupancy u32 for the next chunk immediately indicates
 whether there is anything to hit. The chunk grid acts as the coarsest
 traversal level.
 
+Ray traversal data is a subset of the full per-chunk data: occupancy
+(4 KB), face bitmasks (24 KB), and layer occupancy (24 B). Roughly 28 KB
+per chunk.
+
 For applications of ray traversal through this structure, see:
-- [Voxel Global Illumination](voxel_global_illumination.md) — shadows, AO,
+- [Voxel Global Illumination](voxel_global_illumination.md) -- shadows, AO,
   GI, reflections
-- [Scene Acceleration](scene_acceleration.md) — coarse acceleration for
+- [Scene Acceleration](scene_acceleration.md) -- coarse acceleration for
   arbitrary triangle geometry
 
 
 ## Relationship to Meshing
 
-This decomposition mirrors how greedy meshing works: process one face direction
-at a time, sweeping through 2D slices along the normal axis. The key difference
-is that greedy meshing merges coplanar faces into larger quads to reduce
-triangle count. This architecture instead keeps faces at single-voxel
-granularity and relies on the GPU's ability to render large instance counts
-efficiently via indirect draws.
+This architecture performs greedy meshing, but a variant that differs from
+the traditional approach in several ways:
 
-Greedy merging could still be applied on top of this system if triangle count
-becomes a bottleneck, but the bitmask representation is simpler, faster to
-update, and avoids the complexity of maintaining merged quads across edits.
+- **Material-agnostic.** Traditional greedy meshing fragments quads at
+  material boundaries because each quad carries a single material ID. Here,
+  materials are resolved per-pixel in the fragment shader via volumetric
+  lookup. The merge considers only geometry, producing maximally large quads
+  regardless of material distribution.
+
+- **GPU-resident.** The merge runs in a compute shader, not on the CPU. No
+  data round-trips between CPU and GPU.
+
+- **Bitmask-native.** The merge operates on 32x32 bitmask layers using
+  bitwise operations (shifts, ANDs, leading/trailing zero counts), not
+  polygon soup or vertex lists.
+
+- **Edit-scoped.** The merge only reruns for affected layers on voxel edit,
+  not per frame. The per-frame cost is zero for static geometry.
+
+The combination of material-agnostic merging and per-pixel material lookup
+is the central design trade-off. It moves material complexity from the
+geometry pipeline (where it fragments quads and inflates instance counts)
+to the fragment shader (where it becomes a single texture fetch per pixel).
 
 
 ## Open Questions
 
-- Material/texture data: how to associate voxel type information with face
-  instances without per-vertex attributes. Leading approach: a 32x32x32
-  byte array (32 KB/chunk) storing palette indices, indexed by the
-  recovered face position.
 - Transparency and non-cubic block shapes: how far the bitmask
   representation extends beyond simple opaque cubes. Likely requires a
   secondary rendering path.
-- LOD integration: coarser bitmask levels (16x16x16, 8x8x8) as natural
-  mip levels for distant chunks. The vertex shader prefix-sum mapping works
-  identically at any resolution.
+- Seam handling at LOD boundaries: adjacent chunks at different LOD levels
+  may expose T-junctions or gaps at shared edges. Stitching geometry or
+  screen-space solutions are both candidates.
 
 
 ## Resolved Questions
 
-- **Prefix sum mapping from instance ID to face position in the vertex
-  shader.** Binary search over 32 layer prefix sums (5 iterations), linear
-  popcount scan over 32 row words (16 avg iterations), nth-set-bit
-  extraction within the target word (~8 avg iterations). Total: ~110
-  instructions average, ~220 worst case. 4-7x a plain vertex shader.
-  Within budget for realistic scenes. See the computational analysis for
-  the full breakdown.
-- **View frustum culling.** Chunk-level AABB test in the compute shader
-  before emitting draw commands. Per-direction culling is possible but the
-  layer occupancy zero-check already eliminates empty directions.
+- **Material association.** Volumetric palette-indexed array (32 KB/chunk).
+  Each chunk has a local palette (up to 256 entries) mapping local indices
+  to global block IDs. The fragment shader reads material directly via
+  world-space position: `floor(worldPos) & 31` indexes into the 32x32x32
+  array.
+
+- **Prefix sum mapping.** Eliminated entirely. The vertex shader reads a
+  packed quad descriptor from the quad buffer and unpacks position + extent.
+  No binary search, no popcount scan, no instance-ID-to-face mapping.
+
+- **View frustum culling.** Chunk-level AABB in the filter compute shader.
+  Hi-Z occlusion culling with exact bounds for axis-aligned geometry -- each
+  chunk-direction pair is a planar slab with 4 coplanar corners, allowing
+  exact screen-space projection instead of conservative bounding box tests.
+
 - **X-direction face derivation.** Bit shift within each u32 word, followed
-  by a bit-plane transpose in the compute shader using shared memory. Same
-  cost class as the other directions.
+  by shared memory transpose in the compute shader. Same cost class as the
+  other directions. Now feeds into greedy merge like all other directions.
+
+- **Greedy meshing integration.** Material-agnostic greedy merge in the
+  build compute shader. Operates on face bitmasks after derivation.
+  Materials resolved per-pixel in the fragment shader, so the merge
+  considers only geometry and produces maximally large quads.

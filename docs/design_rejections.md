@@ -64,10 +64,10 @@ gameplay camera (player on terrain, looking at the horizon):
 These problems compound. Rasterization has none of them. A triangle at 500
 meters costs the same as a triangle at 5 meters.
 
-**What to use instead:** Indirect rasterization from directional face bitmasks
-for primary visibility. Ray marching through the same bitmask structure for
-secondary effects (shadows, AO, GI) where rays are short-range, structurally
-coherent, or both.
+**What to use instead:** Indirect rasterization via GPU-computed greedy quads
+from directional face bitmasks for primary visibility. Ray marching through the
+same bitmask structure for secondary effects (shadows, AO, GI) where rays are
+short-range, structurally coherent, or both.
 
 
 ## Octree as Ray Acceleration Structure
@@ -140,9 +140,9 @@ problem.
 More fundamentally, brickmaps store volume data and ray march against it,
 inheriting all the ray marching pathologies described above.
 
-**What to use instead:** Face bitmasks derived from occupancy. Surface data
-only, no volume streaming needed. The data is always resident (28 KB/chunk is
-trivially small) so there is no demand streaming problem to solve.
+**What to use instead:** Face bitmasks derived from occupancy. The data is
+always resident (~60 KB/chunk, including volumetric material) and trivially
+small, so there is no demand streaming problem to solve.
 
 
 ## Meshlet Pool Architecture
@@ -156,10 +156,11 @@ eliminate). The pool management (allocation, fragmentation, compaction) adds
 complexity. The meshlet fill rate varies wildly with surface density, leading
 to wasted GPU lanes on underfilled meshlets.
 
-The directional face bitmask approach removes mesh generation entirely.
-Geometry count is determined by popcount (one instruction). Draw calls are
-emitted by a trivial compute shader. No pool, no fragmentation, no
-compaction.
+The directional face bitmask approach removes pool management entirely. A
+build compute shader (running on edit, not per frame) produces a flat,
+chunk-local quad buffer via greedy merge on the bitmasks. A filter compute
+shader runs per frame for visibility and emits draw commands via
+MultiDrawIndirect. No pool, no fragmentation, no compaction.
 
-**What to use instead:** Indirect rasterization from face bitmasks via
-MultiDrawIndirect. One draw call for the entire world.
+**What to use instead:** Indirect rasterization from GPU-computed greedy quads
+via MultiDrawIndirect. One draw call for the entire world.

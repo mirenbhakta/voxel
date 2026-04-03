@@ -1,9 +1,9 @@
 # Voxel Global Illumination
 
 Techniques for lighting voxel worlds using the directional face bitmask
-structure as the ray acceleration backend. All techniques share the same 29 KB
-per chunk data that the rasterization pipeline already maintains — no secondary
-spatial index required.
+structure as the ray acceleration backend. All techniques share the ~28 KB of
+ray traversal data (occupancy, face bitmasks, layer occupancy) that the system
+already maintains — no secondary spatial index required.
 
 
 ## Why Bitmask Traversal Fits GI
@@ -114,14 +114,17 @@ This can be applied in two ways:
 
 The mip data is tiny. A full mip chain from 32x32 down to 1x1 adds ~340 bits
 (~43 bytes) per layer per direction. For a full chunk across all 6 directions
-and 32 layers: ~8 KB additional. Negligible compared to the base 29 KB.
+and 32 layers: ~8 KB additional. Negligible compared to the base ~28 KB ray
+traversal data.
 
 
 ## Data Layout: Raster vs Ray
 
-All techniques in this document use the same 29 KB/chunk data that the
-rasterization pipeline maintains. No secondary spatial index is required for
-ray traversal.
+All techniques in this document use the ~28 KB ray traversal subset of the
+per-chunk data: occupancy (4 KB), face bitmasks (24 KB), and layer occupancy
+(24 B). The rasterization pipeline maintains additional data (volumetric
+material, quad buffer) but ray traversal does not require it. No secondary
+spatial index is required.
 
 The ray path uses `layer_occ` (a u32 per direction) for layer skipping and
 the 32x32 face bitmask for per-layer hit testing. For short-range techniques
@@ -144,7 +147,7 @@ a face in this layer worth testing at all."
 If ray traversal performance becomes a bottleneck for longer-range techniques,
 per-layer 2D bounds (from the original hierarchy proposal in the acceleration
 structure design) or transposed occupancy bitmasks could be added as
-supplementary metadata without changing the base 29 KB structure.
+supplementary metadata without changing the base ~28 KB ray traversal structure.
 
 
 ## Open Questions

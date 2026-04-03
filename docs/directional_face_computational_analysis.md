@@ -92,153 +92,165 @@ Equivalent fixup for -X at bit 0.
 
 ## Stage 2: Derived Metadata
 
-### Layer Face Counts
-
-    layer_count[dir][layer] = sum of popcount(face_bitmask[dir][layer][row])
-                              for row in 0..32
-
-32 popcounts per layer, 32 layers per direction, 6 directions = 6144
-popcounts per chunk. Output: 6 x 32 x u16 = 384 bytes.
-
-### Layer Prefix Sums
-
-    prefix[dir][0]  = 0
-    prefix[dir][i] = prefix[dir][i-1] + layer_count[dir][i-1]
-
-Enables binary search in the vertex shader. 6 x 32 x u32 = 768 bytes per
-chunk. Computed alongside face counts.
-
 ### Layer Occupancy
 
-    layer_occ[dir] = u32 where bit i is set if layer_count[dir][i] > 0
+    layer_occ[dir] = u32 where bit i is set if any face exists in layer i
 
-6 x u32 = 24 bytes.
+6 x u32 = 24 bytes. Used for fast layer skipping during ray traversal and
+as the first-pass cull in the filter shader (zero layer_occ means no
+geometry for that direction -- skip it).
+
+### Quad Buffer
+
+Produced by the build step's greedy merge. Each entry is a packed u32
+quad descriptor:
+
+    col     5 bits     column position within the layer
+    row     5 bits     row position within the layer
+    layer   5 bits     layer index along the face normal axis
+    width   5 bits     horizontal extent minus one
+    height  5 bits     vertical extent minus one
+    ────────────────
+    total  25 bits     fits in a u32 with room to spare
+
+Organized by chunk and direction. Direction is implicit from draw command
+metadata (gl_DrawID), not stored per quad.
+
+Variable size per chunk-direction pair. Each 32x32 layer contains at most
+1024 faces pre-merge; the greedy merge reduces this substantially. A flat
+wall merges to a single quad. Typical chunks produce a few KB of quad data.
 
 ### Memory Budget Per Chunk
 
-    Occupancy:           4,096 B   (4 KB)
-    Face bitmasks:      24,576 B  (24 KB, 6 directions)
-    Layer face counts:     384 B
-    Layer prefix sums:     768 B
-    Layer occupancy:        24 B
-    ─────────────────────────────
-    Total:              29,848 B  (~29 KB)
+    Occupancy:            4,096 B   (4 KB)
+    Volumetric material: 32,768 B  (32 KB)
+    Face bitmasks:       24,576 B  (24 KB, 6 directions)
+    Layer occupancy:         24 B
+    Quad buffer:          variable  (typically a few KB)
+    ─────────────────────────────────
+    Fixed total:        ~60 KB + quad buffer
 
-Constant regardless of geometric complexity. For 256 loaded chunks: ~7.5 MB.
+For 256 loaded chunks: ~15 MB fixed + quad buffers.
 
 
-## Stage 3: Compute Shader -- Draw Command Generation
+## Stage 3: Build Shader (On Edit)
 
-Runs once per frame. For each visible chunk, for each of 6 directions:
+Runs when chunk occupancy changes. Derives face bitmasks, performs
+material-agnostic greedy merge, writes quad buffer.
+
+### Face Derivation
+
+Same operations as Stage 1. Per direction: 32 layers of 32 AND-NOT
+operations, plus the X-direction transpose via shared memory. Total per
+chunk: 6 directions of face bitmask derivation. Cost dominated by the
+X-direction transpose (32K extract-and-set operations).
+
+### Greedy Merge
+
+The merge operates on 32x32 bitmask layers using bitwise operations. It
+is material-agnostic -- material is resolved per-pixel in the fragment
+shader, so the merge considers only geometry.
+
+Per layer (32x32 bitmask):
+
+    1. Row-wise run detection via bit manipulation:
+         starts = bits & ~(bits << 1)   // left edges of runs
+         ends   = bits & ~(bits >> 1)   // right edges of runs
+       Each (start, end) pair defines a horizontal span.
+
+    2. Cross-row merging: extend spans vertically by comparing adjacent
+       rows. Two spans in adjacent rows with identical start and end
+       positions merge into a single rectangle.
+
+Total work per direction: 32 layers of merge operations. Cost is
+proportional to the number of set bits and transitions in the bitmask,
+not the grid size. A fully solid layer has one transition per row (32
+spans, merging to 1 rectangle). A checkerboard layer has 512 transitions
+per row (no merging possible).
+
+For local edits, the rebuild is scoped to 4x4x4 subchunk blocks. Only
+the affected face layers need face derivation and re-merge. A single
+voxel edit touches at most 12 layers (2 per direction) and re-merges
+only those layers.
+
+
+## Stage 3b: Filter Shader (Per Frame)
+
+Runs each frame. For each visible chunk, for each of 6 directions:
 
     1. Read layer_occ[chunk][dir]. If zero, skip.
-    2. Read prefix[chunk][dir][31] + layer_count[chunk][dir][31] = total faces.
-    3. If total > 0: atomically increment global draw count to get draw_index.
-    4. Write VkDrawIndirectCommand at draw_index:
-         vertexCount   = 6       (two triangles per quad)
-         instanceCount = total_faces
-         firstVertex   = 0
-         firstInstance = 0
-    5. Write draw metadata at draw_index:
-         chunk_id, direction, buffer offset to prefix sums
+    2. Backface test: dot product of face normal with view direction.
+       If non-negative, skip.
+    3. Frustum test: chunk AABB against view frustum planes.
+    4. Hi-Z occlusion test. All geometry is axis-aligned planar slabs.
+       4 coplanar corners projected to screen space, single depth value
+       compared against the Hi-Z pyramid. No conservative bounding box
+       approximation -- the geometry IS its own bound.
+    5. If visible: emit one MDI command pointing into the quad buffer.
 
-The vertex shader uses gl_DrawID to index the metadata buffer and recover
-its chunk and direction.
+### Evaluation Count
 
-### Draw Count
+Maximum: 256 chunks x 6 directions = 1536 evaluations. Most are
+eliminated early:
 
-Maximum: 256 chunks x 6 directions = 1536 draw commands.
-Per command: 16 bytes (VkDrawIndirectCommand) + 12 bytes (metadata) = 28 bytes.
-Total buffer: 43 KB. Trivially small.
+    - layer_occ zero-check eliminates empty directions (cheap, ~1 cycle)
+    - Backface test eliminates 3 of 6 directions for any view (~1 cycle)
+    - Frustum test eliminates off-screen chunks (~5 cycles)
+    - Hi-Z test eliminates occluded chunk-direction pairs (~10 cycles)
 
-### Compute Cost
+Typical surviving draw commands: 200-400. The Hi-Z test adds a few
+instructions per candidate that passes the frustum test, but eliminates
+occluded draws that would otherwise waste vertex and rasterization
+throughput.
 
-1536 potential evaluations. Most are skipped by the layer_occ zero-check.
-Typical: 200-400 actual draw commands. Microseconds of GPU time.
+Per command: 16 bytes (VkDrawIndirectCommand) + metadata = ~28 bytes.
+Total buffer at maximum: 43 KB. Trivially small.
 
 
-## Stage 4: Vertex Shader -- Instance ID to Face Position
+## Stage 4: Vertex Shader
 
-This is the most expensive stage per-instance. The vertex shader maps an
-instance ID to a world-space face quad.
+The vertex shader reads one packed u32 quad descriptor from the quad
+buffer, unpacks 5 fields, and expands to 6 vertices (two triangles).
 
 ### Inputs
 
-- gl_DrawID -> metadata -> (chunk_id, direction, prefix_buffer_offset)
-- gl_InstanceIndex -> face index within this chunk-direction pair (0..N-1)
+- gl_DrawID -> metadata -> (chunk_id, direction, quad_buffer_offset)
+- gl_InstanceIndex -> quad index within this chunk-direction pair
 - gl_VertexIndex -> 0..5 (which vertex of the two-triangle quad)
 
-### Step 4a: Find the Layer (binary search)
+### Unpack and Expand
 
-Binary search over 32 prefix-sum entries:
+    uint descriptor = quad_buffer[offset + gl_InstanceIndex];
+    uint col    = (descriptor >>  0) & 31;
+    uint row    = (descriptor >>  5) & 31;
+    uint layer  = (descriptor >> 10) & 31;
+    uint width  = ((descriptor >> 15) & 31) + 1;
+    uint height = ((descriptor >> 20) & 31) + 1;
 
-    int lo = 0, hi = 31;
-    for (int i = 0; i < 5; i++) {
-        int mid = (lo + hi) >> 1;
-        if (prefix[base + mid + 1] <= face_id)
-            lo = mid + 1;
-        else
-            hi = mid;
-    }
-    uint layer    = lo;
-    uint local_id = face_id - prefix[base + layer];
+Direction comes from draw metadata. The direction determines the axis
+mapping (which of col/row/layer corresponds to x/y/z) and the quad
+orientation.
 
-5 iterations. Each iteration: 1 buffer read + 2 ALU. Total: ~15 instructions.
-Buffer reads are coherent across instances in the same chunk-direction
-group (nearby instance IDs search similar ranges).
+gl_VertexIndex (0..5) selects a vertex of the two-triangle quad. The
+quad spans from (col, row) to (col + width, row + height) in the
+layer's 2D coordinate system.
 
-### Step 4b: Find the Row (linear popcount scan)
+Position + chunk origin offset + MVP multiply.
 
-Linear scan over the 32 u32 words of the target layer's bitmask:
+### Cost
 
-    uint remaining = local_id;
-    uint row;
-    for (row = 0; row < 32; row++) {
-        uint word = face_bitmask[bitmask_base + row];
-        uint count = bitCount(word);
-        if (remaining < count) break;
-        remaining -= count;
-    }
+    Unpack:       ~10 instructions (shifts, masks, adds)
+    Position:     ~15 instructions (axis swizzle, offset, MVP)
+    ─────────────────────────────────────────────────────────
+    Total:        ~20-30 instructions
 
-Each iteration: 1 buffer read + 1 bitCount + 1 compare + 1 subtract.
-Worst case: 32 iterations = 128 instructions.
-Average case: ~16 iterations = 64 instructions.
+Comparable to a plain MVP vertex shader. No binary search, no popcount
+scan, no loop of any kind.
 
-All instances in the same chunk-direction group read the same 128-byte
-layer. This fits in a single GPU cache line. Memory access is coherent even
-when control flow diverges.
+### Comparison With Previous Architecture
 
-### Step 4c: Find the Bit (nth set bit extraction)
-
-Extract the remaining-th set bit from the target word:
-
-    uint word = face_bitmask[bitmask_base + row];
-    for (uint i = 0; i < remaining; i++) {
-        word &= word - 1;  // clear lowest set bit
-    }
-    uint col = findLSB(word);
-
-Each iteration: 2 ALU (AND + subtract). No memory access.
-Worst case: 31 iterations = 62 instructions.
-Average case: ~4-8 iterations = 8-16 instructions.
-
-### Step 4d: Position and Quad Generation
-
-Direction + layer + row + col determine the face position in chunk-local
-coordinates. The mapping depends on direction:
-
-    +X: face at (layer+1, col, row)    -X: face at (layer, col, row)
-    +Y: face at (col, layer+1, row)    -Y: face at (col, layer, row)
-    +Z: face at (col, row, layer+1)    -Z: face at (col, row, layer)
-
-gl_VertexIndex (0..5) selects a vertex of the two-triangle quad. The quad
-normal and tangent vectors are known statically from the direction. Expand
-the face position by +/-0.5 in the two tangent directions.
-
-Cost: ~15 instructions (coordinate swizzle + chunk origin offset + MVP
-multiply).
-
-### Total Vertex Shader Cost
+The previous architecture mapped instance IDs to face positions at
+runtime in the vertex shader:
 
     Step              Worst    Average
     ─────────────────────────────────
@@ -249,24 +261,43 @@ multiply).
     ─────────────────────────────────
     Total               220      110
 
-A plain vertex shader (MVP transform only) is ~20-30 instructions. This
-shader is 4-7x more expensive.
+The new vertex shader replaces all of this with a single buffer read
+and unpack. The 4-7x overhead relative to a plain vertex shader is
+eliminated entirely.
 
-### Throughput Estimate
 
-Modern GPUs process ~10 billion simple vertices/sec. At 4x overhead:
-~2.5 billion instances/sec. At 60 fps: ~42 million instances per frame
-budget. This exceeds even the pathological 3D-checkerboard worst case
-(25M faces for 256 chunks).
+## Stage 4b: Fragment Shader
 
-### Divergence
+The fragment shader computes the voxel position from world-space
+coordinates and reads material from the volumetric material array:
 
-Instances within the same draw command access the same chunk-direction
-bitmask data but search for different bit positions. Control flow diverges
-(different loop iteration counts), but memory access is coherent (same
-128-byte layer). GPU wavefronts tolerate control divergence when memory
-access is uniform. The cost is idle lanes during the longest iteration,
-not cache thrashing.
+    ivec3 voxel = ivec3(floor(worldPos)) & 31;
+    uint material = material_volume[voxel.z * 1024 + voxel.y * 32 + voxel.x];
+
+The material index feeds into the texture atlas or color palette for
+final shading.
+
+### Memory Access Coherence
+
+Adjacent pixels on the same quad read adjacent or identical voxel
+entries. A 4x4 quad covers at most 4x4 = 16 distinct voxel positions.
+Pixels within the same voxel (at close range) read the same entry.
+Pixels spanning adjacent voxels (at medium range) read entries that
+differ by 1 in one axis -- adjacent in memory for X, stride-32 for Y,
+stride-1024 for Z. All patterns are cache-friendly.
+
+### Cost
+
+    floor + bitwise AND:          ~3 instructions
+    Array index computation:      ~3 instructions
+    Buffer read:                  ~4 cycles (L1 cache hit expected)
+    Texture atlas lookup:         ~4 cycles
+    ───────────────────────────────────────────────
+    Total overhead:              ~10-15 instructions
+
+Beyond what a plain textured fragment shader would cost. The volumetric
+lookup replaces per-vertex material attributes, so there is no
+interpolation cost and no per-vertex storage for material data.
 
 
 ## Stage 5: Worst-Case Face Counts
@@ -288,6 +319,10 @@ The pathological case uses ~30% of rasterization budget. Tight but viable.
 No real voxel world produces a 3D checkerboard. This is the theoretical
 ceiling.
 
+Greedy merge provides no benefit here. No two adjacent faces share an
+edge in the same layer, so no merging is possible. Raw face count =
+quad count = 98K per chunk.
+
 ### Realistic Worst Case: Fragmented Terrain
 
 Caves, overhangs, scattered blocks. ~30% solid, ~30-40% surface.
@@ -299,6 +334,10 @@ Caves, overhangs, scattered blocks. ~30% solid, ~30-40% surface.
 
 Well within budget at any resolution.
 
+After greedy merge: roughly 150K-500K quads for 256 chunks. The
+material-agnostic merge is more aggressive than traditional greedy
+meshing because material boundaries do not fragment the mesh.
+
 ### Realistic Per-Direction: Terrain From Above
 
 Looking straight down at flat terrain. Only -Y faces visible. One layer
@@ -306,30 +345,33 @@ per chunk with up to 1024 faces.
 
     Typical: 256 chunks x 800 faces = 205K faces = 410K triangles
 
-Trivial.
+After greedy merge: 256 chunks x ~1-5 quads per chunk (contiguous
+terrain merges to very few rectangles) = 256-1280 quads. Trivial.
 
 ### Comparison With Greedy Meshing
 
-Greedy meshing merges coplanar adjacent faces into larger quads, typically
-achieving 5-20x face count reduction for natural terrain. The bitmask
-approach renders every 1x1 face individually.
+The architecture performs greedy meshing, but material-agnostic.
+Traditional greedy meshing stops at material boundaries because each
+quad carries a single material ID. Material-agnostic merging considers
+only geometry and produces maximally large quads regardless of material
+distribution. The post-merge quad count is lower than traditional
+greedy meshing for heterogeneous surfaces.
 
-    Bitmask approach:      ~3M faces for 256 terrain chunks
-    Greedy equivalent:     ~150K - 600K faces
+    Traditional greedy:            ~150K - 600K quads (256 terrain chunks)
+    Material-agnostic greedy:      ~150K - 500K quads (same geometry)
 
-The bitmask approach is 5-20x more triangles. The trade-off:
+The difference grows with material heterogeneity. A surface with 10
+materials in a 32x32 layer might produce 30-50 quads with traditional
+greedy (one per contiguous same-material region) but 1-5 quads with
+material-agnostic merging (one per contiguous geometry region).
 
-    Bitmask                          Greedy
-    ──────────────────────────────────────────────────────
-    No mesh generation               O(n) meshing per edit
-    O(1) voxel edit                  Remesh affected chunk
-    Constant memory (29 KB/chunk)    Variable (depends on surface)
-    No buffer reallocation           Allocator + fragmentation
-    Simple compute shader            Complex mesh builder
+Estimated post-merge quad counts:
 
-Greedy merging can be layered on top of the bitmask representation later.
-The per-direction per-layer bitmask is exactly the input that greedy
-algorithms expect. This is an extension point, not a redesign.
+    Scenario                       Raw faces    Post-merge quads
+    ─────────────────────────────────────────────────────────────
+    Flat terrain (top-down)         205K         256 - 1,280
+    Fragmented terrain (256 ch)    ~3M           150K - 500K
+    3D checkerboard (per chunk)     98K          98K (no merge)
 
 
 ## Stage 6: Voxel Edit Path
@@ -345,12 +387,21 @@ adjacent layer (which compared against the voxel's position).
     +Y: layers y and y-1     -Y: layers y and y+1
     +Z: layers z and z-1     -Z: layers z and z+1
 
-Up to 12 layer recomputes. Each recompute is an AND-NOT on a 32x32 bitmask
-(128 bytes), followed by popcount (32 words) and prefix sum update.
+Up to 12 layer recomputes. Each recompute:
 
-    Data touched:  12 x 128 bytes = 1,536 bytes
-    Operations:    12 x 32 AND-NOTs + 12 x 32 popcounts = 768 total
-    Prefix sums:   6 x 32 additions = 192 additions
+    1. AND-NOT on a 32x32 bitmask (128 bytes) to regenerate face bits
+    2. Re-run greedy merge for the affected layer
+    3. Patch the quad buffer (replace entries for the affected layer)
+
+For local edits, the rebuild is scoped to 4x4x4 subchunk blocks. Only
+the layers intersecting the edited region need recomputation. Patching
+the quad buffer replaces entries for affected layers without full
+reallocation -- the buffer region for each chunk-direction pair is
+updated in place.
+
+    Data touched:  12 x 128 bytes = 1,536 bytes (face bitmasks)
+                   + affected quad buffer entries
+    Operations:    12 x 32 AND-NOTs + 12 layer merges
 
 ### Cross-Chunk Propagation
 
@@ -361,13 +412,14 @@ edge or corner neighbors). Each neighbor requires up to 2 additional layer
 recomputes.
 
     Worst case (corner voxel): 12 local + 6 cross-chunk = 18 layer recomputes
-    Data touched: 18 x 128 = 2,304 bytes
+    Data touched: 18 x 128 = 2,304 bytes (face bitmasks)
 
 ### Edit Latency
 
-Total per edit: ~2.3 KB data touched, ~1000 arithmetic operations.
-Microseconds on CPU or GPU. No buffer reallocation. No remeshing.
-The next frame's compute dispatch picks up the new counts automatically.
+Total per edit: ~2.3 KB face bitmask data touched, plus the greedy
+re-merge and quad buffer patch for affected layers. Microseconds on
+CPU or GPU. No full buffer reallocation. No remeshing from scratch.
+The next frame's filter shader picks up the changes automatically.
 
 
 ## Potential Optimizations
@@ -375,57 +427,41 @@ The next frame's compute dispatch picks up the new counts automatically.
 Listed for reference. None are required for the base architecture to be
 viable.
 
-### Row Prefix Sums
+### Hierarchical Greedy Merge
 
-Precompute a 32-entry prefix sum per layer to replace the linear row scan
-(step 4b) with a binary search. Reduces worst-case row scan from 128 to
-~15 instructions.
+Multi-resolution merge that finds large rectangles first, then fills
+gaps with smaller ones. Could reduce merge time for dense surfaces where
+the current single-pass merge spends time extending spans that will
+eventually merge into the same large rectangle. Most beneficial for
+surfaces that are locally uniform (flat walls, terrain plateaus).
 
-Cost: 6 directions x 32 layers x 32 entries x 4 bytes = 24 KB per chunk.
-For 256 chunks: 6 MB. Worthwhile if vertex shader throughput becomes the
-bottleneck.
+### Persistent Quad Buffer Pool
 
-### Two-Level Row Hierarchy
+Pre-allocate quad buffer space per chunk-direction pair based on
+historical usage. A chunk-direction pair that consistently produces
+~50 quads gets a 50-entry slot. Edits that do not significantly change
+the quad count reuse the same slot without reallocation. Only overflow
+triggers a resize. Avoids allocator pressure on rapid edits.
 
-Split the 32 rows into 4 groups of 8. Store 4 group-level popcounts per
-layer. Binary search over groups (2 iterations) then linear scan within a
-group (up to 8 iterations). Total: ~10 iterations instead of up to 32.
+### Subchunk Incremental Merge
 
-Cost: 6 x 32 x 4 x u16 = 1.5 KB per chunk. Negligible.
-
-### Precomputed Face Positions
-
-The compute shader writes a buffer of explicit face positions (layer, row,
-col packed into a u32) per face. The vertex shader does a single buffer
-read instead of the scan.
-
-Cost: variable per chunk. Worst case 98K faces x 4 bytes = 393 KB per
-chunk. Requires a pool allocator with the fragmentation and compaction
-complexity that the bitmask approach was designed to avoid. Only consider
-if the vertex shader scan proves to be the dominant bottleneck and the
-simpler optimizations above are insufficient.
+Instead of re-merging entire affected layers on edit, patch the quad
+buffer by removing quads that overlap the edited 4x4x4 region and
+inserting new ones for just that region. Avoids re-merging a full
+32x32 layer when only a small area changed. Only worthwhile if the
+full layer merge becomes a measured bottleneck -- a 32x32 bitmask
+merge is already fast.
 
 
 ## Open Issues
 
-1. **Material data association.** Each face needs a voxel type for texturing.
-   Simplest approach: a 32x32x32 byte array (32 KB/chunk) storing palette
-   indices, indexed by the recovered (x, y, z) position. Adds 32 KB per
-   chunk (8 MB for 256 chunks). Alternative: pack material into the
-   occupancy bitmask using wider words.
+1. **LOD.** Coarser bitmask levels (16x16x16, 8x8x8) are natural mip
+   levels of the occupancy. The face derivation, greedy merge, and
+   quad buffer pipeline are resolution-agnostic -- they work identically
+   at any bitmask resolution. A 16x16x16 level reduces face count by
+   ~8x for distant chunks.
 
-2. **Frustum culling granularity.** Chunk-level AABB culling in the compute
-   shader is the natural first pass. Per-direction culling is possible (if
-   the camera faces +X, no chunk's -X faces contribute) but the layer
-   occupancy zero-check already skips empty directions. Chunk-level culling
-   is likely sufficient.
-
-3. **LOD.** Coarser bitmask levels (16x16x16, 8x8x8) are natural mip levels
-   of the occupancy. A 16x16x16 bitmask is 512 bytes occupancy + ~3 KB
-   faces. Reduces face count by ~8x for distant chunks. The prefix-sum
-   vertex shader works identically at any resolution.
-
-4. **Transparency and non-cubic shapes.** The bitmask representation assumes
+2. **Transparency and non-cubic shapes.** The bitmask representation assumes
    opaque 1x1x1 cubes. Transparent blocks require separate handling (no
    face culling at transparent/opaque boundaries, draw order for blending).
    Non-cubic shapes (slabs, stairs) cannot be represented as single bits.
