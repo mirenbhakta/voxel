@@ -1,21 +1,24 @@
 //! Chunk storage backends and format conversion.
 //!
-//! Provides three storage formats for voxel data, each generic over an element
-//! type `T` and parameterized by a [`VoxelIndexer`] strategy:
+//! Provides four storage formats for voxel data, parameterized by a
+//! [`VoxelIndexer`] strategy:
 //!
-//! - [`Dense`] -- flat array with full random access.
-//! - [`Rle`] -- run-length encoded with binary-searchable run starts.
-//! - [`Palette`] -- unique-value table with per-voxel index array.
+//! - [`Dense`] -- flat array with full random access, generic over `T`.
+//! - [`Rle`] -- run-length encoded with binary-searchable run starts, generic over `T`.
+//! - [`Palette`] -- unique-value table with per-voxel index array, generic over `T`.
+//! - [`Bitmask`] -- bit-packed boolean storage, one bit per voxel.
 //!
 //! Conversion between formats uses a stream intermediate: each type emits a
 //! flat sequence of values in index order via [`IntoVoxelStream`] and
 //! constructs itself from one via [`FromVoxelStream`]. This reduces conversion
 //! paths from N*M to 2N.
 
+pub mod bitmask;
 pub mod dense;
 pub mod palette;
 pub mod rle;
 
+pub use bitmask::Bitmask;
 pub use dense::Dense;
 pub use palette::Palette;
 pub use rle::Rle;
