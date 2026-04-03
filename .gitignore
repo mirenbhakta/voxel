@@ -1,1 +1,34 @@
+# --- Directories ---
+# Ignore whatever IDEs want to put in here
+/.idea
+/.vs
+/.vscode
+
+# `target` is cargo's scratch dir.
 /target
+
+# Dir for any local files during dev. Ignore this.
+/.local
+
+# --- Files ---
+**/*.rs.bk
+
+# Allow settings.json, we add natvis info in there.
+!.vscode/settings.json
+
+# VSCode specifics
+**/node_modules
+**/.pnpm
+
+# --- Claude ---
+
+# Claude session tracking (not synced between sessions)
+.claude/sessions
+.claude/plans
+.claude/memory/embeddings.*
+.claude/memory/memory.db-*
+# Claude local permissions.
+.claude/settings.local.json
+
+# Local MCP confiugurations.
+.mcp.json
