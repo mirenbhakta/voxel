@@ -2,9 +2,11 @@
 //!
 //! Morton codes interleave the bits of two or three integer coordinates into a
 //! single integer, producing a space-filling curve that preserves spatial
-//! locality. This module provides encode and decode functions for 2D and 3D
-//! coordinates in both standard and wide (64-bit) variants, as well as combined
-//! variants that process multiple coordinates simultaneously using bit packing.
+//! locality. This module provides typed encode and decode functions for 2D and
+//! 3D coordinates across multiple bit widths, as well as combined variants that
+//! process multiple coordinates simultaneously using bit packing.
+
+#![allow(dead_code)]
 
 use eden_math::Vector2;
 use eden_math::Vector3;
@@ -13,7 +15,7 @@ use eden_math::Vector3;
 
 /// Insert a zero bit after each of the 16 low bits of `x`.
 #[inline]
-pub fn part_1_by_1(x: u32) -> u32 {
+fn part_1_by_1(x: u32) -> u32 {
     let mut x = x & 0x0000_FFFF;
     x = (x ^ (x <<  8)) & 0x00FF_00FF;
     x = (x ^ (x <<  4)) & 0x0F0F_0F0F;
@@ -24,7 +26,7 @@ pub fn part_1_by_1(x: u32) -> u32 {
 
 /// Remove all odd-indexed bits, compacting even bits into the 16 low bits.
 #[inline]
-pub fn compact_1_by_1(x: u32) -> u32 {
+fn compact_1_by_1(x: u32) -> u32 {
     let mut x = x & 0x5555_5555;
     x = (x ^ (x >>  1)) & 0x3333_3333;
     x = (x ^ (x >>  2)) & 0x0F0F_0F0F;
@@ -35,7 +37,7 @@ pub fn compact_1_by_1(x: u32) -> u32 {
 
 /// Insert a zero bit after each of the 32 low bits of `x`.
 #[inline]
-pub fn part_1_by_1_wide(x: u64) -> u64 {
+fn part_1_by_1_wide(x: u64) -> u64 {
     let mut x = x & 0x0000_0000_FFFF_FFFF;
     x = (x ^ (x << 16)) & 0x0000_FFFF_0000_FFFF;
     x = (x ^ (x <<  8)) & 0x00FF_00FF_00FF_00FF;
@@ -48,7 +50,7 @@ pub fn part_1_by_1_wide(x: u64) -> u64 {
 /// Remove all odd-indexed bits from a 64-bit value, compacting even bits into
 /// the 32 low bits.
 #[inline]
-pub fn compact_1_by_1_wide(x: u64) -> u64 {
+fn compact_1_by_1_wide(x: u64) -> u64 {
     let mut x = x & 0x5555_5555_5555_5555;
     x = (x ^ (x >>  1)) & 0x3333_3333_3333_3333;
     x = (x ^ (x >>  2)) & 0x0F0F_0F0F_0F0F_0F0F;
@@ -62,7 +64,7 @@ pub fn compact_1_by_1_wide(x: u64) -> u64 {
 
 /// Insert two zero bits after each of the 10 low bits of `x`.
 #[inline]
-pub fn part_1_by_2(x: u32) -> u32 {
+fn part_1_by_2(x: u32) -> u32 {
     let mut x = x & 0x0000_03FF;
     x = (x ^ (x << 16)) & 0xFF00_00FF;
     x = (x ^ (x <<  8)) & 0x0300_F00F;
@@ -74,7 +76,7 @@ pub fn part_1_by_2(x: u32) -> u32 {
 /// Remove all bits not at positions divisible by 3, compacting them into the
 /// 10 low bits.
 #[inline]
-pub fn compact_1_by_2(x: u32) -> u32 {
+fn compact_1_by_2(x: u32) -> u32 {
     let mut x = x & 0x0924_9249;
     x = (x ^ (x >>  2)) & 0x030C_30C3;
     x = (x ^ (x >>  4)) & 0x0300_F00F;
@@ -85,7 +87,7 @@ pub fn compact_1_by_2(x: u32) -> u32 {
 
 /// Insert two zero bits after each of the 21 low bits of `x`.
 #[inline]
-pub fn part_1_by_2_wide(x: u64) -> u64 {
+fn part_1_by_2_wide(x: u64) -> u64 {
     let mut x = x & 0x001F_FFFF;
     x = (x ^ (x << 32)) & 0x001F_0000_0000_FFFF;
     x = (x ^ (x << 16)) & 0x001F_0000_FF00_00FF;
@@ -98,7 +100,7 @@ pub fn part_1_by_2_wide(x: u64) -> u64 {
 /// Remove all bits not at positions divisible by 3 from a 64-bit value,
 /// compacting them into the 21 low bits.
 #[inline]
-pub fn compact_1_by_2_wide(x: u64) -> u64 {
+fn compact_1_by_2_wide(x: u64) -> u64 {
     let mut x = x & 0x1249_2492_4924_9249;
     x = (x ^ (x >>  2)) & 0x10C3_0C30_C30C_30C3;
     x = (x ^ (x >>  4)) & 0x100F_00F0_0F00_F00F;
@@ -110,96 +112,31 @@ pub fn compact_1_by_2_wide(x: u64) -> u64 {
 
 // --- 2D Encode/Decode ---
 
-/// Encode two 16-bit coordinates into a 32-bit Morton code.
-#[inline]
-pub fn encode_2d(v: Vector2<u32>) -> u32 {
-    part_1_by_1(v.x) | (part_1_by_1(v.y) << 1)
-}
-
-/// Decode a 32-bit Morton code into two 16-bit coordinates.
-#[inline]
-pub fn decode_2d(code: u32) -> Vector2<u32> {
-    Vector2::new(compact_1_by_1(code), compact_1_by_1(code >> 1))
-}
-
-/// Encode two 32-bit coordinates into a 64-bit Morton code.
-#[inline]
-pub fn encode_2d_wide(v: Vector2<u32>) -> u64 {
-    part_1_by_1_wide(v.x as u64) | (part_1_by_1_wide(v.y as u64) << 1)
-}
-
-/// Decode a 64-bit Morton code into two 32-bit coordinates.
-#[inline]
-pub fn decode_2d_wide(code: u64) -> Vector2<u32> {
-    Vector2::new(
-        compact_1_by_1_wide(code) as u32,
-        compact_1_by_1_wide(code >> 1) as u32,
-    )
-}
-
-// --- 3D Encode/Decode ---
-
-/// Encode three 10-bit coordinates into a 30-bit Morton code.
-#[inline]
-pub fn encode_3d(v: Vector3<u32>) -> u32 {
-    part_1_by_2(v.x) | (part_1_by_2(v.y) << 1) | (part_1_by_2(v.z) << 2)
-}
-
-/// Decode a 30-bit Morton code into three 10-bit coordinates.
-#[inline]
-pub fn decode_3d(code: u32) -> Vector3<u32> {
-    Vector3::new(
-        compact_1_by_2(code),
-        compact_1_by_2(code >> 1),
-        compact_1_by_2(code >> 2),
-    )
-}
-
-/// Encode three 21-bit coordinates into a 63-bit Morton code.
-#[inline]
-pub fn encode_3d_wide(v: Vector3<u32>) -> u64 {
-    part_1_by_2_wide(v.x as u64)
-        | (part_1_by_2_wide(v.y as u64) << 1)
-        | (part_1_by_2_wide(v.z as u64) << 2)
-}
-
-/// Decode a 63-bit Morton code into three 21-bit coordinates.
-#[inline]
-pub fn decode_3d_wide(code: u64) -> Vector3<u32> {
-    Vector3::new(
-        compact_1_by_2_wide(code) as u32,
-        compact_1_by_2_wide(code >> 1) as u32,
-        compact_1_by_2_wide(code >> 2) as u32,
-    )
-}
-
-// --- Combined 2D ---
-
 /// Encode two 8-bit coordinates into a 16-bit Morton code.
 ///
 /// Processes both coordinates simultaneously by packing them into separate
-/// halves of a single register, requiring fewer operations than two separate
-/// calls to [`part_1_by_1`].
+/// halves of a single register, requiring fewer operations than two independent
+/// calls to the spread kernel.
 #[inline]
-pub fn encode_2d_combined(v: Vector2<u32>) -> u32 {
+pub fn encode_2d_8(v: Vector2<u8>) -> u16 {
     // Pack x at bits 0-7, y at bits 16-23. The 16-bit spacing means the
     // shift-8 step of Part1By1 is already accomplished by the packing.
-    let mut t = (v.x & 0xFF) | ((v.y & 0xFF) << 16);
+    let mut t = (v.x as u32 & 0xFF) | ((v.y as u32 & 0xFF) << 16);
     t = (t ^ (t << 4)) & 0x0F0F_0F0F;
     t = (t ^ (t << 2)) & 0x3333_3333;
     t = (t ^ (t << 1)) & 0x5555_5555;
 
     // Merge the two halves into a contiguous 16-bit code.
-    (t & 0xFFFF) | (t >> 15)
+    ((t & 0xFFFF) | (t >> 15)) as u16
 }
 
 /// Decode a 16-bit Morton code into two 8-bit coordinates.
 ///
-/// Inverse of [`encode_2d_combined`]. Separates x and y bits back into packed
-/// halves, then compacts each half.
+/// Inverse of [`encode_2d_8`]. Separates x and y bits back into packed halves,
+/// then compacts each half.
 #[inline]
-pub fn decode_2d_combined(code: u32) -> Vector2<u32> {
-    let code = code & 0xFFFF;
+pub fn decode_2d_8(code: u16) -> Vector2<u8> {
+    let code = code as u32 & 0xFFFF;
 
     // Separate x (even bits) and y (odd bits) back into packed halves.
     let mut v = (code & 0x5555) | ((code & 0xAAAA) << 15);
@@ -207,8 +144,100 @@ pub fn decode_2d_combined(code: u32) -> Vector2<u32> {
     v = (v ^ (v >> 2)) & 0x0F0F_0F0F;
     v = (v ^ (v >> 4)) & 0x00FF_00FF;
 
-    Vector2::new(v & 0xFF, (v >> 16) & 0xFF)
+    Vector2::new((v & 0xFF) as u8, ((v >> 16) & 0xFF) as u8)
 }
+
+// Generates encode_2d_{width} and decode_2d_{width} for 16- and 32-bit inputs.
+macro_rules! impl_morton_2d {
+    // 16-bit: each coordinate fits in u16, output is u32.
+    (16) => {
+        /// Encode two 16-bit coordinates into a 32-bit Morton code.
+        #[inline]
+        pub fn encode_2d_16(v: Vector2<u16>) -> u32 {
+            part_1_by_1(v.x as u32) | (part_1_by_1(v.y as u32) << 1)
+        }
+
+        /// Decode a 32-bit Morton code into two 16-bit coordinates.
+        #[inline]
+        pub fn decode_2d_16(code: u32) -> Vector2<u16> {
+            Vector2::new(
+                compact_1_by_1(code) as u16,
+                compact_1_by_1(code >> 1) as u16,
+            )
+        }
+    };
+
+    // 32-bit: each coordinate fits in u32, output is u64.
+    (32) => {
+        /// Encode two 32-bit coordinates into a 64-bit Morton code.
+        #[inline]
+        pub fn encode_2d_32(v: Vector2<u32>) -> u64 {
+            part_1_by_1_wide(v.x as u64) | (part_1_by_1_wide(v.y as u64) << 1)
+        }
+
+        /// Decode a 64-bit Morton code into two 32-bit coordinates.
+        #[inline]
+        pub fn decode_2d_32(code: u64) -> Vector2<u32> {
+            Vector2::new(
+                compact_1_by_1_wide(code) as u32,
+                compact_1_by_1_wide(code >> 1) as u32,
+            )
+        }
+    };
+}
+
+impl_morton_2d!(16);
+impl_morton_2d!(32);
+
+// --- 3D Encode/Decode ---
+
+// Generates encode_3d_{width} and decode_3d_{width} for 8- and 16-bit inputs.
+macro_rules! impl_morton_3d {
+    // 8-bit: each coordinate fits in u8 (low 8 bits used), output is u32.
+    (8) => {
+        /// Encode three 8-bit coordinates into a 24-bit Morton code.
+        #[inline]
+        pub fn encode_3d_8(v: Vector3<u8>) -> u32 {
+            part_1_by_2(v.x as u32)
+                | (part_1_by_2(v.y as u32) << 1)
+                | (part_1_by_2(v.z as u32) << 2)
+        }
+
+        /// Decode a 24-bit Morton code into three 8-bit coordinates.
+        #[inline]
+        pub fn decode_3d_8(code: u32) -> Vector3<u8> {
+            Vector3::new(
+                compact_1_by_2(code) as u8,
+                compact_1_by_2(code >> 1) as u8,
+                compact_1_by_2(code >> 2) as u8,
+            )
+        }
+    };
+
+    // 16-bit: each coordinate fits in u16 (low 16 bits used), output is u64.
+    (16) => {
+        /// Encode three 16-bit coordinates into a 48-bit Morton code.
+        #[inline]
+        pub fn encode_3d_16(v: Vector3<u16>) -> u64 {
+            part_1_by_2_wide(v.x as u64)
+                | (part_1_by_2_wide(v.y as u64) << 1)
+                | (part_1_by_2_wide(v.z as u64) << 2)
+        }
+
+        /// Decode a 48-bit Morton code into three 16-bit coordinates.
+        #[inline]
+        pub fn decode_3d_16(code: u64) -> Vector3<u16> {
+            Vector3::new(
+                compact_1_by_2_wide(code) as u16,
+                compact_1_by_2_wide(code >> 1) as u16,
+                compact_1_by_2_wide(code >> 2) as u16,
+            )
+        }
+    };
+}
+
+impl_morton_3d!(8);
+impl_morton_3d!(16);
 
 // --- Combined 3D ---
 
@@ -216,7 +245,7 @@ pub fn decode_2d_combined(code: u32) -> Vector2<u32> {
 ///
 /// Processes all three coordinates simultaneously by packing them at 21-bit
 /// offsets in a `u64` intermediary, requiring fewer operations than three
-/// separate calls to [`part_1_by_2`].
+/// separate calls to the spread kernel.
 #[inline]
 pub fn encode_3d_combined(v: Vector3<u32>) -> u32 {
     // Pack x at bits 0-6, y at bits 21-27, z at bits 42-48. The 21-bit
@@ -268,80 +297,90 @@ pub fn decode_3d_combined(code: u32) -> Vector3<u32> {
 mod tests {
     use super::*;
 
-    fn v2(x: u32, y: u32) -> Vector2<u32> { Vector2::new(x, y) }
-    fn v3(x: u32, y: u32, z: u32) -> Vector3<u32> { Vector3::new(x, y, z) }
+    fn v2_8(x: u8, y: u8)     -> Vector2<u8>  { Vector2::new(x, y) }
+    fn v2_16(x: u16, y: u16)  -> Vector2<u16> { Vector2::new(x, y) }
+    fn v2_32(x: u32, y: u32)  -> Vector2<u32> { Vector2::new(x, y) }
+    fn v3_8(x: u8, y: u8, z: u8)     -> Vector3<u8>  { Vector3::new(x, y, z) }
+    fn v3_16(x: u16, y: u16, z: u16) -> Vector3<u16> { Vector3::new(x, y, z) }
+    fn v3_32(x: u32, y: u32, z: u32) -> Vector3<u32> { Vector3::new(x, y, z) }
 
     #[test]
-    fn roundtrip_2d() {
-        let cases = [v2(0, 0), v2(1, 1), v2(0xFFFF, 0xFFFF), v2(5, 10), v2(0, 0xFFFF)];
+    fn roundtrip_2d_8() {
+        let cases = [v2_8(0, 0), v2_8(1, 1), v2_8(255, 255), v2_8(5, 10), v2_8(0, 255)];
         for v in cases {
-            let code = encode_2d(v);
-            assert_eq!(decode_2d(code), v, "roundtrip failed for {v:?}");
+            let code = encode_2d_8(v);
+            assert_eq!(decode_2d_8(code), v, "roundtrip failed for {v:?}");
         }
     }
 
     #[test]
-    fn roundtrip_2d_wide() {
+    fn roundtrip_2d_16() {
         let cases = [
-            v2(0, 0),
-            v2(1, 1),
-            v2(0xFFFF_FFFF, 0xFFFF_FFFF),
-            v2(5, 10),
-            v2(0, 0xFFFF_FFFF),
+            v2_16(0, 0),
+            v2_16(1, 1),
+            v2_16(0xFFFF, 0xFFFF),
+            v2_16(5, 10),
+            v2_16(0, 0xFFFF),
         ];
         for v in cases {
-            let code = encode_2d_wide(v);
-            assert_eq!(decode_2d_wide(code), v, "roundtrip failed for {v:?}");
+            let code = encode_2d_16(v);
+            assert_eq!(decode_2d_16(code), v, "roundtrip failed for {v:?}");
         }
     }
 
     #[test]
-    fn roundtrip_3d() {
+    fn roundtrip_2d_32() {
         let cases = [
-            v3(0, 0, 0),
-            v3(1, 1, 1),
-            v3(1023, 1023, 1023),
-            v3(5, 10, 15),
-            v3(0, 0, 1023),
+            v2_32(0, 0),
+            v2_32(1, 1),
+            v2_32(0xFFFF_FFFF, 0xFFFF_FFFF),
+            v2_32(5, 10),
+            v2_32(0, 0xFFFF_FFFF),
         ];
         for v in cases {
-            let code = encode_3d(v);
-            assert_eq!(decode_3d(code), v, "roundtrip failed for {v:?}");
+            let code = encode_2d_32(v);
+            assert_eq!(decode_2d_32(code), v, "roundtrip failed for {v:?}");
         }
     }
 
     #[test]
-    fn roundtrip_3d_wide() {
+    fn roundtrip_3d_8() {
         let cases = [
-            v3(0, 0, 0),
-            v3(1, 1, 1),
-            v3(0x1F_FFFF, 0x1F_FFFF, 0x1F_FFFF),
-            v3(5, 10, 15),
-            v3(0, 0, 0x1F_FFFF),
+            v3_8(0, 0, 0),
+            v3_8(1, 1, 1),
+            v3_8(255, 255, 255),
+            v3_8(5, 10, 15),
+            v3_8(0, 0, 255),
         ];
         for v in cases {
-            let code = encode_3d_wide(v);
-            assert_eq!(decode_3d_wide(code), v, "roundtrip failed for {v:?}");
+            let code = encode_3d_8(v);
+            assert_eq!(decode_3d_8(code), v, "roundtrip failed for {v:?}");
         }
     }
 
     #[test]
-    fn roundtrip_2d_combined() {
-        let cases = [v2(0, 0), v2(1, 1), v2(255, 255), v2(5, 10), v2(0, 255)];
+    fn roundtrip_3d_16() {
+        let cases = [
+            v3_16(0, 0, 0),
+            v3_16(1, 1, 1),
+            v3_16(0xFFFF, 0xFFFF, 0xFFFF),
+            v3_16(5, 10, 15),
+            v3_16(0, 0, 0xFFFF),
+        ];
         for v in cases {
-            let code = encode_2d_combined(v);
-            assert_eq!(decode_2d_combined(code), v, "roundtrip failed for {v:?}");
+            let code = encode_3d_16(v);
+            assert_eq!(decode_3d_16(code), v, "roundtrip failed for {v:?}");
         }
     }
 
     #[test]
     fn roundtrip_3d_combined() {
         let cases = [
-            v3(0, 0, 0),
-            v3(1, 1, 1),
-            v3(127, 127, 127),
-            v3(5, 10, 15),
-            v3(0, 0, 127),
+            v3_32(0, 0, 0),
+            v3_32(1, 1, 1),
+            v3_32(127, 127, 127),
+            v3_32(5, 10, 15),
+            v3_32(0, 0, 127),
         ];
         for v in cases {
             let code = encode_3d_combined(v);
@@ -351,50 +390,48 @@ mod tests {
 
     #[test]
     fn known_values_2d() {
-        assert_eq!(encode_2d(v2(0, 0)), 0);
-        assert_eq!(encode_2d(v2(1, 0)), 1);
-        assert_eq!(encode_2d(v2(0, 1)), 2);
-        assert_eq!(encode_2d(v2(1, 1)), 3);
-        assert_eq!(encode_2d(v2(2, 0)), 4);
+        assert_eq!(encode_2d_16(v2_16(0, 0)), 0);
+        assert_eq!(encode_2d_16(v2_16(1, 0)), 1);
+        assert_eq!(encode_2d_16(v2_16(0, 1)), 2);
+        assert_eq!(encode_2d_16(v2_16(1, 1)), 3);
+        assert_eq!(encode_2d_16(v2_16(2, 0)), 4);
     }
 
     #[test]
     fn known_values_3d() {
-        assert_eq!(encode_3d(v3(1, 0, 0)), 1);
-        assert_eq!(encode_3d(v3(0, 1, 0)), 2);
-        assert_eq!(encode_3d(v3(0, 0, 1)), 4);
-        assert_eq!(encode_3d(v3(1, 1, 1)), 7);
+        assert_eq!(encode_3d_8(v3_8(1, 0, 0)), 1);
+        assert_eq!(encode_3d_8(v3_8(0, 1, 0)), 2);
+        assert_eq!(encode_3d_8(v3_8(0, 0, 1)), 4);
+        assert_eq!(encode_3d_8(v3_8(1, 1, 1)), 7);
     }
 
     #[test]
-    fn cross_validate_2d_combined() {
-        // For 8-bit coordinates, encode_2d and encode_2d_combined must agree.
-        for x in [0, 1, 2, 17, 128, 254, 255] {
-            for y in [0, 1, 2, 17, 128, 254, 255] {
-                let v        = v2(x, y);
-                let standard = encode_2d(v) & 0xFFFF;
-                let combined = encode_2d_combined(v);
+    fn cross_validate_2d_8_vs_16() {
+        // For 8-bit coordinates, encode_2d_8 and encode_2d_16 must agree.
+        for x in [0u8, 1, 2, 17, 128, 254, 255] {
+            for y in [0u8, 1, 2, 17, 128, 254, 255] {
+                let by_8  = encode_2d_8(v2_8(x, y)) as u32;
+                let by_16 = encode_2d_16(v2_16(x as u16, y as u16)) & 0xFFFF;
                 assert_eq!(
-                    standard, combined,
-                    "2d mismatch for ({x}, {y}): standard={standard:#X}, combined={combined:#X}",
+                    by_8, by_16,
+                    "2d mismatch for ({x}, {y}): encode_2d_8={by_8:#X}, encode_2d_16={by_16:#X}",
                 );
             }
         }
     }
 
     #[test]
-    fn cross_validate_3d_combined() {
-        // For 7-bit coordinates, encode_3d and encode_3d_combined must agree.
-        for x in [0, 1, 2, 17, 64, 126, 127] {
-            for y in [0, 1, 2, 17, 64, 126, 127] {
-                for z in [0, 1, 2, 17, 64, 126, 127] {
-                    let v        = v3(x, y, z);
-                    let standard = encode_3d(v) & 0x1F_FFFF;
-                    let combined = encode_3d_combined(v);
+    fn cross_validate_3d_8_vs_combined() {
+        // For 7-bit coordinates, encode_3d_8 and encode_3d_combined must agree.
+        for x in [0u8, 1, 2, 17, 64, 126, 127] {
+            for y in [0u8, 1, 2, 17, 64, 126, 127] {
+                for z in [0u8, 1, 2, 17, 64, 126, 127] {
+                    let by_8        = encode_3d_8(v3_8(x, y, z)) & 0x1F_FFFF;
+                    let by_combined = encode_3d_combined(v3_32(x as u32, y as u32, z as u32));
                     assert_eq!(
-                        standard, combined,
+                        by_8, by_combined,
                         "3d mismatch for ({x}, {y}, {z}): \
-                         standard={standard:#X}, combined={combined:#X}",
+                         encode_3d_8={by_8:#X}, encode_3d_combined={by_combined:#X}",
                     );
                 }
             }
