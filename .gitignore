@@ -31,4 +31,4 @@
 .claude/settings.local.json
 
 # Local MCP confiugurations.
-.mcp.json
+.mcp.jsonCargo.lock
