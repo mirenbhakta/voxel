@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/scaffold"]
+
 [package]
 name = "voxel"
 version = "0.1.0"
