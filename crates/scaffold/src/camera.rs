@@ -33,11 +33,11 @@ pub struct Camera {
 impl Camera {
     /// Create a camera with default settings.
     ///
-    /// Positioned above and behind the chunk origin, looking toward the
-    /// center. 60 degree vertical FOV, 16:9 aspect.
+    /// Positioned above and behind the chunk grid center, looking toward
+    /// it. 60 degree vertical FOV, 16:9 aspect.
     pub fn new() -> Self {
         Camera {
-            position : Vec3::new(16.0, 20.0, -10.0),
+            position : Vec3::new(64.0, 40.0, -20.0),
             yaw      : std::f32::consts::PI,
             pitch    : -0.4,
             fov_y    : 60.0_f32.to_radians(),

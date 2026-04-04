@@ -17,6 +17,10 @@ struct Camera {
 // Page table mapping logical block indices to physical block IDs.
 @group(0) @binding(2) var<storage, read> page_table : array<u32>;
 
+// Per-slot chunk world offsets in voxel units (vec4<i32>, w unused).
+// Indexed by slot = instance_index / SLOT_INSTANCE_STRIDE (98304).
+@group(0) @binding(3) var<storage, read> chunk_offsets : array<vec4<i32>>;
+
 
 // Vertex shader output.
 struct VertexOutput {
@@ -126,9 +130,15 @@ fn vs_main(
     let face_row   = row + corner.y * height;
     let face_layer = layer + IS_POSITIVE[dir];
 
-    let pos = LAYER_VEC[dir] * face_layer
-            + COL_VEC[dir]   * face_col
-            + ROW_VEC[dir]   * face_row;
+    let local_pos = LAYER_VEC[dir] * face_layer
+                  + COL_VEC[dir]   * face_col
+                  + ROW_VEC[dir]   * face_row;
+
+    // Derive slot from instance index and apply chunk world offset.
+    // 98304 = MAX_CHUNK_BLOCKS (384) * BLOCK_SIZE (256).
+    let slot   = instance_index / 98304u;
+    let offset = chunk_offsets[slot];
+    let pos    = local_pos + vec3<f32>(f32(offset.x), f32(offset.y), f32(offset.z));
 
     var out : VertexOutput;
     out.clip_position = camera.view_proj * vec4<f32>(pos, 1.0);

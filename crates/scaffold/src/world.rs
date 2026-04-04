@@ -27,8 +27,8 @@ const BLOCK_SIZE: u32       = 256;
 /// Bytes per block.
 const BLOCK_BYTES: u64      = BLOCK_SIZE as u64 * 4;
 
-/// Total blocks in the pool. 4096 blocks = 4 MB total quad storage.
-const POOL_BLOCKS: u32      = 4096;
+/// Total blocks in the pool. 8192 blocks = 8 MB total quad storage.
+const POOL_BLOCKS: u32      = 8192;
 
 /// Maximum blocks any single chunk can use (worst case: 98304 / 256).
 const MAX_CHUNK_BLOCKS: u32 = 384;
@@ -54,13 +54,15 @@ const SLOT_INSTANCE_STRIDE: u32 = MAX_CHUNK_BLOCKS * BLOCK_SIZE;
 /// block IDs in the pool.
 struct QuadPool {
     /// The shared quad storage buffer.
-    quad_buf    : Buffer,
+    quad_buf         : Buffer,
     /// The page table mapping logical to physical block IDs.
-    page_table  : Buffer,
+    page_table       : Buffer,
+    /// Per-slot chunk world offsets (`vec4<i32>` stride, xyz in voxel units).
+    chunk_offset_buf : Buffer,
     /// Free block IDs (LIFO stack).
-    free_blocks : Vec<u32>,
+    free_blocks      : Vec<u32>,
     /// Free page table slot indices (LIFO stack).
-    free_slots  : Vec<u32>,
+    free_slots       : Vec<u32>,
 }
 
 // --- QuadPool ---
@@ -85,14 +87,23 @@ impl QuadPool {
             mapped_at_creation : false,
         });
 
+        let chunk_offset_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("chunk_offsets"),
+            size               : u64::from(MAX_CHUNKS) * 16,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
         let free_blocks = (0..POOL_BLOCKS).rev().collect();
         let free_slots  = (0..MAX_CHUNKS).rev().collect();
 
         QuadPool {
-            quad_buf    : quad_buf,
-            page_table  : page_table,
-            free_blocks : free_blocks,
-            free_slots  : free_slots,
+            quad_buf         : quad_buf,
+            page_table       : page_table,
+            chunk_offset_buf : chunk_offset_buf,
+            free_blocks      : free_blocks,
+            free_slots       : free_slots,
         }
     }
 
@@ -145,6 +156,23 @@ impl QuadPool {
             &self.page_table,
             offset,
             bytemuck::cast_slice(block_ids),
+        );
+    }
+
+    /// Write a chunk's world-space voxel offset into the offset buffer.
+    fn write_chunk_offset(
+        &self,
+        queue : &Queue,
+        slot  : u32,
+        pos   : ChunkPos,
+    )
+    {
+        let data: [i32; 4] = [pos.x * 32, pos.y * 32, pos.z * 32, 0];
+
+        queue.write_buffer(
+            &self.chunk_offset_buf,
+            u64::from(slot) * 16,
+            bytemuck::cast_slice(&data),
         );
     }
 }
@@ -249,6 +277,10 @@ impl GpuWorld {
                     binding  : 2,
                     resource : pool.page_table.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding  : 3,
+                    resource : pool.chunk_offset_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -296,8 +328,9 @@ impl GpuWorld {
         let slot      = self.pool.alloc_slot();
         let block_ids = self.pool.alloc_blocks(MAX_CHUNK_BLOCKS);
 
-        // Write block IDs to the page table.
+        // Write block IDs to the page table and chunk world offset.
         self.pool.write_page_table(queue, slot, &block_ids);
+        self.pool.write_chunk_offset(queue, slot, pos);
 
         let build = ChunkBuildData::new(
             device,

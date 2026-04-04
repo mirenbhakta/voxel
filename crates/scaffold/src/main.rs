@@ -249,6 +249,18 @@ impl ApplicationHandler for App {
                         },
                         count : None,
                     },
+                    BindGroupLayoutEntry {
+                        binding    : 3,
+                        visibility : ShaderStages::VERTEX,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
                 ],
             },
         );
@@ -323,8 +335,13 @@ impl ApplicationHandler for App {
             camera_buf.clone(),
         );
 
-        let occ = generate_test_occupancy();
-        world.insert(&device, &queue, ChunkPos::new(0, 0, 0), &occ);
+        for cx in 0..4i32 {
+            for cz in 0..4i32 {
+                let occ = generate_test_occupancy_varied(cx, cz);
+                world.insert(&device, &queue, ChunkPos::new(cx, 0, cz), &occ);
+            }
+        }
+
         world.rebuild(&device, &queue);
 
         self.gpu = Some(Gpu {
@@ -605,14 +622,17 @@ fn create_depth_texture(
 // Test data generation
 // ---------------------------------------------------------------------------
 
-/// Generate a test occupancy bitmask for a 32x8x32 platform.
+/// Generate a test occupancy bitmask with a chunk-dependent fill height.
 ///
-/// Layout: `occ[z * 32 + y]`, bit x. Fills y=0..8 for all x and z.
-fn generate_test_occupancy() -> [u32; 1024] {
+/// Layout: `occ[z * 32 + y]`, bit x. Fill height varies by chunk
+/// position so adjacent chunks are visually distinguishable.
+fn generate_test_occupancy_varied(cx: i32, cz: i32) -> [u32; 1024] {
     let mut occ = [0u32; 1024];
 
+    let height = (4 + ((cx * 3 + cz * 7).unsigned_abs() % 8)) as usize;
+
     for z in 0..32 {
-        for y in 0..8 {
+        for y in 0..height.min(32) {
             occ[z * 32 + y] = !0u32;
         }
     }
