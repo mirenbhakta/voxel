@@ -38,7 +38,7 @@ impl Camera {
     pub fn new() -> Self {
         Camera {
             position : Vec3::new(16.0, 20.0, -10.0),
-            yaw      : 0.0,
+            yaw      : std::f32::consts::PI,
             pitch    : -0.4,
             fov_y    : 60.0_f32.to_radians(),
             aspect   : 16.0 / 9.0,

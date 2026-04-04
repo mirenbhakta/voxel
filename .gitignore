@@ -12,6 +12,7 @@
 
 # --- Files ---
 **/*.rs.bk
+Cargo.lock
 
 # Allow settings.json, we add natvis info in there.
 !.vscode/settings.json

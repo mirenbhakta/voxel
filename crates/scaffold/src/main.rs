@@ -4,6 +4,7 @@
 //! quads using instanced drawing from packed quad descriptors. Includes an
 //! FPS camera with WASD + mouse look controls.
 
+mod build;
 mod camera;
 
 use std::sync::Arc;
@@ -34,8 +35,6 @@ use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, W
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
-
-use voxel::render::{Direction, FaceMasks, FaceNeighbors};
 
 use camera::Camera;
 
@@ -189,15 +188,21 @@ impl ApplicationHandler for App {
         // Update camera aspect ratio to match the window.
         self.camera.aspect = config.width as f32 / config.height as f32;
 
-        // Generate test quad data from a chunk's face masks.
-        let quads      = generate_test_quads();
-        let quad_count = quads.len() as u32;
+        // Build quad buffer on the GPU via compute shader.
+        let occ            = generate_test_occupancy();
+        let build_pipeline = build::BuildPipeline::new(&device);
+        let chunk_data     = build::ChunkBuildData::new(
+            &device, &build_pipeline, &occ,
+        );
 
-        let quad_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label    : Some("quad_buf"),
-            contents : bytemuck::cast_slice(&quads),
-            usage    : BufferUsages::STORAGE,
-        });
+        let mut build_encoder = device.create_command_encoder(
+            &CommandEncoderDescriptor::default(),
+        );
+        chunk_data.dispatch(&mut build_encoder, &build_pipeline);
+        queue.submit(Some(build_encoder.finish()));
+
+        let quad_count = chunk_data.read_quad_count(&device);
+        eprintln!("build stage: {quad_count} quads");
 
         // Camera uniform buffer.
         let camera_uniform = CameraUniform {
@@ -251,7 +256,7 @@ impl ApplicationHandler for App {
                 },
                 BindGroupEntry {
                     binding  : 1,
-                    resource : quad_buf.as_entire_binding(),
+                    resource : chunk_data.quad_buf.as_entire_binding(),
                 },
             ],
         });
@@ -598,52 +603,19 @@ fn create_depth_texture(
 // Test data generation
 // ---------------------------------------------------------------------------
 
-/// Generate packed quad descriptors from a test chunk.
+/// Generate a test occupancy bitmask for a 32x8x32 platform.
 ///
-/// Fills a 32x8x32 platform at y=0..8, derives face masks, and emits
-/// one 1x1 quad per visible face. Direction is packed into bits 25-27.
-fn generate_test_quads() -> Vec<u32> {
-    // Build occupancy directly. Layout: occ[z * 32 + y], bit x.
-    // Fill y=0..8 for all x and z (a solid platform).
-    let mut occ = vec![0u32; 1024];
+/// Layout: `occ[z * 32 + y]`, bit x. Fills y=0..8 for all x and z.
+fn generate_test_occupancy() -> [u32; 1024] {
+    let mut occ = [0u32; 1024];
 
     for z in 0..32 {
         for y in 0..8 {
-            // All 32 x-bits set in this word.
             occ[z * 32 + y] = !0u32;
         }
     }
 
-    // Derive face masks with no neighbors (boundary faces exposed).
-    let neighbors = FaceNeighbors::none();
-    let faces     = FaceMasks::from_occupancy(&occ, &neighbors);
-
-    // Emit one packed u32 per visible face bit.
-    let mut quads = Vec::new();
-
-    for &dir in &Direction::ALL {
-        for layer in 0..32usize {
-            for row in 0..32usize {
-                let word = faces.word(dir, layer, row);
-                let mut bits = word;
-
-                while bits != 0 {
-                    let col = bits.trailing_zeros();
-                    bits &= bits - 1;
-
-                    // Pack: col(5) | row(5) | layer(5) | 0(5) | 0(5) | dir(3)
-                    let packed = col
-                        | ((row as u32) << 5)
-                        | ((layer as u32) << 10)
-                        | ((dir as u32) << 25);
-
-                    quads.push(packed);
-                }
-            }
-        }
-    }
-
-    quads
+    occ
 }
 
 // ---------------------------------------------------------------------------
