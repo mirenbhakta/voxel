@@ -15,8 +15,15 @@
 // Atomic quad count (initialized to 0 before dispatch).
 @group(0) @binding(1) var<storage, read_write> quad_count : atomic<u32>;
 
-// Output quad buffer (pre-allocated worst case).
+// Shared quad pool (all chunks write into this).
 @group(0) @binding(2) var<storage, read_write> quads : array<u32>;
+
+// Page table mapping logical block indices to physical block IDs.
+@group(0) @binding(3) var<storage, read> page_table : array<u32>;
+
+// Per-dispatch chunk slot offset into the page table.
+struct Immediates { block_base : u32, }
+var<immediate> imm : Immediates;
 
 // Shared memory for the 32-word face layer. Used by the Y-direction
 // transpose and by the greedy merge.
@@ -118,9 +125,16 @@ fn build(
                     | ((height - 1u) << 20u)
                     | (dir << 25u);
 
-                let idx = atomicAdd(&quad_count, 1u);
-                if idx < arrayLength(&quads) {
-                    quads[idx] = packed;
+                // Map the local quad index through the page table to a
+                // physical slot in the shared quad pool.
+                let local_idx = atomicAdd(&quad_count, 1u);
+                let block_idx = local_idx / 256u;
+                let block_off = local_idx % 256u;
+                let block_id  = page_table[imm.block_base + block_idx];
+                let phys_idx  = block_id * 256u + block_off;
+
+                if phys_idx < arrayLength(&quads) {
+                    quads[phys_idx] = packed;
                 }
             }
         }

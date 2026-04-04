@@ -10,22 +10,10 @@ use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType,
     BufferDescriptor, BufferUsages, CommandEncoder, ComputePassDescriptor,
-    ComputePipeline, ComputePipelineDescriptor, Device,
+    ComputePipeline, ComputePipelineDescriptor, Device, Queue,
     PipelineCompilationOptions, PipelineLayoutDescriptor,
     ShaderModuleDescriptor, ShaderSource, ShaderStages,
 };
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Maximum quads a single chunk can produce.
-///
-/// Worst case is a 3D checkerboard: every other voxel occupied, each
-/// with 6 exposed faces. 32^3 / 2 * 6 = 98304 quads. Greedy merge
-/// reduces this dramatically, but the buffer must handle the pathological
-/// case.
-const MAX_QUADS: u32 = 98_304;
 
 // ---------------------------------------------------------------------------
 // BuildPipeline
@@ -79,13 +67,26 @@ impl BuildPipeline {
                         },
                         count : None,
                     },
-                    // binding 2: quad buffer (read-write storage)
+                    // binding 2: shared quad pool (read-write storage)
                     BindGroupLayoutEntry {
                         binding    : 2,
                         visibility : ShaderStages::COMPUTE,
                         ty         : BindingType::Buffer {
                             ty                 : BufferBindingType::Storage {
                                 read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 3: page table (read-only storage)
+                    BindGroupLayoutEntry {
+                        binding    : 3,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
                             },
                             has_dynamic_offset : false,
                             min_binding_size   : None,
@@ -100,7 +101,7 @@ impl BuildPipeline {
             &PipelineLayoutDescriptor {
                 label              : Some("build_pl"),
                 bind_group_layouts : &[Some(&bg_layout)],
-                immediate_size     : 0,
+                immediate_size     : 4,
             },
         );
 
@@ -126,11 +127,9 @@ impl BuildPipeline {
 /// GPU resources for building one chunk's quad buffer.
 pub struct ChunkBuildData {
     /// The chunk's occupancy bitmask on the GPU (4 KB).
-    _occupancy_buf : Buffer,
+    occupancy_buf  : Buffer,
     /// Atomic quad count (4 bytes, zeroed before dispatch).
     quad_count_buf : Buffer,
-    /// Output quad buffer, read by the render pipeline.
-    pub quad_buf   : Buffer,
     /// Staging buffer for reading back the quad count to CPU.
     count_staging  : Buffer,
     /// Bind group for the compute dispatch.
@@ -140,19 +139,31 @@ pub struct ChunkBuildData {
 impl ChunkBuildData {
     /// Create GPU resources for building a chunk's quad buffer.
     ///
-    /// Uploads the occupancy data and allocates output buffers. The quad
-    /// count is initialized to zero.
+    /// Uploads the occupancy data and allocates per-chunk buffers. The
+    /// bind group references the shared quad pool and page table rather
+    /// than a per-chunk quad buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `device`     - The GPU device for resource creation.
+    /// * `pipeline`   - The build compute pipeline (provides the BGL).
+    /// * `occ`        - Initial chunk occupancy bitmask.
+    /// * `quad_pool`  - The shared quad storage buffer.
+    /// * `page_table` - The shared page table buffer.
     pub fn new(
-        device   : &Device,
-        pipeline : &BuildPipeline,
-        occ      : &[u32; 1024],
+        device     : &Device,
+        pipeline   : &BuildPipeline,
+        occ        : &[u32; 1024],
+        quad_pool  : &Buffer,
+        page_table : &Buffer,
     ) -> Self
     {
         let occupancy_buf = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label    : Some("build_occ"),
                 contents : bytemuck::cast_slice(occ),
-                usage    : BufferUsages::STORAGE,
+                usage    : BufferUsages::STORAGE
+                         | BufferUsages::COPY_DST,
             },
         );
 
@@ -162,16 +173,10 @@ impl ChunkBuildData {
                 label    : Some("build_count"),
                 contents : bytemuck::bytes_of(&0u32),
                 usage    : BufferUsages::STORAGE
-                         | BufferUsages::COPY_SRC,
+                         | BufferUsages::COPY_SRC
+                         | BufferUsages::COPY_DST,
             },
         );
-
-        let quad_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("build_quads"),
-            size               : u64::from(MAX_QUADS) * 4,
-            usage              : BufferUsages::STORAGE,
-            mapped_at_creation : false,
-        });
 
         let count_staging = device.create_buffer(&BufferDescriptor {
             label              : Some("build_count_staging"),
@@ -195,30 +200,45 @@ impl ChunkBuildData {
                 },
                 BindGroupEntry {
                     binding  : 2,
-                    resource : quad_buf.as_entire_binding(),
+                    resource : quad_pool.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 3,
+                    resource : page_table.as_entire_binding(),
                 },
             ],
         });
 
         ChunkBuildData {
-            _occupancy_buf : occupancy_buf,
-            quad_count_buf,
-            quad_buf,
-            count_staging,
-            bind_group,
+            occupancy_buf  : occupancy_buf,
+            quad_count_buf : quad_count_buf,
+            count_staging  : count_staging,
+            bind_group     : bind_group,
         }
     }
 
     /// Record the compute dispatch and count readback copy.
     ///
-    /// After this call, submit the encoder to the queue. Then call
-    /// [`read_quad_count`] to retrieve the result.
+    /// Resets the atomic counter, dispatches the compute pass with the
+    /// chunk's page table offset, and copies the counter to the staging
+    /// buffer. After this call, submit the encoder to the queue, then
+    /// call [`read_quad_count`] to retrieve the result.
+    ///
+    /// # Arguments
+    ///
+    /// * `encoder`    - The command encoder to record into.
+    /// * `pipeline`   - The build compute pipeline.
+    /// * `block_base` - Offset into the page table for this chunk's slot.
     pub fn dispatch(
         &self,
-        encoder  : &mut CommandEncoder,
-        pipeline : &BuildPipeline,
+        encoder    : &mut CommandEncoder,
+        pipeline   : &BuildPipeline,
+        block_base : u32,
     )
     {
+        // Reset the atomic counter to zero.
+        encoder.clear_buffer(&self.quad_count_buf, 0, None);
+
         // Compute pass: face derivation + greedy merge.
         {
             let mut pass = encoder.begin_compute_pass(
@@ -230,6 +250,7 @@ impl ChunkBuildData {
 
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_immediates(0, bytemuck::bytes_of(&block_base));
             pass.dispatch_workgroups(32, 6, 1);
         }
 
@@ -238,6 +259,18 @@ impl ChunkBuildData {
             &self.quad_count_buf, 0,
             &self.count_staging,  0,
             4,
+        );
+    }
+
+    /// Upload new occupancy data to the GPU buffer.
+    ///
+    /// The data is written immediately via the queue. The caller must
+    /// dispatch the build shader afterward to update the quad buffer.
+    pub fn upload_occupancy(&self, queue: &Queue, occ: &[u32; 1024]) {
+        queue.write_buffer(
+            &self.occupancy_buf,
+            0,
+            bytemuck::cast_slice(occ),
         );
     }
 

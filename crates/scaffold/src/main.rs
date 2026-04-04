@@ -6,6 +6,7 @@
 
 mod build;
 mod camera;
+mod world;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,19 +16,20 @@ use glam::Vec3;
 use pollster::FutureExt as _;
 use wgpu::util::DeviceExt;
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
+    BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferUsages,
     Color, ColorTargetState, ColorWrites, CommandEncoderDescriptor,
     CompareFunction, CurrentSurfaceTexture, DepthBiasState, DepthStencilState,
-    Device, DeviceDescriptor, Extent3d, Face, FragmentState, FrontFace,
-    Instance, InstanceDescriptor, LoadOp, MultisampleState, Operations,
-    PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode,
-    PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment,
-    RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, RequestAdapterOptions, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages, StencilState, StoreOp, Surface,
-    SurfaceConfiguration, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureUsages, TextureView, TextureViewDescriptor, VertexState,
+    Device, DeviceDescriptor, Extent3d, Face, Features, FragmentState,
+    FrontFace, Instance, InstanceDescriptor, Limits, LoadOp, MultisampleState,
+    Operations, PipelineCompilationOptions, PipelineLayoutDescriptor,
+    PolygonMode, PrimitiveState, PrimitiveTopology, Queue,
+    RenderPassColorAttachment, RenderPassDepthStencilAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
+    RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, ShaderStages,
+    StencilState, StoreOp, Surface, SurfaceConfiguration, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor, VertexState,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -37,6 +39,8 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use camera::Camera;
+use voxel::chunk::ChunkPos;
+use world::GpuWorld;
 
 // ---------------------------------------------------------------------------
 // GPU types
@@ -118,14 +122,12 @@ struct Gpu {
     queue      : Queue,
     /// The voxel rendering pipeline.
     pipeline   : RenderPipeline,
-    /// The bind group containing camera and quad buffers.
-    bind_group : BindGroup,
     /// The camera uniform buffer.
     camera_buf : Buffer,
     /// The depth buffer texture view.
     depth_view : TextureView,
-    /// The number of quad instances to draw.
-    quad_count : u32,
+    /// The GPU world manager (chunks, build pipeline, draw state).
+    world      : GpuWorld,
 }
 
 // --- App ---
@@ -171,9 +173,17 @@ impl ApplicationHandler for App {
             .block_on()
             .expect("no compatible adapter found");
 
-        // Request the device and queue.
+        // Request the device and queue with immediates support.
         let (device, queue) = adapter
-            .request_device(&DeviceDescriptor::default())
+            .request_device(&DeviceDescriptor {
+                label             : Some("scaffold_device"),
+                required_features : Features::IMMEDIATES,
+                required_limits   : Limits {
+                    max_immediate_size : 4,
+                    ..Limits::default()
+                },
+                ..Default::default()
+            })
             .block_on()
             .expect("failed to create device");
 
@@ -188,22 +198,6 @@ impl ApplicationHandler for App {
         // Update camera aspect ratio to match the window.
         self.camera.aspect = config.width as f32 / config.height as f32;
 
-        // Build quad buffer on the GPU via compute shader.
-        let occ            = generate_test_occupancy();
-        let build_pipeline = build::BuildPipeline::new(&device);
-        let chunk_data     = build::ChunkBuildData::new(
-            &device, &build_pipeline, &occ,
-        );
-
-        let mut build_encoder = device.create_command_encoder(
-            &CommandEncoderDescriptor::default(),
-        );
-        chunk_data.dispatch(&mut build_encoder, &build_pipeline);
-        queue.submit(Some(build_encoder.finish()));
-
-        let quad_count = chunk_data.read_quad_count(&device);
-        eprintln!("build stage: {quad_count} quads");
-
         // Camera uniform buffer.
         let camera_uniform = CameraUniform {
             view_proj : self.camera.view_proj().to_cols_array(),
@@ -215,7 +209,7 @@ impl ApplicationHandler for App {
             usage    : BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
 
-        // Bind group layout: camera uniform + quad storage.
+        // Bind group layout: camera uniform + shared quad pool + page table.
         let bind_group_layout = device.create_bind_group_layout(
             &BindGroupLayoutDescriptor {
                 label   : Some("main_bgl"),
@@ -242,24 +236,21 @@ impl ApplicationHandler for App {
                         },
                         count : None,
                     },
+                    BindGroupLayoutEntry {
+                        binding    : 2,
+                        visibility : ShaderStages::VERTEX,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
                 ],
             },
         );
-
-        let bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label   : Some("main_bg"),
-            layout  : &bind_group_layout,
-            entries : &[
-                BindGroupEntry {
-                    binding  : 0,
-                    resource : camera_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding  : 1,
-                    resource : chunk_data.quad_buf.as_entire_binding(),
-                },
-            ],
-        });
 
         // Load the shader.
         let shader = device.create_shader_module(ShaderModuleDescriptor {
@@ -272,9 +263,9 @@ impl ApplicationHandler for App {
         // Pipeline layout.
         let pipeline_layout = device.create_pipeline_layout(
             &PipelineLayoutDescriptor {
-                label                : Some("main_pl"),
+                label              : Some("main_pl"),
                 bind_group_layouts : &[Some(&bind_group_layout)],
-                immediate_size     : 0,
+                immediate_size     : 4,
             },
         );
 
@@ -324,9 +315,20 @@ impl ApplicationHandler for App {
             config.height,
         );
 
+        // GPU world manager.
+        let mut world = GpuWorld::new(
+            &device,
+            bind_group_layout,
+            camera_buf.clone(),
+        );
+
+        let occ = generate_test_occupancy();
+        world.insert(&device, &queue, ChunkPos::new(0, 0, 0), &occ);
+        world.rebuild(&device, &queue);
+
         self.gpu = Some(Gpu {
             window, surface, config, device, queue,
-            pipeline, bind_group, camera_buf, depth_view, quad_count,
+            pipeline, camera_buf, depth_view, world,
         });
 
         // Start the render loop.
@@ -497,8 +499,7 @@ impl ApplicationHandler for App {
                     );
 
                     pass.set_pipeline(&gpu.pipeline);
-                    pass.set_bind_group(0, &gpu.bind_group, &[]);
-                    pass.draw(0..6, 0..gpu.quad_count);
+                    gpu.world.draw(&mut pass);
                 }
 
                 gpu.queue.submit(Some(encoder.finish()));
