@@ -21,12 +21,7 @@ optional. A search that returns nothing is fine; skipping the search is not.
 - Use the `memory-maintain` agent when prompted by the SessionStart hook.
 - Use the `memory-summarize` agent to regenerate stale summaries.
 
-Entity types: note, log, fact, failure, decision, convention, knowledge,
-skill, artifact, task, summary.
-
 ## Project Config
-
-Define your project's commands here. Agents reference these by name.
 
 | Key | Command | Notes |
 |-----|---------|-------|
@@ -216,8 +211,6 @@ checks, ask where the single correct enforcement point is.
 
 Language-specific conventions, formatting rules, and documentation style belong in
 `.claude/context/` files, not here. Agents read these files during setup.
-
-See `.claude/context/README.md` for how to create and organize context files.
 
 ---
 
@@ -416,5 +409,3 @@ For documentation style, voice, and structure, read `.claude/context/docs.md`.
 - **Verify honestly.** Run `cargo check` and `cargo test` before reporting completion.
   Report the actual output. If something fails, say so with the error. If you did not run
   a check, say that. Never claim success without evidence.
-
-# TWEAKS

@@ -14,7 +14,7 @@ description: >
 
 ## Label Taxonomy
 
-Every issue gets at least one `type:` label and one `area:` label.
+Every issue gets at least one `type:` label.
 
 ### Type (required, pick one)
 
@@ -28,19 +28,6 @@ Every issue gets at least one `type:` label and one `area:` label.
 | `type: research` | Investigation or exploration |
 | `type: task` | Doesn't fit other categories |
 | `type: tracking` | Meta-issue tracking a larger initiative |
-
-### Area (required, pick all that apply)
-
-> **Replace these with your project's subsystems.** The labels below are
-> examples to show the pattern.
-
-| Label | Scope |
-|-------|-------|
-| `area: frontend` | Client-side UI and rendering |
-| `area: backend` | Server-side logic and APIs |
-| `area: infrastructure` | Deployment, CI/CD, hosting |
-| `area: documentation` | Docs, guides, references |
-| `area: tooling` | Developer tools and scripts |
 
 ### Impact (recommended)
 

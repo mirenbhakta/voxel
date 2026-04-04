@@ -11,11 +11,9 @@ description: >
 1. Run in parallel:
    - `git status` (never `-uall`)
    - `git diff` for any uncommitted changes
-   - `git log --oneline main..HEAD` to see all commits on this branch
-   - `git diff main...HEAD --stat` for a file-level summary
+   - `git log --oneline master..HEAD` to see all commits on this branch
+   - `git diff master...HEAD --stat` for a file-level summary
    - Check if current branch tracks a remote and is up to date
-
-   > **Note:** Replace `main` with your default branch name if different.
 
 2. Analyze ALL commits on the branch (not just the latest). Draft the PR.
 

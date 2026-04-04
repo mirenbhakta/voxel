@@ -75,9 +75,6 @@ If the commit resolves a PR, include `(#N)` at the end of the title.
 | Migrate | Moving to a new version or API |
 | Update | Enhancing an existing feature |
 
-> **Customization:** If your project uses a different commit format (e.g.,
-> `[scope] - Action`), replace the Title Line section above.
-
 ### Body
 
 Structured paragraphs describing what changed and why. For non-trivial commits:
