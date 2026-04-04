@@ -17,9 +17,6 @@ struct Camera {
 // Page table mapping logical block indices to physical block IDs.
 @group(0) @binding(2) var<storage, read> page_table : array<u32>;
 
-// Per-draw chunk slot offset into the page table.
-struct Immediates { block_base : u32, }
-var<immediate> imm : Immediates;
 
 // Vertex shader output.
 struct VertexOutput {
@@ -96,11 +93,13 @@ fn vs_main(
     @builtin(instance_index) instance_index : u32,
 ) -> VertexOutput
 {
-    // Map instance index through the page table to the physical quad
-    // location in the shared pool.
+    // Map absolute instance index through the page table to the physical
+    // quad location in the shared pool. first_instance encodes the
+    // page-table base, so instance_index / 256 is already the global
+    // block index.
     let block_idx = instance_index / 256u;
     let block_off = instance_index % 256u;
-    let block_id  = page_table[imm.block_base + block_idx];
+    let block_id  = page_table[block_idx];
     let packed    = quads[block_id * 256u + block_off];
 
     // Unpack quad descriptor fields.

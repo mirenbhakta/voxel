@@ -177,7 +177,8 @@ impl ApplicationHandler for App {
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
                 label             : Some("scaffold_device"),
-                required_features : Features::IMMEDIATES,
+                required_features : Features::IMMEDIATES
+                                  | Features::INDIRECT_FIRST_INSTANCE,
                 required_limits   : Limits {
                     max_immediate_size : 4,
                     ..Limits::default()
@@ -265,7 +266,7 @@ impl ApplicationHandler for App {
             &PipelineLayoutDescriptor {
                 label              : Some("main_pl"),
                 bind_group_layouts : &[Some(&bind_group_layout)],
-                immediate_size     : 4,
+                immediate_size     : 0,
             },
         );
 

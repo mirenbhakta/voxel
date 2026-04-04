@@ -12,6 +12,7 @@ use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
     Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
     Device, Queue, RenderPass,
+    util::DrawIndirectArgs,
 };
 
 use crate::build::{BuildPipeline, ChunkBuildData};
@@ -34,6 +35,12 @@ const MAX_CHUNK_BLOCKS: u32 = 384;
 
 /// Maximum concurrent loaded chunks.
 const MAX_CHUNKS: u32       = 256;
+
+/// Quads per page-table slot (blocks per slot * quads per block).
+///
+/// Used as the `first_instance` stride in indirect draw args so that
+/// `instance_index / 256` yields the correct global block index.
+const SLOT_INSTANCE_STRIDE: u32 = MAX_CHUNK_BLOCKS * BLOCK_SIZE;
 
 // ---------------------------------------------------------------------------
 // QuadPool
@@ -198,6 +205,10 @@ pub struct GpuWorld {
     chunks         : HashMap<ChunkPos, GpuChunk>,
     /// Positions of chunks that need rebuilding.
     dirty          : Vec<ChunkPos>,
+    /// Packed `DrawIndirectArgs` for all drawable chunks.
+    indirect_buf   : Buffer,
+    /// Number of valid draw commands in `indirect_buf`.
+    draw_count     : u32,
 }
 
 // --- GpuWorld ---
@@ -241,6 +252,14 @@ impl GpuWorld {
             ],
         });
 
+        let indirect_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("indirect_buf"),
+            size               : u64::from(MAX_CHUNKS) * 16,
+            usage              : BufferUsages::INDIRECT
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
         GpuWorld {
             build_pipeline : BuildPipeline::new(device),
             render_bgl     : render_bgl,
@@ -249,6 +268,8 @@ impl GpuWorld {
             pool           : pool,
             chunks         : HashMap::new(),
             dirty          : Vec::new(),
+            indirect_buf   : indirect_buf,
+            draw_count     : 0,
         }
     }
 
@@ -300,13 +321,17 @@ impl GpuWorld {
     }
 
     /// Remove a chunk and release its GPU resources.
-    pub fn remove(&mut self, pos: ChunkPos) {
+    ///
+    /// Rebuilds the indirect draw buffer so that `draw` never references
+    /// freed page table slots.
+    pub fn remove(&mut self, queue: &Queue, pos: ChunkPos) {
         if let Some(chunk) = self.chunks.remove(&pos) {
             self.pool.free_blocks(&chunk.alloc.block_ids);
             self.pool.free_slot(chunk.alloc.slot);
         }
 
         self.dirty.retain(|&p| p != pos);
+        self.rebuild_indirect(queue);
     }
 
     /// Upload new occupancy data for a chunk and mark it for rebuilding.
@@ -383,24 +408,53 @@ impl GpuWorld {
                 }
             }
         }
+
+        // Rebuild the indirect draw buffer from all chunks.
+        self.rebuild_indirect(queue);
     }
 
-    /// Issue draw calls for all chunks with quads.
+    /// Issue a single multi-draw-indirect call for all chunks with quads.
     ///
-    /// Sets the shared render bind group once, then emits per-chunk
-    /// immediates and instanced quad draws. The caller must have already
-    /// set the render pipeline on the pass.
+    /// Sets the shared render bind group and dispatches all chunk draws
+    /// from the indirect buffer. The caller must have already set the
+    /// render pipeline on the pass.
     pub fn draw<'a>(&'a self, pass: &mut RenderPass<'a>) {
+        if self.draw_count == 0 {
+            return;
+        }
+
         pass.set_bind_group(0, &self.render_bg, &[]);
+        pass.multi_draw_indirect(&self.indirect_buf, 0, self.draw_count);
+    }
+
+    /// Rebuild the indirect draw buffer from all loaded chunks.
+    ///
+    /// Packs [`DrawIndirectArgs`] for every chunk with a non-zero quad
+    /// count and writes them to the GPU indirect buffer.
+    fn rebuild_indirect(&mut self, queue: &Queue) {
+        let mut args: Vec<DrawIndirectArgs> = Vec::new();
 
         for chunk in self.chunks.values() {
             if chunk.count == 0 {
                 continue;
             }
 
-            let block_base = chunk.alloc.slot * MAX_CHUNK_BLOCKS;
-            pass.set_immediates(0, bytemuck::bytes_of(&block_base));
-            pass.draw(0..6, 0..chunk.count);
+            args.push(DrawIndirectArgs {
+                vertex_count   : 6,
+                instance_count : chunk.count,
+                first_vertex   : 0,
+                first_instance : chunk.alloc.slot * SLOT_INSTANCE_STRIDE,
+            });
+        }
+
+        self.draw_count = args.len() as u32;
+
+        if !args.is_empty() {
+            queue.write_buffer(
+                &self.indirect_buf,
+                0,
+                bytemuck::cast_slice(&args),
+            );
         }
     }
 }
