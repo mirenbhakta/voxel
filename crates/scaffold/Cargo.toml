@@ -12,6 +12,7 @@ egui-winit = "0.34"
 glam       = "0.29"
 noise      = "0.9"
 pollster   = "0.4.0"
+rayon      = "1"
 voxel      = { path = "../.." }
 wgpu       = "29.0.1"
 winit      = "0.30.13"

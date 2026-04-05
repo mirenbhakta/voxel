@@ -2,16 +2,34 @@
 //!
 //! The [`ChunkManager`] bridges the CPU [`World`] and GPU [`GpuWorld`],
 //! loading chunks within a view distance of a center position and keeping
-//! the GPU representation in sync with the source data.
+//! the GPU representation in sync with the source data. Chunk generation
+//! runs in parallel via rayon with a per-frame time budget.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use glam::Vec3;
-use voxel::chunk::ChunkPos;
+use rayon::prelude::*;
+use voxel::chunk::{Chunk, ChunkPos};
 use voxel::world::{ChunkProvider, World};
 use wgpu::{Device, Queue};
 
 use crate::world::{GpuWorld, MAX_CHUNK_BLOCKS};
+
+// ---------------------------------------------------------------------------
+// GenOutcome
+// ---------------------------------------------------------------------------
+
+/// Result of a single parallel chunk generation attempt.
+enum GenOutcome {
+    /// The provider produced a chunk.
+    Generated(ChunkPos, Chunk),
+    /// The provider returned `None` for this position.
+    Rejected(ChunkPos),
+    /// Generation was skipped because the frame budget expired.
+    Skipped(ChunkPos),
+}
 
 // ---------------------------------------------------------------------------
 // ChunkManager
@@ -40,6 +58,8 @@ pub struct ChunkManager {
     loads_per_frame  : usize,
     /// Maximum GPU rebuilds per frame.
     builds_per_frame : usize,
+    /// Wall-clock budget for parallel chunk generation.
+    gen_budget       : Duration,
 }
 
 // --- ChunkManager ---
@@ -54,10 +74,14 @@ impl ChunkManager {
     ///   keep loaded.
     /// * `loads_per_frame`  - Maximum new chunks generated per frame.
     /// * `builds_per_frame` - Maximum GPU chunk rebuilds per frame.
+    /// * `gen_budget`       - Wall-clock time budget for parallel chunk
+    ///   generation. Workers that have not started when the budget
+    ///   expires are skipped and retried next frame.
     pub fn new(
         view_distance    : i32,
         loads_per_frame  : usize,
         builds_per_frame : usize,
+        gen_budget       : Duration,
     ) -> Self
     {
         ChunkManager {
@@ -68,6 +92,7 @@ impl ChunkManager {
             rejected         : HashSet::new(),
             loads_per_frame  : loads_per_frame,
             builds_per_frame : builds_per_frame,
+            gen_budget       : gen_budget,
         }
     }
 
@@ -96,13 +121,14 @@ impl ChunkManager {
     ///
     /// 1. Unloads chunks outside the view distance from both the CPU
     ///    world and the GPU.
-    /// 2. Loads up to `loads_per_frame` new chunks from the provider.
+    /// 2. Loads up to `loads_per_frame` new chunks from the provider,
+    ///    generating in parallel with a time budget.
     /// 3. Syncs dirty CPU chunks (from voxel edits) to the GPU.
     /// 4. Triggers GPU rebuild for up to `builds_per_frame` dirty chunks,
     ///    prioritized by distance to center.
     pub fn update(
         &mut self,
-        provider : &dyn ChunkProvider,
+        provider : &(dyn ChunkProvider + Sync),
         gpu      : &mut GpuWorld,
         device   : &Device,
         queue    : &Queue,
@@ -230,28 +256,34 @@ impl ChunkManager {
         });
     }
 
-    /// Load chunks from the front of the queue via the provider.
+    /// Generate and load chunks in parallel using rayon.
     ///
-    /// Respects both the per-frame load budget and GPU pool capacity.
+    /// Pops up to `loads_per_frame` positions from the load queue,
+    /// dispatches generation across the thread pool, and collects
+    /// results. An atomic flag provides early exit: once the wall-clock
+    /// budget expires, workers that have not yet started their
+    /// generation skip immediately. In-progress workers finish
+    /// naturally (bounded by single-chunk generation time). Skipped
+    /// positions are pushed back onto the load queue for next frame.
     fn load_queued_chunks(
         &mut self,
-        provider : &dyn ChunkProvider,
+        provider : &(dyn ChunkProvider + Sync),
         gpu      : &mut GpuWorld,
         device   : &Device,
         queue    : &Queue,
     )
     {
-        let mut loaded = 0;
+        // Determine batch size from per-frame budget and GPU capacity.
+        let available_slots  = gpu.free_slots() as usize;
+        let available_blocks = gpu.free_blocks() as usize
+                             / MAX_CHUNK_BLOCKS as usize;
+        let capacity         = available_slots.min(available_blocks);
+        let max_loads        = self.loads_per_frame.min(capacity);
 
-        while loaded < self.loads_per_frame {
-            // Check GPU capacity before popping. If the pool is full,
-            // stop and let the rebuild trim free blocks for next frame.
-            if gpu.free_slots() == 0
-                || gpu.free_blocks() < MAX_CHUNK_BLOCKS
-            {
-                break;
-            }
+        // Pop nearest positions from the queue.
+        let mut positions = Vec::with_capacity(max_loads);
 
+        while positions.len() < max_loads {
             let Some(pos) = self.load_queue.pop()
             else {
                 break;
@@ -263,20 +295,57 @@ impl ChunkManager {
                 continue;
             }
 
-            let Some(chunk) = provider.generate(pos)
-            else {
-                self.rejected.insert(pos);
-                continue;
-            };
+            positions.push(pos);
+        }
 
-            // Extract GPU-format data before inserting into the world.
-            let occ = chunk.occupancy_words();
-            let mat = chunk.material_block_ids();
+        if positions.is_empty() {
+            return;
+        }
 
-            self.world.insert_chunk(pos, chunk);
-            gpu.insert(device, queue, pos, &occ, &mat);
+        // Fork: generate chunks in parallel with early-exit flag.
+        let deadline = Instant::now() + self.gen_budget;
+        let expired  = AtomicBool::new(false);
 
-            loaded += 1;
+        let outcomes: Vec<GenOutcome> = positions
+            .par_iter()
+            .map(|&pos| {
+                if expired.load(Ordering::Relaxed) {
+                    return GenOutcome::Skipped(pos);
+                }
+
+                match provider.generate(pos) {
+                    Some(chunk) => {
+                        if Instant::now() > deadline {
+                            expired.store(true, Ordering::Relaxed);
+                        }
+
+                        GenOutcome::Generated(pos, chunk)
+                    }
+
+                    None => GenOutcome::Rejected(pos),
+                }
+            })
+            .collect();
+
+        // Join: process outcomes serially.
+        for outcome in outcomes {
+            match outcome {
+                GenOutcome::Generated(pos, chunk) => {
+                    let occ = chunk.occupancy_words();
+                    let mat = chunk.material_block_ids();
+
+                    self.world.insert_chunk(pos, chunk);
+                    gpu.insert(device, queue, pos, &occ, &mat);
+                }
+
+                GenOutcome::Rejected(pos) => {
+                    self.rejected.insert(pos);
+                }
+
+                GenOutcome::Skipped(pos) => {
+                    self.load_queue.push(pos);
+                }
+            }
         }
     }
 

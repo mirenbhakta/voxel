@@ -7,11 +7,12 @@
 mod build;
 mod camera;
 mod chunk_manager;
+mod timestamp;
 mod world;
 mod worldgen;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
@@ -43,6 +44,7 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use camera::Camera;
 use chunk_manager::ChunkManager;
+use timestamp::TimestampQueries;
 use voxel::world::ChunkProvider;
 use world::{build_material_tables, GpuWorld, RenderStats};
 
@@ -146,13 +148,15 @@ struct Gpu {
     /// The chunk manager (owns CPU world, drives loading/unloading).
     chunk_mgr     : ChunkManager,
     /// The world generator (chunk provider).
-    provider      : Box<dyn ChunkProvider>,
+    provider      : Box<dyn ChunkProvider + Sync>,
     /// The egui context shared across frames.
     egui_ctx      : egui::Context,
     /// The egui-winit integration state.
     egui_state    : egui_winit::State,
     /// The egui wgpu renderer.
     egui_renderer : egui_wgpu::Renderer,
+    /// The GPU timestamp query manager.
+    timestamps    : TimestampQueries,
 }
 
 // --- App ---
@@ -204,7 +208,8 @@ impl ApplicationHandler for App {
             .request_device(&DeviceDescriptor {
                 label             : Some("scaffold_device"),
                 required_features : Features::IMMEDIATES
-                                  | Features::INDIRECT_FIRST_INSTANCE,
+                                  | Features::INDIRECT_FIRST_INSTANCE
+                                  | Features::TIMESTAMP_QUERY,
                 required_limits   : Limits {
                     max_immediate_size : 4,
                     ..Limits::default()
@@ -446,10 +451,12 @@ impl ApplicationHandler for App {
         );
 
         // Chunk manager: view distance 6, load up to 8 chunks/frame,
-        // rebuild up to 16 chunks/frame.
-        let mut chunk_mgr = ChunkManager::new(6, 8, 16);
+        // rebuild up to 16 chunks/frame, 4ms worldgen budget.
+        let mut chunk_mgr = ChunkManager::new(
+            6, 8, 16, Duration::from_millis(4),
+        );
 
-        let provider: Box<dyn ChunkProvider> = Box::new(
+        let provider: Box<dyn ChunkProvider + Sync> = Box::new(
             worldgen::SurfaceTerrain::new(42, stone, dirt, grass),
         );
 
@@ -481,6 +488,8 @@ impl ApplicationHandler for App {
             egui_wgpu::RendererOptions::default(),
         );
 
+        let timestamps = TimestampQueries::new(&device, &queue);
+
         self.gpu = Some(Gpu {
             window    : window,
             surface   : surface,
@@ -496,6 +505,7 @@ impl ApplicationHandler for App {
             egui_ctx      : egui_ctx,
             egui_state    : egui_state,
             egui_renderer : egui_renderer,
+            timestamps    : timestamps,
         });
 
         // Start the render loop.
@@ -609,6 +619,9 @@ impl ApplicationHandler for App {
                         (dt - self.frame_time_avg) * 0.05;
                 }
 
+                // Poll for GPU timestamp results from the previous frame.
+                gpu.timestamps.begin_frame(&gpu.device);
+
                 // Update camera position from keyboard input.
                 update_camera_movement(&mut self.camera, &self.input, dt);
 
@@ -656,6 +669,7 @@ impl ApplicationHandler for App {
 
                 // Build the egui frame.
                 let stats      = gpu.gpu_world.stats();
+                let gpu_render = gpu.timestamps.render_ms();
                 let egui_input = gpu.egui_state.take_egui_input(
                     &gpu.window,
                 );
@@ -667,6 +681,7 @@ impl ApplicationHandler for App {
                     &stats,
                     &self.camera,
                     self.frame_time_avg,
+                    gpu_render,
                     &gpu.chunk_mgr,
                 );
 
@@ -740,6 +755,9 @@ impl ApplicationHandler for App {
                                     stencil_ops : None,
                                 },
                             ),
+                            timestamp_writes : Some(
+                                gpu.timestamps.render_pass_timestamps(),
+                            ),
                             ..Default::default()
                         },
                     );
@@ -773,7 +791,14 @@ impl ApplicationHandler for App {
                     );
                 }
 
+                // Resolve timestamp queries for async readback.
+                gpu.timestamps.resolve(&mut encoder);
+
                 gpu.queue.submit(Some(encoder.finish()));
+
+                // Initiate async timestamp readback.
+                gpu.timestamps.request_readback();
+
                 frame.present();
 
                 // Release stale egui textures after submission.
@@ -853,11 +878,12 @@ fn update_camera_movement(
 
 /// Draw the rendering statistics overlay.
 fn draw_stats_ui(
-    ctx       : &egui::Context,
-    stats     : &RenderStats,
-    camera    : &Camera,
-    dt_avg    : f32,
-    chunk_mgr : &ChunkManager,
+    ctx        : &egui::Context,
+    stats      : &RenderStats,
+    camera     : &Camera,
+    dt_avg     : f32,
+    gpu_render : f32,
+    chunk_mgr  : &ChunkManager,
 ) {
     egui::Window::new("Stats")
         .default_open(true)
@@ -872,6 +898,10 @@ fn draw_stats_ui(
 
                     ui.label("Frame");
                     ui.label(format!("{:.2} ms", dt_avg * 1000.0));
+                    ui.end_row();
+
+                    ui.label("GPU");
+                    ui.label(format!("{:.2} ms", gpu_render));
                     ui.end_row();
                 });
 
