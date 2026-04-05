@@ -1,3 +1,4 @@
+pub mod block;
 pub mod chunk;
 pub mod index;
 pub mod morton;

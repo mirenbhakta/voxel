@@ -10,7 +10,8 @@ use std::collections::HashMap;
 
 use eden_math::Vector3;
 
-use crate::chunk::{BlockId, Chunk, ChunkPos, CHUNK_SIZE};
+use crate::block::BlockId;
+use crate::chunk::{Chunk, ChunkPos, CHUNK_SIZE};
 
 // ---------------------------------------------------------------------------
 // Coordinate helpers

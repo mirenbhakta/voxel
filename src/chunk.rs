@@ -16,6 +16,7 @@ use std::ops::Deref;
 
 use eden_math::Vector3;
 
+use crate::block::BlockId;
 use crate::index::Linear3D;
 use crate::storage::{Bitmask, Dense};
 
@@ -35,37 +36,6 @@ pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 /// word layout `occ[z * 32 + y]` with bit position `x`, matching the data
 /// layout required by the rendering pipeline.
 pub type ChunkIndexer = Linear3D<CHUNK_SIZE, CHUNK_SIZE, CHUNK_SIZE>;
-
-// ---------------------------------------------------------------------------
-// BlockId
-// ---------------------------------------------------------------------------
-
-/// A global block type identifier.
-///
-/// The zero value represents air (empty space). All other values identify
-/// a concrete block type defined in the block registry.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct BlockId(u16);
-
-impl BlockId {
-    /// The empty block. A voxel with this ID is not occupied.
-    pub const AIR: BlockId = BlockId(0);
-
-    /// Create a block identifier from a raw value.
-    pub fn new(id: u16) -> Self {
-        BlockId(id)
-    }
-
-    /// Returns `true` if this is the air (empty) block.
-    pub fn is_air(self) -> bool {
-        self.0 == 0
-    }
-
-    /// Returns the underlying integer value.
-    pub fn raw(self) -> u16 {
-        self.0
-    }
-}
 
 // ---------------------------------------------------------------------------
 // ChunkPos
