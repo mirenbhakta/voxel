@@ -6,6 +6,7 @@
 
 mod build;
 mod camera;
+mod chunk_manager;
 mod world;
 
 use std::sync::Arc;
@@ -40,7 +41,9 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use camera::Camera;
-use voxel::chunk::ChunkPos;
+use chunk_manager::ChunkManager;
+use voxel::chunk::{Chunk, ChunkPos};
+use voxel::world::ChunkProvider;
 use world::{build_material_tables, GpuWorld, RenderStats};
 
 use egui_wgpu::ScreenDescriptor;
@@ -139,7 +142,11 @@ struct Gpu {
     /// The depth buffer texture view.
     depth_view    : TextureView,
     /// The GPU world manager (chunks, build pipeline, draw state).
-    world         : GpuWorld,
+    gpu_world     : GpuWorld,
+    /// The chunk manager (owns CPU world, drives loading/unloading).
+    chunk_mgr     : ChunkManager,
+    /// The test terrain provider.
+    provider      : TestTerrainProvider,
     /// The egui context shared across frames.
     egui_ctx      : egui::Context,
     /// The egui-winit integration state.
@@ -426,7 +433,7 @@ impl ApplicationHandler for App {
         );
 
         // GPU world manager.
-        let mut world = GpuWorld::new(
+        let mut gpu_world = GpuWorld::new(
             &device,
             &queue,
             bind_group_layout,
@@ -438,18 +445,24 @@ impl ApplicationHandler for App {
             texture_layers,
         );
 
-        for cx in 0..4i32 {
-            for cz in 0..4i32 {
-                let (occ, mat) = generate_test_terrain(
-                    cx, cz, stone, dirt, grass,
-                );
-                world.insert(
-                    &device, &queue, ChunkPos::new(cx, 0, cz), &occ, &mat,
-                );
-            }
-        }
+        // Chunk manager: view distance 6, load up to 8 chunks/frame,
+        // rebuild up to 16 chunks/frame.
+        let mut chunk_mgr = ChunkManager::new(6, 8, 16);
 
-        world.rebuild(&device, &queue);
+        let provider = TestTerrainProvider {
+            stone : stone,
+            dirt  : dirt,
+            grass : grass,
+        };
+
+        // Initial load pass from camera position.
+        chunk_mgr.set_center(Vec3::new(
+            self.camera.position.x,
+            self.camera.position.y,
+            self.camera.position.z,
+        ));
+
+        chunk_mgr.update(&provider, &mut gpu_world, &device, &queue);
 
         // Initialize egui.
         let egui_ctx = egui::Context::default();
@@ -471,9 +484,20 @@ impl ApplicationHandler for App {
         );
 
         self.gpu = Some(Gpu {
-            window, surface, config, device, queue,
-            pipeline, camera_buf, depth_view, world,
-            egui_ctx, egui_state, egui_renderer,
+            window    : window,
+            surface   : surface,
+            config    : config,
+            device    : device,
+            queue     : queue,
+            pipeline  : pipeline,
+            camera_buf : camera_buf,
+            depth_view : depth_view,
+            gpu_world : gpu_world,
+            chunk_mgr : chunk_mgr,
+            provider  : provider,
+            egui_ctx      : egui_ctx,
+            egui_state    : egui_state,
+            egui_renderer : egui_renderer,
         });
 
         // Start the render loop.
@@ -590,6 +614,16 @@ impl ApplicationHandler for App {
                 // Update camera position from keyboard input.
                 update_camera_movement(&mut self.camera, &self.input, dt);
 
+                // Drive chunk loading/unloading from camera position.
+                gpu.chunk_mgr.set_center(self.camera.position);
+
+                gpu.chunk_mgr.update(
+                    &gpu.provider,
+                    &mut gpu.gpu_world,
+                    &gpu.device,
+                    &gpu.queue,
+                );
+
                 // Write camera uniform to the GPU buffer.
                 let uniform = CameraUniform {
                     view_proj : self.camera.view_proj().to_cols_array(),
@@ -623,7 +657,7 @@ impl ApplicationHandler for App {
                     .create_view(&TextureViewDescriptor::default());
 
                 // Build the egui frame.
-                let stats      = gpu.world.stats();
+                let stats      = gpu.gpu_world.stats();
                 let egui_input = gpu.egui_state.take_egui_input(
                     &gpu.window,
                 );
@@ -635,6 +669,7 @@ impl ApplicationHandler for App {
                     &stats,
                     &self.camera,
                     self.frame_time_avg,
+                    &gpu.chunk_mgr,
                 );
 
                 let egui_output = gpu.egui_ctx.end_pass();
@@ -712,7 +747,7 @@ impl ApplicationHandler for App {
                     );
 
                     pass.set_pipeline(&gpu.pipeline);
-                    gpu.world.draw(&mut pass);
+                    gpu.gpu_world.draw(&mut pass);
                 }
 
                 // Egui render pass: overlay on top of the scene.
@@ -820,10 +855,11 @@ fn update_camera_movement(
 
 /// Draw the rendering statistics overlay.
 fn draw_stats_ui(
-    ctx    : &egui::Context,
-    stats  : &RenderStats,
-    camera : &Camera,
-    dt_avg : f32,
+    ctx       : &egui::Context,
+    stats     : &RenderStats,
+    camera    : &Camera,
+    dt_avg    : f32,
+    chunk_mgr : &ChunkManager,
 ) {
     egui::Window::new("Stats")
         .default_open(true)
@@ -863,6 +899,33 @@ fn draw_stats_ui(
 
                     ui.label("Triangles");
                     ui.label(format!("{}", stats.total_quads * 2));
+                    ui.end_row();
+                });
+
+            ui.separator();
+
+            egui::Grid::new("streaming")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("View dist");
+                    ui.label(format!("{}", chunk_mgr.view_distance()));
+                    ui.end_row();
+
+                    ui.label("CPU chunks");
+                    ui.label(format!(
+                        "{}", chunk_mgr.world().chunk_count(),
+                    ));
+                    ui.end_row();
+
+                    ui.label("Load queue");
+                    ui.label(format!("{}", chunk_mgr.load_queue_len()));
+                    ui.end_row();
+
+                    let center = chunk_mgr.center();
+                    ui.label("Center");
+                    ui.label(format!(
+                        "({}, {}, {})", center.x, center.y, center.z,
+                    ));
                     ui.end_row();
                 });
 
@@ -929,58 +992,61 @@ fn create_depth_texture(
 }
 
 // ---------------------------------------------------------------------------
-// Test data generation
+// Test terrain provider
 // ---------------------------------------------------------------------------
 
-/// Generate terrain occupancy and material data for a test chunk.
+/// A [`ChunkProvider`] that generates simple layered terrain.
 ///
-/// Produces layered terrain with stone at the bottom, dirt in the middle,
-/// and grass on top. Fill height varies by chunk position so adjacent
-/// chunks are visually distinguishable.
-///
-/// # Arguments
-///
-/// * `cx`    - Chunk X coordinate (for height variation).
-/// * `cz`    - Chunk Z coordinate (for height variation).
-/// * `stone` - Block ID for stone layers.
-/// * `dirt`  - Block ID for dirt layers.
-/// * `grass` - Block ID for the top grass layer.
-fn generate_test_terrain(
-    cx    : i32,
-    cz    : i32,
+/// Produces stone at the bottom, dirt in the middle, and grass on top.
+/// Only generates chunks at y=0 (single ground layer). Fill height
+/// varies by chunk XZ position so adjacent chunks are distinguishable.
+struct TestTerrainProvider {
+    /// Block ID for stone layers.
     stone : BlockId,
+    /// Block ID for dirt layers.
     dirt  : BlockId,
+    /// Block ID for the grass surface layer.
     grass : BlockId,
-) -> ([u32; 1024], Box<[u8; 32768]>)
-{
-    let mut occ = [0u32; 1024];
-    let mut mat = Box::new([0u8; 32768]);
+}
 
-    let height = (4 + ((cx * 3 + cz * 7).unsigned_abs() % 8)) as usize;
+impl ChunkProvider for TestTerrainProvider {
+    fn generate(&self, pos: ChunkPos) -> Option<Chunk> {
+        // Only generate the ground layer.
+        if pos.y != 0 {
+            return None;
+        }
 
-    for z in 0..32usize {
-        for y in 0..height.min(32) {
-            occ[z * 32 + y] = !0u32;
+        let cx = pos.x;
+        let cz = pos.z;
 
-            // Assign block type based on depth from the surface.
-            let block = if y == height - 1 {
-                grass
-            }
-            else if y + 3 >= height {
-                dirt
-            }
-            else {
-                stone
-            };
+        let height = (4 + ((cx * 3 + cz * 7).unsigned_abs() % 8)) as u8;
+        let height = height.min(32);
 
-            let block_id = block.raw() as u8;
-            for x in 0..32usize {
-                mat[z * 1024 + y * 32 + x] = block_id;
+        let mut chunk = Chunk::new();
+
+        for z in 0..32u8 {
+            for x in 0..32u8 {
+                for y in 0..height {
+                    // Assign block type based on depth from surface.
+                    let block = if y == height - 1 {
+                        self.grass
+                    }
+                    else if y + 3 >= height {
+                        self.dirt
+                    }
+                    else {
+                        self.stone
+                    };
+
+                    chunk.set_block(
+                        &eden_math::Vector3::new(x, y, z), block,
+                    );
+                }
             }
         }
-    }
 
-    (occ, mat)
+        Some(chunk)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bytemuck   = { version = "1", features = ["derive"] }
+eden-math  = { path = "../../../eden/eden-engine/lib/eden-math", default-features = false }
 egui       = "0.34"
 egui-wgpu  = "0.34"
 egui-winit = "0.34"

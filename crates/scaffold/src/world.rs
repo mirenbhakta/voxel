@@ -32,14 +32,14 @@ const BLOCK_SIZE: u32       = 256;
 /// Bytes per block.
 const BLOCK_BYTES: u64      = BLOCK_SIZE as u64 * 4;
 
-/// Total blocks in the pool. 8192 blocks = 8 MB total quad storage.
-const POOL_BLOCKS: u32      = 8192;
+/// Total blocks in the pool. 16384 blocks = 16 MB total quad storage.
+const POOL_BLOCKS: u32      = 16384;
 
 /// Maximum blocks any single chunk can use (worst case: 98304 / 256).
-const MAX_CHUNK_BLOCKS: u32 = 384;
+pub(crate) const MAX_CHUNK_BLOCKS: u32 = 384;
 
 /// Maximum concurrent loaded chunks.
-const MAX_CHUNKS: u32       = 256;
+const MAX_CHUNKS: u32       = 1024;
 
 /// Quads per page-table slot (blocks per slot * quads per block).
 ///
@@ -698,6 +698,112 @@ impl GpuWorld {
         self.dirty_neighbors(pos);
     }
 
+    /// Returns whether a chunk is loaded on the GPU at `pos`.
+    pub fn is_loaded(&self, pos: ChunkPos) -> bool {
+        self.chunks.contains_key(&pos)
+    }
+
+    /// Returns the number of free page table slots.
+    pub fn free_slots(&self) -> u32 {
+        self.pool.free_slots.len() as u32
+    }
+
+    /// Returns the number of free pool blocks.
+    pub fn free_blocks(&self) -> u32 {
+        self.pool.free_blocks.len() as u32
+    }
+
+    /// Upload new material data for an existing chunk.
+    ///
+    /// Use when voxel block types change without affecting occupancy.
+    /// The chunk is not marked dirty for rebuild -- call
+    /// [`update_occupancy`](Self::update_occupancy) separately if
+    /// occupancy also changed.
+    pub fn update_material(
+        &mut self,
+        queue    : &Queue,
+        pos      : ChunkPos,
+        material : &[u8; 32768],
+    )
+    {
+        if let Some(chunk) = self.chunks.get(&pos) {
+            self.pool.write_material(queue, chunk.alloc.slot, material);
+        }
+    }
+
+    /// Rebuild a specific set of dirty chunks.
+    ///
+    /// Only chunks in `positions` that are currently marked dirty will be
+    /// dispatched. Chunks not in the set remain dirty for a future call.
+    /// After this call, the indirect draw buffer is rebuilt to reflect
+    /// updated quad counts.
+    pub fn rebuild_subset(
+        &mut self,
+        device    : &Device,
+        queue     : &Queue,
+        positions : &[ChunkPos],
+    )
+    {
+        // Collect the subset of requested positions that are actually dirty.
+        let to_build: Vec<ChunkPos> = positions.iter()
+            .copied()
+            .filter(|pos| {
+                self.chunks.get(pos).is_some_and(|c| c.dirty)
+            })
+            .collect();
+
+        if to_build.is_empty() {
+            return;
+        }
+
+        // Upload neighbor boundary slices for chunks being rebuilt.
+        for &pos in &to_build {
+            let slices = build_neighbor_slices(&self.chunks, pos);
+            if let Some(chunk) = self.chunks.get(&pos) {
+                chunk.build.upload_neighbor_slices(queue, &slices);
+            }
+        }
+
+        // Encode all rebuilds into one command buffer.
+        let mut encoder = device.create_command_encoder(
+            &CommandEncoderDescriptor::default(),
+        );
+
+        for &pos in &to_build {
+            if let Some(chunk) = self.chunks.get(&pos) {
+                let block_base = chunk.alloc.slot * MAX_CHUNK_BLOCKS;
+                chunk.build.dispatch(
+                    &mut encoder, &self.build_pipeline, block_base,
+                );
+            }
+        }
+
+        queue.submit(Some(encoder.finish()));
+
+        // Read back quad counts and trim excess blocks.
+        for pos in to_build {
+            if let Some(chunk) = self.chunks.get_mut(&pos) {
+                chunk.count = chunk.build.read_quad_count(device);
+                chunk.dirty = false;
+
+                let needed = (chunk.count + BLOCK_SIZE - 1) / BLOCK_SIZE;
+                let needed = needed.max(1) as usize;
+
+                if needed < chunk.alloc.block_ids.len() {
+                    let excess = chunk.alloc.block_ids.split_off(needed);
+                    self.pool.free_blocks(&excess);
+                }
+            }
+        }
+
+        // Remove rebuilt positions from the master dirty list.
+        self.dirty.retain(|pos| {
+            self.chunks.get(pos).is_some_and(|c| c.dirty)
+        });
+
+        self.rebuild_indirect(queue);
+    }
+
     /// Dispatch the build shader for all dirty chunks and read back
     /// quad counts.
     ///
@@ -711,54 +817,13 @@ impl GpuWorld {
         queue  : &Queue,
     )
     {
-        if self.dirty.is_empty() {
-            return;
-        }
+        let all_dirty: Vec<ChunkPos> = self.dirty.clone();
+        self.rebuild_subset(device, queue, &all_dirty);
+    }
 
-        // Upload neighbor boundary slices for all dirty chunks.
-        for &pos in &self.dirty {
-            let slices = build_neighbor_slices(&self.chunks, pos);
-            if let Some(chunk) = self.chunks.get(&pos) {
-                chunk.build.upload_neighbor_slices(queue, &slices);
-            }
-        }
-
-        // Encode all dirty chunk rebuilds into one command buffer.
-        let mut encoder = device.create_command_encoder(
-            &CommandEncoderDescriptor::default(),
-        );
-
-        for &pos in &self.dirty {
-            if let Some(chunk) = self.chunks.get(&pos) {
-                let block_base = chunk.alloc.slot * MAX_CHUNK_BLOCKS;
-                chunk.build.dispatch(
-                    &mut encoder, &self.build_pipeline, block_base,
-                );
-            }
-        }
-
-        queue.submit(Some(encoder.finish()));
-
-        // Read back quad counts and trim excess block allocations.
-        for pos in self.dirty.drain(..) {
-            if let Some(chunk) = self.chunks.get_mut(&pos) {
-                chunk.count = chunk.build.read_quad_count(device);
-                chunk.dirty = false;
-
-                // Trim excess blocks. Keep at least one block so the
-                // page table entry remains valid for zero-count chunks.
-                let needed = (chunk.count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                let needed = needed.max(1) as usize;
-
-                if needed < chunk.alloc.block_ids.len() {
-                    let excess = chunk.alloc.block_ids.split_off(needed);
-                    self.pool.free_blocks(&excess);
-                }
-            }
-        }
-
-        // Rebuild the indirect draw buffer from all chunks.
-        self.rebuild_indirect(queue);
+    /// Returns the current list of dirty chunk positions.
+    pub fn dirty_positions(&self) -> &[ChunkPos] {
+        &self.dirty
     }
 
     /// Returns a snapshot of current rendering statistics.

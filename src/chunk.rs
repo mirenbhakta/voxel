@@ -169,6 +169,47 @@ impl Chunk {
     pub fn palette(&self) -> &[BlockId] {
         &self.palette
     }
+
+    /// Copy the occupancy bitmask into a 1024-word array.
+    ///
+    /// Word layout: `words[z * 32 + y]`, bit position `x`. This matches
+    /// the `ChunkIndexer` linear layout expected by the build shader.
+    pub fn occupancy_words(&self) -> [u32; 1024] {
+        let raw     = self.occupancy.as_raw();
+        let mut out = [0u32; 1024];
+        out[..raw.len()].copy_from_slice(raw);
+        out
+    }
+
+    /// Build a per-voxel block ID array for GPU upload.
+    ///
+    /// Each byte contains the raw [`BlockId`] value for the voxel at
+    /// that position, resolved through the local palette. Unoccupied
+    /// voxels are zero (air). Layout: `data[z * 1024 + y * 32 + x]`.
+    pub fn material_block_ids(&self) -> [u8; 32768] {
+        let palette_data = self.material.as_slice();
+        let occ_data     = self.occupancy.as_raw();
+        let mut out      = [0u8; 32768];
+
+        for z in 0..32usize {
+            for y in 0..32usize {
+                let word = occ_data[z * 32 + y];
+                if word == 0 {
+                    continue;
+                }
+
+                let row_base = z * 1024 + y * 32;
+                for x in 0..32usize {
+                    if word & (1 << x) != 0 {
+                        let idx = palette_data[row_base + x] as usize;
+                        out[row_base + x] = self.palette[idx].raw() as u8;
+                    }
+                }
+            }
+        }
+
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,5 +306,44 @@ mod tests {
         assert_eq!(pos.x, 10);
         assert_eq!(pos.y, -5);
         assert_eq!(pos.z, 3);
+    }
+
+    // -- occupancy_words_roundtrip --
+
+    #[test]
+    fn occupancy_words_roundtrip() {
+        let mut chunk = Chunk::new();
+        let pos       = Vector3::new(5, 10, 15);
+
+        chunk.set_block(&pos, BlockId::new(1));
+
+        let words = chunk.occupancy_words();
+
+        // Voxel (5, 10, 15) should be bit 5 in word[15 * 32 + 10].
+        assert_ne!(words[15 * 32 + 10] & (1 << 5), 0);
+
+        // All other bits in that word should be zero.
+        assert_eq!(words[15 * 32 + 10] & !(1 << 5), 0);
+    }
+
+    // -- material_block_ids_resolves_palette --
+
+    #[test]
+    fn material_block_ids_resolves_palette() {
+        let mut chunk = Chunk::new();
+        let stone     = BlockId::new(1);
+        let dirt      = BlockId::new(2);
+
+        chunk.set_block(&Vector3::new(0, 0, 0), stone);
+        chunk.set_block(&Vector3::new(1, 0, 0), dirt);
+
+        let ids = chunk.material_block_ids();
+
+        // The array should contain raw BlockId values, not palette indices.
+        assert_eq!(ids[0], stone.raw() as u8);
+        assert_eq!(ids[1], dirt.raw() as u8);
+
+        // Unoccupied voxel should be 0 (air).
+        assert_eq!(ids[2], 0);
     }
 }
