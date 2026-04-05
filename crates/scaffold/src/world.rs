@@ -6,6 +6,8 @@
 //! and draw call emission.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytemuck::{Pod, Zeroable};
 use voxel::block::{BlockId, BlockRegistry, FaceTexture};
@@ -13,14 +15,15 @@ use voxel::chunk::ChunkPos;
 use wgpu::{
     AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry,
     BindGroupLayout, BindingResource, Buffer, BufferDescriptor, BufferUsages,
-    CommandEncoderDescriptor, Device, Extent3d, FilterMode, Queue,
-    RenderPass, SamplerDescriptor, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
-    TextureViewDimension,
+    CommandEncoder, CommandEncoderDescriptor, ComputePassDescriptor, Device,
+    Extent3d, FilterMode, Queue, RenderPass, SamplerDescriptor,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+    TextureView, TextureViewDescriptor, TextureViewDimension,
     util::DrawIndirectArgs,
 };
 
 use crate::build::{BuildPipeline, ChunkBuildData};
+use crate::cull::CullPipeline;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -354,6 +357,8 @@ pub struct RenderStats {
     pub chunks_loaded     : u32,
     /// Chunks included in draw calls (non-zero quad count).
     pub chunks_drawn      : u32,
+    /// Chunks visible after frustum culling (one frame latency).
+    pub chunks_visible    : u32,
     /// Total quads across all chunks.
     pub total_quads       : u32,
     /// Pool blocks currently allocated.
@@ -394,10 +399,28 @@ pub struct GpuWorld {
     chunks             : HashMap<ChunkPos, GpuChunk>,
     /// Positions of chunks that need rebuilding.
     dirty              : Vec<ChunkPos>,
-    /// Packed `DrawIndirectArgs` for all drawable chunks.
-    indirect_buf       : Buffer,
-    /// Number of valid draw commands in `indirect_buf`.
-    draw_count         : u32,
+    /// The frustum culling compute pipeline.
+    cull_pipeline      : CullPipeline,
+    /// Source indirect draw buffer (CPU-written, all chunks with quads).
+    src_indirect_buf   : Buffer,
+    /// Output indirect draw buffer (GPU-written, visible chunks only).
+    dst_indirect_buf   : Buffer,
+    /// GPU-side atomic draw count for `multi_draw_indirect_count`.
+    draw_count_buf     : Buffer,
+    /// Frustum plane uniform buffer (6 x `vec4<f32>`).
+    frustum_buf        : Buffer,
+    /// Cull pass bind group.
+    cull_bg            : BindGroup,
+    /// Total source draws before culling.
+    src_draw_count     : u32,
+    /// Staging buffer for async readback of the visible draw count.
+    count_staging      : Buffer,
+    /// Set by the map callback when the visible count is ready.
+    count_ready        : Arc<AtomicBool>,
+    /// Whether a count readback request is currently in flight.
+    count_pending      : bool,
+    /// Last known visible chunk count (one frame latency).
+    visible_count      : u32,
     /// The material property table buffer (per-block color + texture config).
     material_table_buf : Buffer,
     /// Per-face texture override table for non-uniform blocks.
@@ -572,13 +595,60 @@ impl GpuWorld {
             ],
         });
 
-        let indirect_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("indirect_buf"),
+        // Culling buffers: source (CPU-written), destination (GPU-written),
+        // and an atomic draw count that feeds multi_draw_indirect_count.
+        let src_indirect_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("src_indirect_buf"),
             size               : u64::from(MAX_CHUNKS) * 16,
-            usage              : BufferUsages::INDIRECT
+            usage              : BufferUsages::STORAGE
                                | BufferUsages::COPY_DST,
             mapped_at_creation : false,
         });
+
+        let dst_indirect_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("dst_indirect_buf"),
+            size               : u64::from(MAX_CHUNKS) * 16,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::INDIRECT,
+            mapped_at_creation : false,
+        });
+
+        let draw_count_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("draw_count_buf"),
+            size               : 4,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::INDIRECT
+                               | BufferUsages::COPY_SRC
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let count_staging = device.create_buffer(&BufferDescriptor {
+            label              : Some("cull_count_staging"),
+            size               : 4,
+            usage              : BufferUsages::COPY_DST
+                               | BufferUsages::MAP_READ,
+            mapped_at_creation : false,
+        });
+
+        let frustum_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("frustum_buf"),
+            size               : 96,
+            usage              : BufferUsages::UNIFORM
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let cull_pipeline = CullPipeline::new(device);
+
+        let cull_bg = cull_pipeline.create_bind_group(
+            device,
+            &frustum_buf,
+            &src_indirect_buf,
+            &pool.chunk_offset_buf,
+            &dst_indirect_buf,
+            &draw_count_buf,
+        );
 
         GpuWorld {
             build_pipeline     : BuildPipeline::new(device),
@@ -588,8 +658,17 @@ impl GpuWorld {
             pool               : pool,
             chunks             : HashMap::new(),
             dirty              : Vec::new(),
-            indirect_buf       : indirect_buf,
-            draw_count         : 0,
+            cull_pipeline      : cull_pipeline,
+            src_indirect_buf   : src_indirect_buf,
+            dst_indirect_buf   : dst_indirect_buf,
+            draw_count_buf     : draw_count_buf,
+            frustum_buf        : frustum_buf,
+            cull_bg            : cull_bg,
+            src_draw_count     : 0,
+            count_staging      : count_staging,
+            count_ready        : Arc::new(AtomicBool::new(false)),
+            count_pending      : false,
+            visible_count      : 0,
             material_table_buf : material_table_buf,
             face_texture_buf   : face_texture_buf,
             texture_view       : texture_view,
@@ -854,7 +933,8 @@ impl GpuWorld {
 
         RenderStats {
             chunks_loaded     : self.chunks.len() as u32,
-            chunks_drawn      : self.draw_count,
+            chunks_drawn      : self.src_draw_count,
+            chunks_visible    : self.visible_count,
             total_quads       : total_quads,
             pool_blocks_used  : POOL_BLOCKS
                               - self.pool.free_blocks.len() as u32,
@@ -865,18 +945,157 @@ impl GpuWorld {
         }
     }
 
+    /// Record the frustum cull compute pass.
+    ///
+    /// Clears the draw count buffer, uploads frustum planes, and
+    /// dispatches the cull compute shader. Must be called after
+    /// `rebuild_indirect` and before the render pass.
+    ///
+    /// # Arguments
+    ///
+    /// * `encoder` - The command encoder to record into.
+    /// * `queue`   - The queue for frustum plane upload.
+    /// * `planes`  - The six frustum planes from the camera.
+    pub fn dispatch_cull(
+        &self,
+        encoder : &mut CommandEncoder,
+        queue   : &Queue,
+        planes  : &[[f32; 4]; 6],
+    )
+    {
+        if self.src_draw_count == 0 {
+            return;
+        }
+
+        // Upload frustum planes.
+        queue.write_buffer(
+            &self.frustum_buf,
+            0,
+            bytemuck::cast_slice(planes.as_slice()),
+        );
+
+        // Clear the atomic draw count to zero.
+        encoder.clear_buffer(&self.draw_count_buf, 0, None);
+
+        // Frustum cull compute pass.
+        {
+            let mut pass = encoder.begin_compute_pass(
+                &ComputePassDescriptor {
+                    label            : Some("cull_frustum"),
+                    timestamp_writes : None,
+                },
+            );
+
+            pass.set_pipeline(self.cull_pipeline.pipeline());
+            pass.set_bind_group(0, &self.cull_bg, &[]);
+            pass.set_immediates(
+                0,
+                bytemuck::bytes_of(&self.src_draw_count),
+            );
+
+            let workgroups = (self.src_draw_count + 63) / 64;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+    }
+
+    /// Copy the GPU-written visible draw count to the staging buffer.
+    ///
+    /// Call after the cull compute pass but before `encoder.finish()`.
+    /// Results arrive one frame later via [`poll_visible_count`](Self::poll_visible_count).
+    pub fn resolve_visible_count(&mut self, encoder: &mut CommandEncoder) {
+        if self.src_draw_count == 0 {
+            return;
+        }
+
+        // If a previous readback completed, consume it first so the
+        // staging buffer is unmapped before we copy into it.
+        if self.count_pending {
+            if self.count_ready.load(Ordering::Acquire) {
+                self.consume_count_readback();
+            }
+            else {
+                // Previous map still in flight. Skip this frame.
+                return;
+            }
+        }
+
+        encoder.copy_buffer_to_buffer(
+            &self.draw_count_buf, 0,
+            &self.count_staging,  0,
+            4,
+        );
+    }
+
+    /// Request async readback of the visible draw count.
+    ///
+    /// Call after `queue.submit()`. The result becomes available in the
+    /// next frame's [`poll_visible_count`](Self::poll_visible_count).
+    pub fn request_count_readback(&mut self) {
+        if self.src_draw_count == 0 || self.count_pending {
+            return;
+        }
+
+        self.count_pending = true;
+        self.count_ready.store(false, Ordering::Release);
+
+        let ready = self.count_ready.clone();
+
+        self.count_staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                result.unwrap();
+                ready.store(true, Ordering::Release);
+            });
+    }
+
+    /// Poll for completed visible count readback.
+    ///
+    /// Call at the start of each frame. Updates `visible_count` if
+    /// results are available.
+    pub fn poll_visible_count(&mut self, device: &Device) {
+        if !self.count_pending {
+            return;
+        }
+
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        if self.count_ready.load(Ordering::Acquire) {
+            self.consume_count_readback();
+        }
+    }
+
+    /// Read mapped staging data and update the visible count.
+    fn consume_count_readback(&mut self) {
+        let slice = self.count_staging.slice(..);
+        let data  = slice.get_mapped_range();
+        let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        drop(data);
+
+        self.count_staging.unmap();
+
+        self.count_pending = false;
+        self.count_ready.store(false, Ordering::Release);
+        self.visible_count = count;
+    }
+
     /// Issue a single multi-draw-indirect call for all chunks with quads.
     ///
     /// Sets the shared render bind group and dispatches all chunk draws
     /// from the indirect buffer. The caller must have already set the
     /// render pipeline on the pass.
     pub fn draw<'a>(&'a self, pass: &mut RenderPass<'a>) {
-        if self.draw_count == 0 {
+        if self.src_draw_count == 0 {
             return;
         }
 
         pass.set_bind_group(0, &self.render_bg, &[]);
-        pass.multi_draw_indirect(&self.indirect_buf, 0, self.draw_count);
+        pass.multi_draw_indirect_count(
+            &self.dst_indirect_buf,
+            0,
+            &self.draw_count_buf,
+            0,
+            self.src_draw_count,
+        );
     }
 
     /// Rebuild the indirect draw buffer from all loaded chunks.
@@ -899,11 +1118,11 @@ impl GpuWorld {
             });
         }
 
-        self.draw_count = args.len() as u32;
+        self.src_draw_count = args.len() as u32;
 
         if !args.is_empty() {
             queue.write_buffer(
-                &self.indirect_buf,
+                &self.src_indirect_buf,
                 0,
                 bytemuck::cast_slice(&args),
             );

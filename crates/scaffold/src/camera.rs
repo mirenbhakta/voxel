@@ -86,4 +86,37 @@ impl Camera {
     pub fn view_proj(&self) -> Mat4 {
         self.projection_matrix() * self.view_matrix()
     }
+
+    /// Extract six frustum planes from the view-projection matrix.
+    ///
+    /// Returns inward-pointing planes `[left, right, bottom, top, near, far]`
+    /// as `(nx, ny, nz, d)` where `dot(n, point) + d >= 0` for points
+    /// inside the frustum. Each plane is normalized by `length(n)`.
+    ///
+    /// Uses the Gribb-Hartmann method adapted for wgpu's `[0, 1]` depth
+    /// range, where the near plane condition is `0 <= z` rather than
+    /// `-w <= z`.
+    pub fn frustum_planes(&self) -> [[f32; 4]; 6] {
+        let vp = self.view_proj();
+
+        let row0 = vp.row(0);
+        let row1 = vp.row(1);
+        let row2 = vp.row(2);
+        let row3 = vp.row(3);
+
+        let raw = [
+            row3 + row0,       // left
+            row3 - row0,       // right
+            row3 + row1,       // bottom
+            row3 - row1,       // top
+            row2,              // near  ([0,1] depth: 0 <= z)
+            row3 - row2,       // far   ([0,1] depth: z <= w)
+        ];
+
+        // Normalize each plane so distance tests are correct.
+        raw.map(|p| {
+            let len = p.truncate().length();
+            (p / len).to_array()
+        })
+    }
 }

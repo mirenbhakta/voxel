@@ -7,6 +7,7 @@
 mod build;
 mod camera;
 mod chunk_manager;
+mod cull;
 mod timestamp;
 mod world;
 mod worldgen;
@@ -231,6 +232,7 @@ impl ApplicationHandler for App {
                 label             : Some("scaffold_device"),
                 required_features : Features::IMMEDIATES
                                   | Features::INDIRECT_FIRST_INSTANCE
+                                  | Features::MULTI_DRAW_INDIRECT_COUNT
                                   | Features::TIMESTAMP_QUERY,
                 required_limits   : Limits {
                     max_immediate_size : 4,
@@ -646,6 +648,7 @@ impl ApplicationHandler for App {
 
                 // Poll for GPU timestamp results from the previous frame.
                 gpu.timestamps.begin_frame(&gpu.device);
+                gpu.gpu_world.poll_visible_count(&gpu.device);
 
                 // Update camera position from keyboard input.
                 update_camera_movement(&mut self.camera, &self.input, dt);
@@ -670,6 +673,9 @@ impl ApplicationHandler for App {
                     0,
                     bytemuck::bytes_of(&uniform),
                 );
+
+                // Extract frustum planes for GPU culling.
+                let frustum_planes = self.camera.frustum_planes();
 
                 // Acquire the next frame.
                 let frame = match gpu.surface.get_current_texture() {
@@ -776,6 +782,16 @@ impl ApplicationHandler for App {
                     &screen_desc,
                 );
 
+                // Frustum cull: compact source draws into visible draws.
+                gpu.gpu_world.dispatch_cull(
+                    &mut encoder,
+                    &gpu.queue,
+                    &frustum_planes,
+                );
+
+                // Copy the GPU-written visible count to the staging buffer.
+                gpu.gpu_world.resolve_visible_count(&mut encoder);
+
                 // Voxel render pass: clear + draw quads.
                 {
                     let mut pass = encoder.begin_render_pass(
@@ -848,8 +864,9 @@ impl ApplicationHandler for App {
 
                 gpu.queue.submit(Some(encoder.finish()));
 
-                // Initiate async timestamp readback.
+                // Initiate async timestamp and visible count readback.
                 gpu.timestamps.request_readback();
+                gpu.gpu_world.request_count_readback();
 
                 frame.present();
 
@@ -966,8 +983,8 @@ fn draw_stats_ui(
                 .show(ui, |ui| {
                     ui.label("Chunks");
                     ui.label(format!(
-                        "{} loaded, {} drawn",
-                        stats.chunks_loaded, stats.chunks_drawn,
+                        "{} loaded, {} visible",
+                        stats.chunks_loaded, stats.chunks_visible,
                     ));
                     ui.end_row();
 
