@@ -5,7 +5,7 @@
 //! build dispatch, quad count readback, block allocation/trimming,
 //! and draw call emission.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytemuck::{Pod, Zeroable};
 use voxel::block::{BlockId, BlockRegistry, FaceTexture};
@@ -32,14 +32,14 @@ const BLOCK_SIZE: u32       = 256;
 /// Bytes per block.
 const BLOCK_BYTES: u64      = BLOCK_SIZE as u64 * 4;
 
-/// Total blocks in the pool. 16384 blocks = 16 MB total quad storage.
-const POOL_BLOCKS: u32      = 16384;
+/// Total blocks in the pool. 65536 blocks = 64 MB total quad storage.
+const POOL_BLOCKS: u32      = 65536;
 
 /// Maximum blocks any single chunk can use (worst case: 98304 / 256).
 pub(crate) const MAX_CHUNK_BLOCKS: u32 = 384;
 
 /// Maximum concurrent loaded chunks.
-const MAX_CHUNKS: u32       = 1024;
+const MAX_CHUNKS: u32       = 4096;
 
 /// Quads per page-table slot (blocks per slot * quads per block).
 ///
@@ -670,6 +670,19 @@ impl GpuWorld {
         self.rebuild_indirect(queue);
     }
 
+    /// Remove all loaded chunks from the GPU.
+    ///
+    /// Frees every slot and zeroes occupancy for all positions. Used when
+    /// switching world generators to start with a clean slate.
+    pub fn clear(&mut self, queue: &Queue) {
+        let positions: Vec<ChunkPos> =
+            self.chunks.keys().copied().collect();
+
+        for pos in positions {
+            self.remove(queue, pos);
+        }
+    }
+
     /// Upload new occupancy data for a chunk and mark it for rebuilding.
     ///
     /// The occupancy buffer is written immediately via the queue. The
@@ -739,9 +752,10 @@ impl GpuWorld {
     /// updated quad counts.
     pub fn rebuild_subset(
         &mut self,
-        device    : &Device,
-        queue     : &Queue,
+        device   : &Device,
+        queue    : &Queue,
         positions : &[ChunkPos],
+        rejected : &HashSet<ChunkPos>,
     )
     {
         // Collect the subset of requested positions that are actually dirty.
@@ -758,7 +772,10 @@ impl GpuWorld {
 
         // Upload neighbor boundary slices for chunks being rebuilt.
         for &pos in &to_build {
-            let slices = build_neighbor_slices(&self.chunks, pos);
+            let slices = build_neighbor_slices(
+                &self.chunks, pos, rejected,
+            );
+
             if let Some(chunk) = self.chunks.get(&pos) {
                 chunk.build.upload_neighbor_slices(queue, &slices);
             }
@@ -813,12 +830,13 @@ impl GpuWorld {
     /// dirty list is empty.
     pub fn rebuild(
         &mut self,
-        device : &Device,
-        queue  : &Queue,
+        device   : &Device,
+        queue    : &Queue,
+        rejected : &HashSet<ChunkPos>,
     )
     {
         let all_dirty: Vec<ChunkPos> = self.dirty.clone();
-        self.rebuild_subset(device, queue, &all_dirty);
+        self.rebuild_subset(device, queue, &all_dirty, rejected);
     }
 
     /// Returns the current list of dirty chunk positions.
@@ -923,64 +941,112 @@ impl GpuWorld {
 ///
 /// Extract the 6 boundary layers from neighboring chunks' occupancy
 /// shadows and pack them into a 192-word array matching the shader's
-/// expected layout. Missing neighbors produce zero slices, leaving
-/// boundary faces visible.
+/// expected layout.
+///
+/// Unloaded neighbors default to fully occupied (all-ones) so that
+/// boundary faces against the unloaded void are culled. Neighbors
+/// in the `rejected` set are known-empty and produce zero slices,
+/// keeping boundary faces visible against confirmed air.
 fn build_neighbor_slices(
-    chunks : &HashMap<ChunkPos, GpuChunk>,
-    pos    : ChunkPos,
+    chunks   : &HashMap<ChunkPos, GpuChunk>,
+    pos      : ChunkPos,
+    rejected : &HashSet<ChunkPos>,
 ) -> [u32; NEIGHBOR_WORDS]
 {
-    let mut slices = [0u32; NEIGHBOR_WORDS];
+    // Default: assume unloaded neighbors are solid (cull boundary
+    // faces). Loaded and rejected neighbors overwrite their direction.
+    let mut slices = [!0u32; NEIGHBOR_WORDS];
 
-    let neighbor_occ = |dx: i32, dy: i32, dz: i32| -> Option<&[u32; 1024]> {
+    // Look up a neighbor. Returns:
+    //   Some(Some(occ)) — loaded, use actual occupancy
+    //   Some(None)      — rejected (known empty), zero the slice
+    //   None            — unloaded, leave as all-ones
+    let neighbor = |dx: i32, dy: i32, dz: i32|
+        -> Option<Option<&[u32; 1024]>>
+    {
         let npos = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
-        chunks.get(&npos).map(|c| c.occ.as_ref())
+
+        if let Some(c) = chunks.get(&npos) {
+            return Some(Some(c.occ.as_ref()));
+        }
+
+        if rejected.contains(&npos) {
+            return Some(None);
+        }
+
+        None
     };
 
     // +X: x=0 column of neighbor at (+1,0,0). Word[z], bit y.
-    if let Some(occ) = neighbor_occ(1, 0, 0) {
+    if let Some(data) = neighbor(1, 0, 0) {
         for z in 0..32 {
             let mut word = 0u32;
-            for y in 0..32 {
-                word |= (occ[z * 32 + y] & 1) << y;
+            if let Some(occ) = data {
+                for y in 0..32 {
+                    word |= (occ[z * 32 + y] & 1) << y;
+                }
             }
             slices[DIR_POS_X + z] = word;
         }
     }
 
     // -X: x=31 column of neighbor at (-1,0,0). Word[z], bit y.
-    if let Some(occ) = neighbor_occ(-1, 0, 0) {
+    if let Some(data) = neighbor(-1, 0, 0) {
         for z in 0..32 {
             let mut word = 0u32;
-            for y in 0..32 {
-                word |= ((occ[z * 32 + y] >> 31) & 1) << y;
+            if let Some(occ) = data {
+                for y in 0..32 {
+                    word |= ((occ[z * 32 + y] >> 31) & 1) << y;
+                }
             }
             slices[DIR_NEG_X + z] = word;
         }
     }
 
     // +Y: y=0 row of neighbor at (0,+1,0). Word[z], bit x.
-    if let Some(occ) = neighbor_occ(0, 1, 0) {
+    if let Some(data) = neighbor(0, 1, 0) {
         for z in 0..32 {
-            slices[DIR_POS_Y + z] = occ[z * 32];
+            slices[DIR_POS_Y + z] = match data {
+                Some(occ) => occ[z * 32],
+                None      => 0,
+            };
         }
     }
 
     // -Y: y=31 row of neighbor at (0,-1,0). Word[z], bit x.
-    if let Some(occ) = neighbor_occ(0, -1, 0) {
+    if let Some(data) = neighbor(0, -1, 0) {
         for z in 0..32 {
-            slices[DIR_NEG_Y + z] = occ[z * 32 + 31];
+            slices[DIR_NEG_Y + z] = match data {
+                Some(occ) => occ[z * 32 + 31],
+                None      => 0,
+            };
         }
     }
 
     // +Z: z=0 layer of neighbor at (0,0,+1). Word[y], bit x.
-    if let Some(occ) = neighbor_occ(0, 0, 1) {
-        slices[DIR_POS_Z..DIR_POS_Z + 32].copy_from_slice(&occ[..32]);
+    if let Some(data) = neighbor(0, 0, 1) {
+        match data {
+            Some(occ) => {
+                slices[DIR_POS_Z..DIR_POS_Z + 32]
+                    .copy_from_slice(&occ[..32]);
+            }
+            None => {
+                slices[DIR_POS_Z..DIR_POS_Z + 32].fill(0);
+            }
+        }
     }
 
     // -Z: z=31 layer of neighbor at (0,0,-1). Word[y], bit x.
-    if let Some(occ) = neighbor_occ(0, 0, -1) {
-        slices[DIR_NEG_Z..DIR_NEG_Z + 32].copy_from_slice(&occ[992..]);
+    if let Some(data) = neighbor(0, 0, -1) {
+        match data {
+            Some(occ) => {
+                slices[DIR_NEG_Z..DIR_NEG_Z + 32]
+                    .copy_from_slice(&occ[992..]);
+            }
+            None => {
+                slices[DIR_NEG_Z..DIR_NEG_Z + 32].fill(0);
+            }
+        }
     }
 
     slices

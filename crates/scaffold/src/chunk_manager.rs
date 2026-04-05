@@ -60,6 +60,10 @@ pub struct ChunkManager {
     builds_per_frame : usize,
     /// Wall-clock budget for parallel chunk generation.
     gen_budget       : Duration,
+    /// Maximum chunks to keep loaded. Caps the iteration radius in
+    /// [`rebuild_load_queue`](Self::rebuild_load_queue) so that a large
+    /// view distance does not cause a combinatorial explosion.
+    chunk_budget     : usize,
 }
 
 // --- ChunkManager ---
@@ -77,11 +81,15 @@ impl ChunkManager {
     /// * `gen_budget`       - Wall-clock time budget for parallel chunk
     ///   generation. Workers that have not started when the budget
     ///   expires are skipped and retried next frame.
+    /// * `chunk_budget`     - Maximum chunks to keep loaded. Caps the
+    ///   load queue iteration radius so that large view distances do
+    ///   not freeze the frame while enumerating millions of positions.
     pub fn new(
         view_distance    : i32,
         loads_per_frame  : usize,
         builds_per_frame : usize,
         gen_budget       : Duration,
+        chunk_budget     : usize,
     ) -> Self
     {
         ChunkManager {
@@ -93,6 +101,7 @@ impl ChunkManager {
             loads_per_frame  : loads_per_frame,
             builds_per_frame : builds_per_frame,
             gen_budget       : gen_budget,
+            chunk_budget     : chunk_budget,
         }
     }
 
@@ -164,9 +173,35 @@ impl ChunkManager {
         self.load_queue.len()
     }
 
+    /// Set the view distance in chunk units.
+    ///
+    /// If the distance changed, rebuilds the load queue so new positions
+    /// within the expanded radius are queued. Chunks outside the new
+    /// distance are unloaded on the next [`update`](Self::update) call.
+    pub fn set_view_distance(&mut self, distance: i32) {
+        if distance == self.view_distance {
+            return;
+        }
+
+        self.view_distance = distance;
+        self.rebuild_load_queue();
+    }
+
     /// Returns the current center chunk position.
     pub fn center(&self) -> ChunkPos {
         self.center
+    }
+
+    /// Clear all loaded chunks and reset queues.
+    ///
+    /// Used when switching world generators. The caller should also clear
+    /// all corresponding GPU chunks, then call
+    /// [`set_center`](Self::set_center) to repopulate the load queue.
+    pub fn reset(&mut self) {
+        self.world      = World::new();
+        self.load_queue.clear();
+        self.rejected.clear();
+        self.center     = ChunkPos::new(i32::MAX, i32::MAX, i32::MAX);
     }
 
     // -----------------------------------------------------------------------
@@ -175,12 +210,20 @@ impl ChunkManager {
 
     /// Recompute the load queue for the current center.
     ///
-    /// Enumerates all positions within the view distance sphere, filters
-    /// out positions already loaded in the CPU world, and sorts by
-    /// squared distance (nearest first).
+    /// Enumerates positions within a sphere capped to the smaller of the
+    /// view distance and the radius that fits the remaining chunk budget.
+    /// This prevents combinatorial explosion when the view distance is
+    /// much larger than what the GPU can hold.
     fn rebuild_load_queue(&mut self) {
-        let vd  = self.view_distance;
-        let vd2 = vd * vd;
+        // Cap iteration radius to what the budget can fill. Rejected
+        // positions occupy sphere volume without consuming GPU slots,
+        // so include them to avoid underestimating the radius for
+        // sparse generators (e.g. terrain where most Y levels are empty).
+        let loaded    = self.world.chunk_count();
+        let remaining = self.chunk_budget.saturating_sub(loaded);
+        let budget_r  = sphere_radius(remaining + self.rejected.len());
+        let vd        = self.view_distance.min(budget_r);
+        let vd2       = vd * vd;
         let cx  = self.center.x;
         let cy  = self.center.y;
         let cz  = self.center.z;
@@ -410,6 +453,23 @@ impl ChunkManager {
 
         prioritized.truncate(self.builds_per_frame);
 
-        gpu.rebuild_subset(device, queue, &prioritized);
+        gpu.rebuild_subset(device, queue, &prioritized, &self.rejected);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Integer radius of a discrete sphere containing at most `n` positions.
+///
+/// Inverts the volume formula V = (4/3)pi*r^3 and rounds up so the sphere
+/// is large enough to hold `n` chunks. Returns at least 1 when `n > 0`.
+fn sphere_radius(n: usize) -> i32 {
+    if n == 0 {
+        return 0;
+    }
+
+    let r = (0.75 * n as f64 / std::f64::consts::PI).cbrt();
+    (r.ceil() as i32).max(1)
 }

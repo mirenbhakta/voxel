@@ -106,6 +106,19 @@ impl InputState {
 }
 
 // ---------------------------------------------------------------------------
+// World generator mode
+// ---------------------------------------------------------------------------
+
+/// The active world generator.
+#[derive(Clone, Copy, PartialEq)]
+enum WorldGenMode {
+    /// Rolling hills with layered stone, dirt, and grass.
+    Terrain,
+    /// Floating 3D noise blobs in every direction.
+    Asteroid,
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -123,6 +136,8 @@ struct App {
     last_frame     : Instant,
     /// Exponentially smoothed frame time for display.
     frame_time_avg : f32,
+    /// Which world generator is active.
+    gen_mode       : WorldGenMode,
 }
 
 /// Initialized GPU resources tied to a window surface.
@@ -157,6 +172,12 @@ struct Gpu {
     egui_renderer : egui_wgpu::Renderer,
     /// The GPU timestamp query manager.
     timestamps    : TimestampQueries,
+    /// Stone block ID for provider construction.
+    stone         : BlockId,
+    /// Dirt block ID for provider construction.
+    dirt          : BlockId,
+    /// Grass block ID for provider construction.
+    grass         : BlockId,
 }
 
 // --- App ---
@@ -171,6 +192,7 @@ impl App {
             grabbed        : false,
             last_frame     : Instant::now(),
             frame_time_avg : 0.0,
+            gen_mode       : WorldGenMode::Terrain,
         }
     }
 }
@@ -453,7 +475,7 @@ impl ApplicationHandler for App {
         // Chunk manager: view distance 6, load up to 8 chunks/frame,
         // rebuild up to 16 chunks/frame, 4ms worldgen budget.
         let mut chunk_mgr = ChunkManager::new(
-            6, 8, 16, Duration::from_millis(4),
+            6, 8, 16, Duration::from_millis(4), 4096,
         );
 
         let provider: Box<dyn ChunkProvider + Sync> = Box::new(
@@ -506,6 +528,9 @@ impl ApplicationHandler for App {
             egui_state    : egui_state,
             egui_renderer : egui_renderer,
             timestamps    : timestamps,
+            stone         : stone,
+            dirt          : dirt,
+            grass         : grass,
         });
 
         // Start the render loop.
@@ -676,6 +701,9 @@ impl ApplicationHandler for App {
 
                 gpu.egui_ctx.begin_pass(egui_input);
 
+                let prev_mode     = self.gen_mode;
+                let mut view_dist = gpu.chunk_mgr.view_distance();
+
                 draw_stats_ui(
                     &gpu.egui_ctx,
                     &stats,
@@ -683,7 +711,31 @@ impl ApplicationHandler for App {
                     self.frame_time_avg,
                     gpu_render,
                     &gpu.chunk_mgr,
+                    &mut view_dist,
+                    &mut self.gen_mode,
                 );
+
+                gpu.chunk_mgr.set_view_distance(view_dist);
+
+                // Switch world generator when the user picks a new mode.
+                if self.gen_mode != prev_mode {
+                    gpu.chunk_mgr.reset();
+                    gpu.gpu_world.clear(&gpu.queue);
+
+                    gpu.provider = match self.gen_mode {
+                        WorldGenMode::Terrain => Box::new(
+                            worldgen::SurfaceTerrain::new(
+                                42, gpu.stone, gpu.dirt, gpu.grass,
+                            ),
+                        ),
+                        WorldGenMode::Asteroid => Box::new(
+                            worldgen::AsteroidField::new(42, gpu.stone),
+                        ),
+                    };
+
+                    // Re-trigger loading from current position.
+                    gpu.chunk_mgr.set_center(self.camera.position);
+                }
 
                 let egui_output = gpu.egui_ctx.end_pass();
 
@@ -884,6 +936,8 @@ fn draw_stats_ui(
     dt_avg     : f32,
     gpu_render : f32,
     chunk_mgr  : &ChunkManager,
+    view_dist  : &mut i32,
+    gen_mode   : &mut WorldGenMode,
 ) {
     egui::Window::new("Stats")
         .default_open(true)
@@ -932,12 +986,14 @@ fn draw_stats_ui(
 
             ui.separator();
 
+            ui.add(
+                egui::Slider::new(view_dist, 1..=200)
+                    .text("View dist"),
+            );
+
             egui::Grid::new("streaming")
                 .num_columns(2)
                 .show(ui, |ui| {
-                    ui.label("View dist");
-                    ui.label(format!("{}", chunk_mgr.view_distance()));
-                    ui.end_row();
 
                     ui.label("CPU chunks");
                     ui.label(format!(
@@ -987,6 +1043,22 @@ fn draw_stats_ui(
                 camera.position.y,
                 camera.position.z,
             ));
+
+            ui.separator();
+
+            egui::ComboBox::from_label("Generator")
+                .selected_text(match *gen_mode {
+                    WorldGenMode::Terrain  => "Terrain",
+                    WorldGenMode::Asteroid => "Asteroid",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        gen_mode, WorldGenMode::Terrain, "Terrain",
+                    );
+                    ui.selectable_value(
+                        gen_mode, WorldGenMode::Asteroid, "Asteroid",
+                    );
+                });
         });
 }
 
