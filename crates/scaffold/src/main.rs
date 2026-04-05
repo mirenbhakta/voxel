@@ -14,22 +14,23 @@ use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
 use pollster::FutureExt as _;
+use voxel::block::{BlockId, BlockRegistry, Material};
 use wgpu::util::DeviceExt;
 use wgpu::{
-    BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType, BufferUsages,
-    Color, ColorTargetState, ColorWrites, CommandEncoderDescriptor,
-    CompareFunction, CurrentSurfaceTexture, DepthBiasState, DepthStencilState,
-    Device, DeviceDescriptor, Extent3d, Face, Features, FragmentState,
-    FrontFace, Instance, InstanceDescriptor, Limits, LoadOp, MultisampleState,
-    Operations, PipelineCompilationOptions, PipelineLayoutDescriptor,
-    PolygonMode, PrimitiveState, PrimitiveTopology, Queue,
-    RenderPassColorAttachment, RenderPassDepthStencilAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
-    RequestAdapterOptions, ShaderModuleDescriptor, ShaderSource, ShaderStages,
-    StencilState, StoreOp, Surface, SurfaceConfiguration, TextureDescriptor,
-    TextureDimension, TextureFormat, TextureUsages, TextureView,
-    TextureViewDescriptor, VertexState,
+    BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType, Buffer,
+    BufferBindingType, BufferUsages, Color, ColorTargetState, ColorWrites,
+    CommandEncoderDescriptor, CompareFunction, CurrentSurfaceTexture,
+    DepthBiasState, DepthStencilState, Device, DeviceDescriptor, Extent3d,
+    Face, Features, FragmentState, FrontFace, Instance, InstanceDescriptor,
+    Limits, LoadOp, MultisampleState, Operations,
+    PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode,
+    PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment,
+    RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, RequestAdapterOptions, SamplerBindingType,
+    ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState,
+    StoreOp, Surface, SurfaceConfiguration, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
+    TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -40,7 +41,14 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use camera::Camera;
 use voxel::chunk::ChunkPos;
-use world::GpuWorld;
+use world::{build_material_tables, GpuWorld};
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Width and height of each texture layer in pixels.
+const TEX_SIZE: u32 = 16;
 
 // ---------------------------------------------------------------------------
 // GPU types
@@ -210,7 +218,29 @@ impl ApplicationHandler for App {
             usage    : BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
 
-        // Bind group layout: camera uniform + shared quad pool + page table.
+        // Register block types.
+        let mut registry = BlockRegistry::new();
+        let stone = registry.register(
+            "stone", Material::from_rgb(128, 128, 128).with_texture(1),
+        );
+        let dirt = registry.register(
+            "dirt", Material::from_rgb(139, 90, 43).with_texture(2),
+        );
+        let grass = registry.register(
+            "grass",
+            Material::from_rgb(255, 255, 255)
+                .with_top_bottom_side(3, 2, 4),
+        );
+
+        // Build GPU material tables from the registry.
+        let (materials, face_tex) = build_material_tables(&registry);
+
+        // Generate procedural block textures.
+        let texture_pixels = generate_textures();
+        let texture_layers = 5u32;
+
+        // Bind group layout: camera, quad pool, page table, chunk offsets,
+        // material volume, material table, texture array, sampler.
         let bind_group_layout = device.create_bind_group_layout(
             &BindGroupLayoutDescriptor {
                 label   : Some("main_bgl"),
@@ -259,6 +289,62 @@ impl ApplicationHandler for App {
                             has_dynamic_offset : false,
                             min_binding_size   : None,
                         },
+                        count : None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding    : 4,
+                        visibility : ShaderStages::FRAGMENT,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding    : 5,
+                        visibility : ShaderStages::FRAGMENT,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding    : 6,
+                        visibility : ShaderStages::FRAGMENT,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding    : 7,
+                        visibility : ShaderStages::FRAGMENT,
+                        ty         : BindingType::Texture {
+                            sample_type    : TextureSampleType::Float {
+                                filterable : true,
+                            },
+                            view_dimension : TextureViewDimension::D2Array,
+                            multisampled   : false,
+                        },
+                        count : None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding    : 8,
+                        visibility : ShaderStages::FRAGMENT,
+                        ty         : BindingType::Sampler(
+                            SamplerBindingType::Filtering,
+                        ),
                         count : None,
                     },
                 ],
@@ -331,14 +417,24 @@ impl ApplicationHandler for App {
         // GPU world manager.
         let mut world = GpuWorld::new(
             &device,
+            &queue,
             bind_group_layout,
             camera_buf.clone(),
+            &materials,
+            &face_tex,
+            &texture_pixels,
+            TEX_SIZE,
+            texture_layers,
         );
 
         for cx in 0..4i32 {
             for cz in 0..4i32 {
-                let occ = generate_test_occupancy_varied(cx, cz);
-                world.insert(&device, &queue, ChunkPos::new(cx, 0, cz), &occ);
+                let (occ, mat) = generate_test_terrain(
+                    cx, cz, stone, dirt, grass,
+                );
+                world.insert(
+                    &device, &queue, ChunkPos::new(cx, 0, cz), &occ, &mat,
+                );
             }
         }
 
@@ -622,22 +718,132 @@ fn create_depth_texture(
 // Test data generation
 // ---------------------------------------------------------------------------
 
-/// Generate a test occupancy bitmask with a chunk-dependent fill height.
+/// Generate terrain occupancy and material data for a test chunk.
 ///
-/// Layout: `occ[z * 32 + y]`, bit x. Fill height varies by chunk
-/// position so adjacent chunks are visually distinguishable.
-fn generate_test_occupancy_varied(cx: i32, cz: i32) -> [u32; 1024] {
+/// Produces layered terrain with stone at the bottom, dirt in the middle,
+/// and grass on top. Fill height varies by chunk position so adjacent
+/// chunks are visually distinguishable.
+///
+/// # Arguments
+///
+/// * `cx`    - Chunk X coordinate (for height variation).
+/// * `cz`    - Chunk Z coordinate (for height variation).
+/// * `stone` - Block ID for stone layers.
+/// * `dirt`  - Block ID for dirt layers.
+/// * `grass` - Block ID for the top grass layer.
+fn generate_test_terrain(
+    cx    : i32,
+    cz    : i32,
+    stone : BlockId,
+    dirt  : BlockId,
+    grass : BlockId,
+) -> ([u32; 1024], Box<[u8; 32768]>)
+{
     let mut occ = [0u32; 1024];
+    let mut mat = Box::new([0u8; 32768]);
 
     let height = (4 + ((cx * 3 + cz * 7).unsigned_abs() % 8)) as usize;
 
-    for z in 0..32 {
+    for z in 0..32usize {
         for y in 0..height.min(32) {
             occ[z * 32 + y] = !0u32;
+
+            // Assign block type based on depth from the surface.
+            let block = if y == height - 1 {
+                grass
+            }
+            else if y + 3 >= height {
+                dirt
+            }
+            else {
+                stone
+            };
+
+            let block_id = block.raw() as u8;
+            for x in 0..32usize {
+                mat[z * 1024 + y * 32 + x] = block_id;
+            }
         }
     }
 
-    occ
+    (occ, mat)
+}
+
+// ---------------------------------------------------------------------------
+// Procedural textures
+// ---------------------------------------------------------------------------
+
+/// Generate all block texture layers as raw RGBA pixel data.
+///
+/// Returns a byte vector containing all layers packed sequentially.
+/// Layer 0 is a solid white fallback. Layers 1-3 are noisy variations
+/// of stone, dirt, and grass.
+fn generate_textures() -> Vec<u8> {
+    let mut pixels = Vec::new();
+    let layer_bytes = (TEX_SIZE * TEX_SIZE * 4) as usize;
+
+    // Layer 0: solid white fallback.
+    pixels.extend(std::iter::repeat(255u8).take(layer_bytes));
+
+    // Layer 1: stone (gray, speckled).
+    pixels.extend(generate_noise_texture(128, 128, 128, 20, 1));
+
+    // Layer 2: dirt (brown).
+    pixels.extend(generate_noise_texture(139, 90, 43, 15, 2));
+
+    // Layer 3: grass top (green).
+    pixels.extend(generate_noise_texture(80, 160, 50, 20, 3));
+
+    // Layer 4: grass side (brownish-green).
+    pixels.extend(generate_noise_texture(100, 120, 60, 15, 4));
+
+    pixels
+}
+
+/// Generate a single noise texture layer.
+///
+/// Produces a TEX_SIZE x TEX_SIZE RGBA image with per-pixel noise
+/// applied to the base color. The noise is deterministic for a given
+/// seed.
+///
+/// # Arguments
+///
+/// * `base_r` - Base red channel value.
+/// * `base_g` - Base green channel value.
+/// * `base_b` - Base blue channel value.
+/// * `noise`  - Maximum per-channel deviation from the base color.
+/// * `seed`   - Hash seed for deterministic noise generation.
+fn generate_noise_texture(
+    base_r : u8,
+    base_g : u8,
+    base_b : u8,
+    noise  : u8,
+    seed   : u32,
+) -> Vec<u8>
+{
+    let mut pixels = Vec::with_capacity((TEX_SIZE * TEX_SIZE * 4) as usize);
+
+    for y in 0..TEX_SIZE {
+        for x in 0..TEX_SIZE {
+            let h     = tex_hash(x, y, seed);
+            let delta = (h % (noise as u32 * 2 + 1)) as i16 - noise as i16;
+            let r     = (base_r as i16 + delta).clamp(0, 255) as u8;
+            let g     = (base_g as i16 + delta).clamp(0, 255) as u8;
+            let b     = (base_b as i16 + delta).clamp(0, 255) as u8;
+            pixels.extend_from_slice(&[r, g, b, 255]);
+        }
+    }
+
+    pixels
+}
+
+/// Simple integer hash for deterministic texture noise.
+fn tex_hash(x: u32, y: u32, seed: u32) -> u32 {
+    let mut h = x.wrapping_mul(374761393)
+        .wrapping_add(y.wrapping_mul(668265263))
+        .wrapping_add(seed.wrapping_mul(2654435761));
+    h = (h ^ (h >> 13)).wrapping_mul(1274126177);
+    h ^ (h >> 16)
 }
 
 // ---------------------------------------------------------------------------

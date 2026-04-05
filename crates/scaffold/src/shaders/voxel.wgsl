@@ -21,21 +21,45 @@ struct Camera {
 // Indexed by slot = instance_index / SLOT_INSTANCE_STRIDE (98304).
 @group(0) @binding(3) var<storage, read> chunk_offsets : array<vec4<i32>>;
 
+// Volumetric material buffer. Each chunk slot stores 32768 bytes (8192 u32s).
+// Each byte is a resolved BlockId. Shader reads as array<u32> and unpacks.
+@group(0) @binding(4) var<storage, read> material_volume : array<u32>;
+
+// Material property table. One vec4<u32> per block type.
+// .x = packed RGBA color (LE byte order, use unpack4x8unorm).
+// .y = default texture array layer index (used when .z == 0).
+// .z = face texture offset (0 = uniform, nonzero = base into face_textures).
+// .w = reserved.
+@group(0) @binding(5) var<storage, read> material_table : array<vec4<u32>>;
+
+// Per-face texture overrides. Only populated for blocks with non-uniform
+// face textures. Six consecutive u32 entries per block, indexed by
+// material_table[block_id].z + direction.
+@group(0) @binding(6) var<storage, read> face_textures : array<u32>;
+
+// Block texture array for per-face sampling.
+@group(0) @binding(7) var block_textures : texture_2d_array<f32>;
+
+// Nearest-neighbor sampler with repeat addressing.
+@group(0) @binding(8) var tex_sampler : sampler;
+
 
 // Vertex shader output.
 struct VertexOutput {
     @builtin(position) clip_position : vec4<f32>,
-    @location(0)       color         : vec3<f32>,
+    @location(0)       world_pos     : vec3<f32>,
+    @location(1) @interpolate(flat)  direction : u32,
+    @location(2) @interpolate(flat)  slot      : u32,
 }
 
-// Per-direction face colors for visual identification.
-const DIR_COLORS = array<vec3<f32>, 6>(
-    vec3<f32>(0.90, 0.35, 0.30), // +X  red
-    vec3<f32>(0.35, 0.85, 0.35), // -X  green
-    vec3<f32>(0.35, 0.40, 0.95), // +Y  blue
-    vec3<f32>(0.95, 0.85, 0.30), // -Y  yellow
-    vec3<f32>(0.85, 0.35, 0.85), // +Z  magenta
-    vec3<f32>(0.30, 0.85, 0.85), // -Z  cyan
+// Outward face normal per direction.
+const NORMAL_VEC = array<vec3<f32>, 6>(
+    vec3<f32>( 1.0,  0.0,  0.0), // +X
+    vec3<f32>(-1.0,  0.0,  0.0), // -X
+    vec3<f32>( 0.0,  1.0,  0.0), // +Y
+    vec3<f32>( 0.0, -1.0,  0.0), // -Y
+    vec3<f32>( 0.0,  0.0,  1.0), // +Z
+    vec3<f32>( 0.0,  0.0, -1.0), // -Z
 );
 
 // Column axis unit vector per direction (col_axis = (normal+1)%3).
@@ -142,11 +166,62 @@ fn vs_main(
 
     var out : VertexOutput;
     out.clip_position = camera.view_proj * vec4<f32>(pos, 1.0);
-    out.color         = DIR_COLORS[dir];
+    out.world_pos     = pos;
+    out.direction     = dir;
+    out.slot          = slot;
     return out;
 }
 
 @fragment
 fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(in.color, 1.0);
+    // Nudge half a voxel toward the interior to identify the owning voxel.
+    // The face surface sits at the boundary between voxels; without the
+    // nudge, positive-direction faces would resolve to the neighbor.
+    let nudge    = NORMAL_VEC[in.direction] * 0.5;
+    let voxel_f  = floor(in.world_pos - nudge);
+
+    // Wrap to chunk-local coordinates (0..31).
+    let vx = u32(i32(voxel_f.x) & 31);
+    let vy = u32(i32(voxel_f.y) & 31);
+    let vz = u32(i32(voxel_f.z) & 31);
+
+    // Read the block ID from the volumetric material array.
+    let voxel_idx = vz * 1024u + vy * 32u + vx;
+    let word_idx  = in.slot * 8192u + voxel_idx / 4u;
+    let byte_off  = (voxel_idx % 4u) * 8u;
+    let block_id  = (material_volume[word_idx] >> byte_off) & 0xFFu;
+
+    // Look up material properties.
+    let mat_entry   = material_table[block_id];
+    let color       = unpack4x8unorm(mat_entry.x);
+    let face_offset = mat_entry.z;
+
+    // Resolve texture index. Uniform blocks use the default index
+    // directly. Per-face blocks branch into the face texture table.
+    var tex_idx = mat_entry.y;
+
+    if face_offset != 0u {
+        tex_idx = face_textures[face_offset + in.direction];
+    }
+
+    // Compute UV from world position based on face direction.
+    var uv : vec2<f32>;
+
+    if in.direction < 2u {
+        // X faces: texture from Y and Z axes.
+        uv = fract(in.world_pos.yz);
+    }
+    else if in.direction < 4u {
+        // Y faces: texture from X and Z axes.
+        uv = fract(in.world_pos.xz);
+    }
+    else {
+        // Z faces: texture from X and Y axes.
+        uv = fract(in.world_pos.xy);
+    }
+
+    // Sample the texture array.
+    let tex_color = textureSample(block_textures, tex_sampler, uv, i32(tex_idx));
+
+    return vec4<f32>(tex_color.rgb * color.rgb, 1.0);
 }

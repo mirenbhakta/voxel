@@ -7,11 +7,16 @@
 
 use std::collections::HashMap;
 
+use bytemuck::{Pod, Zeroable};
+use voxel::block::{BlockId, BlockRegistry, FaceTexture};
 use voxel::chunk::ChunkPos;
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout,
-    Buffer, BufferDescriptor, BufferUsages, CommandEncoderDescriptor,
-    Device, Queue, RenderPass,
+    AddressMode, BindGroup, BindGroupDescriptor, BindGroupEntry,
+    BindGroupLayout, BindingResource, Buffer, BufferDescriptor, BufferUsages,
+    CommandEncoderDescriptor, Device, Extent3d, FilterMode, Queue,
+    RenderPass, SamplerDescriptor, TextureDescriptor, TextureDimension,
+    TextureFormat, TextureUsages, TextureView, TextureViewDescriptor,
+    TextureViewDimension,
     util::DrawIndirectArgs,
 };
 
@@ -67,6 +72,85 @@ const DIR_POS_Z: usize = 4 * SLICE_WORDS;
 const DIR_NEG_Z: usize = 5 * SLICE_WORDS;
 
 // ---------------------------------------------------------------------------
+// GpuMaterial
+// ---------------------------------------------------------------------------
+
+/// GPU-side material entry for the material property table.
+///
+/// Each entry maps a block type to its packed color and texture
+/// configuration. Laid out to match the shader's `array<vec4<u32>>`
+/// binding.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct GpuMaterial {
+    /// Packed RGBA color in little-endian byte order.
+    pub color_rgba  : u32,
+    /// Default texture index (used when `face_offset` is 0).
+    pub texture_idx : u32,
+    /// Offset into the face texture table for per-face blocks.
+    /// Zero means uniform (all faces use `texture_idx`).
+    pub face_offset : u32,
+    /// Reserved for future use.
+    pub _pad        : u32,
+}
+
+// ---------------------------------------------------------------------------
+// build_material_tables
+// ---------------------------------------------------------------------------
+
+/// Build GPU material tables from a block registry.
+///
+/// Scans the registry and produces two tables:
+/// - A per-block material entry with color, default texture, and face
+///   offset.
+/// - A flat face texture array containing per-direction texture indices
+///   for blocks with non-uniform face textures.
+///
+/// Uniform blocks get `face_offset = 0` and use the single texture
+/// index directly. Per-face blocks get an offset into the face table
+/// where 6 consecutive entries store per-direction indices.
+pub fn build_material_tables(
+    registry : &BlockRegistry,
+) -> (Vec<GpuMaterial>, Vec<u32>)
+{
+    let mut materials  = Vec::with_capacity(registry.len());
+    // Index 0 is reserved as the "uniform" sentinel, so real offsets
+    // start at 1 and are always nonzero.
+    let mut face_table = vec![0u32];
+
+    for i in 0..registry.len() {
+        let block        = registry.get(BlockId::new(i as u16));
+        let mat          = block.material();
+        let [r, g, b, a] = mat.color();
+        let color_rgba   = u32::from_le_bytes([r, g, b, a]);
+
+        let (texture_idx, face_offset) = match mat.face_texture() {
+            FaceTexture::Uniform(idx) => {
+                (idx as u32, 0u32)
+            }
+
+            FaceTexture::PerFace(faces) => {
+                let base = face_table.len() as u32;
+                for &t in &faces {
+                    face_table.push(t as u32);
+                }
+                // Default texture is the +X face (index 0).
+                (faces[0] as u32, base)
+            }
+        };
+
+        materials.push(GpuMaterial {
+            color_rgba,
+            texture_idx,
+            face_offset,
+            _pad : 0,
+        });
+    }
+
+    (materials, face_table)
+}
+
+// ---------------------------------------------------------------------------
 // QuadPool
 // ---------------------------------------------------------------------------
 
@@ -78,15 +162,17 @@ const DIR_NEG_Z: usize = 5 * SLICE_WORDS;
 /// block IDs in the pool.
 struct QuadPool {
     /// The shared quad storage buffer.
-    quad_buf         : Buffer,
+    quad_buf            : Buffer,
     /// The page table mapping logical to physical block IDs.
-    page_table       : Buffer,
+    page_table          : Buffer,
     /// Per-slot chunk world offsets (`vec4<i32>` stride, xyz in voxel units).
-    chunk_offset_buf : Buffer,
+    chunk_offset_buf    : Buffer,
+    /// Volumetric material buffer for per-voxel block IDs.
+    material_volume_buf : Buffer,
     /// Free block IDs (LIFO stack).
-    free_blocks      : Vec<u32>,
+    free_blocks         : Vec<u32>,
     /// Free page table slot indices (LIFO stack).
-    free_slots       : Vec<u32>,
+    free_slots          : Vec<u32>,
 }
 
 // --- QuadPool ---
@@ -119,15 +205,24 @@ impl QuadPool {
             mapped_at_creation : false,
         });
 
+        let material_volume_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("material_volume"),
+            size               : u64::from(MAX_CHUNKS) * 32768,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
         let free_blocks = (0..POOL_BLOCKS).rev().collect();
         let free_slots  = (0..MAX_CHUNKS).rev().collect();
 
         QuadPool {
-            quad_buf         : quad_buf,
-            page_table       : page_table,
-            chunk_offset_buf : chunk_offset_buf,
-            free_blocks      : free_blocks,
-            free_slots       : free_slots,
+            quad_buf            : quad_buf,
+            page_table          : page_table,
+            chunk_offset_buf    : chunk_offset_buf,
+            material_volume_buf : material_volume_buf,
+            free_blocks         : free_blocks,
+            free_slots          : free_slots,
         }
     }
 
@@ -199,6 +294,21 @@ impl QuadPool {
             bytemuck::cast_slice(&data),
         );
     }
+
+    /// Write per-voxel material data for a chunk's slot.
+    fn write_material(
+        &self,
+        queue    : &Queue,
+        slot     : u32,
+        material : &[u8; 32768],
+    )
+    {
+        queue.write_buffer(
+            &self.material_volume_buf,
+            u64::from(slot) * 32768,
+            material,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,23 +356,31 @@ struct GpuChunk {
 /// 3. In the render pass, call [`draw`](Self::draw) to issue draw calls.
 pub struct GpuWorld {
     /// The shared build compute pipeline.
-    build_pipeline : BuildPipeline,
+    build_pipeline     : BuildPipeline,
     /// The render bind group layout.
-    render_bgl     : BindGroupLayout,
+    render_bgl         : BindGroupLayout,
     /// The shared camera uniform buffer.
-    camera_buf     : Buffer,
-    /// Shared render bind group (camera + quad pool + page table).
-    render_bg      : BindGroup,
+    camera_buf         : Buffer,
+    /// Shared render bind group (camera + pool + page table + materials + textures).
+    render_bg          : BindGroup,
     /// The shared block pool.
-    pool           : QuadPool,
+    pool               : QuadPool,
     /// Per-chunk GPU state.
-    chunks         : HashMap<ChunkPos, GpuChunk>,
+    chunks             : HashMap<ChunkPos, GpuChunk>,
     /// Positions of chunks that need rebuilding.
-    dirty          : Vec<ChunkPos>,
+    dirty              : Vec<ChunkPos>,
     /// Packed `DrawIndirectArgs` for all drawable chunks.
-    indirect_buf   : Buffer,
+    indirect_buf       : Buffer,
     /// Number of valid draw commands in `indirect_buf`.
-    draw_count     : u32,
+    draw_count         : u32,
+    /// The material property table buffer (per-block color + texture config).
+    material_table_buf : Buffer,
+    /// Per-face texture override table for non-uniform blocks.
+    face_texture_buf   : Buffer,
+    /// The block texture array view.
+    texture_view       : TextureView,
+    /// The texture sampler.
+    tex_sampler        : wgpu::Sampler,
 }
 
 // --- GpuWorld ---
@@ -272,21 +390,120 @@ impl GpuWorld {
     ///
     /// # Arguments
     ///
-    /// * `device`     - The GPU device for pipeline and resource creation.
-    /// * `render_bgl` - The bind group layout used by the render pipeline.
-    ///   Binding 0 is a camera uniform, binding 1 is the shared quad pool,
-    ///   and binding 2 is the page table.
-    /// * `camera_buf` - The shared camera uniform buffer. A handle clone
+    /// * `device`         - The GPU device for pipeline and resource creation.
+    /// * `queue`          - The queue for texture upload.
+    /// * `render_bgl`     - The bind group layout used by the render pipeline.
+    /// * `camera_buf`     - The shared camera uniform buffer. A handle clone
     ///   is stored internally. The caller retains ownership for writing
     ///   camera updates.
+    /// * `materials`      - Material property table entries, one per block type.
+    /// * `face_textures`  - Per-face texture indices for non-uniform blocks,
+    ///   produced by [`build_material_tables`].
+    /// * `texture_pixels` - Raw RGBA pixel data for all texture array layers,
+    ///   packed sequentially.
+    /// * `texture_size`   - Width and height of each texture layer in pixels.
+    /// * `texture_layers` - Number of layers in the texture array.
     pub fn new(
-        device     : &Device,
-        render_bgl : BindGroupLayout,
-        camera_buf : Buffer,
+        device         : &Device,
+        queue          : &Queue,
+        render_bgl     : BindGroupLayout,
+        camera_buf     : Buffer,
+        materials      : &[GpuMaterial],
+        face_textures  : &[u32],
+        texture_pixels : &[u8],
+        texture_size   : u32,
+        texture_layers : u32,
     ) -> Self
     {
         let pool = QuadPool::new(device);
 
+        // Create the material table buffer from the provided entries.
+        let material_table_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("material_table"),
+            size               : (materials.len() * std::mem::size_of::<GpuMaterial>())
+                                     .max(16) as u64,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        queue.write_buffer(
+            &material_table_buf,
+            0,
+            bytemuck::cast_slice(materials),
+        );
+
+        // Create the face texture buffer. Minimum 4 bytes for wgpu.
+        let face_texture_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("face_textures"),
+            size               : (face_textures.len() * 4).max(4) as u64,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        if !face_textures.is_empty() {
+            queue.write_buffer(
+                &face_texture_buf,
+                0,
+                bytemuck::cast_slice(face_textures),
+            );
+        }
+
+        // Create the block texture array.
+        let texture = device.create_texture(&TextureDescriptor {
+            label           : Some("block_textures"),
+            size            : Extent3d {
+                width                 : texture_size,
+                height                : texture_size,
+                depth_or_array_layers : texture_layers,
+            },
+            mip_level_count : 1,
+            sample_count    : 1,
+            dimension       : TextureDimension::D2,
+            format          : TextureFormat::Rgba8UnormSrgb,
+            usage           : TextureUsages::TEXTURE_BINDING
+                            | TextureUsages::COPY_DST,
+            view_formats    : &[],
+        });
+
+        // Upload all layers in a single write.
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture   : &texture,
+                mip_level : 0,
+                origin    : wgpu::Origin3d::ZERO,
+                aspect    : wgpu::TextureAspect::All,
+            },
+            texture_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset         : 0,
+                bytes_per_row  : Some(texture_size * 4),
+                rows_per_image : Some(texture_size),
+            },
+            Extent3d {
+                width                 : texture_size,
+                height                : texture_size,
+                depth_or_array_layers : texture_layers,
+            },
+        );
+
+        let texture_view = texture.create_view(&TextureViewDescriptor {
+            dimension : Some(TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
+        let tex_sampler = device.create_sampler(&SamplerDescriptor {
+            label          : Some("block_sampler"),
+            mag_filter     : FilterMode::Nearest,
+            min_filter     : FilterMode::Nearest,
+            address_mode_u : AddressMode::Repeat,
+            address_mode_v : AddressMode::Repeat,
+            address_mode_w : AddressMode::Repeat,
+            ..Default::default()
+        });
+
+        // Build the render bind group with all 9 bindings.
         let render_bg = device.create_bind_group(&BindGroupDescriptor {
             label   : Some("render_bg"),
             layout  : &render_bgl,
@@ -307,6 +524,26 @@ impl GpuWorld {
                     binding  : 3,
                     resource : pool.chunk_offset_buf.as_entire_binding(),
                 },
+                BindGroupEntry {
+                    binding  : 4,
+                    resource : pool.material_volume_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 5,
+                    resource : material_table_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 6,
+                    resource : face_texture_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 7,
+                    resource : BindingResource::TextureView(&texture_view),
+                },
+                BindGroupEntry {
+                    binding  : 8,
+                    resource : BindingResource::Sampler(&tex_sampler),
+                },
             ],
         });
 
@@ -319,36 +556,42 @@ impl GpuWorld {
         });
 
         GpuWorld {
-            build_pipeline : BuildPipeline::new(device),
-            render_bgl     : render_bgl,
-            camera_buf     : camera_buf,
-            render_bg      : render_bg,
-            pool           : pool,
-            chunks         : HashMap::new(),
-            dirty          : Vec::new(),
-            indirect_buf   : indirect_buf,
-            draw_count     : 0,
+            build_pipeline     : BuildPipeline::new(device),
+            render_bgl         : render_bgl,
+            camera_buf         : camera_buf,
+            render_bg          : render_bg,
+            pool               : pool,
+            chunks             : HashMap::new(),
+            dirty              : Vec::new(),
+            indirect_buf       : indirect_buf,
+            draw_count         : 0,
+            material_table_buf : material_table_buf,
+            face_texture_buf   : face_texture_buf,
+            texture_view       : texture_view,
+            tex_sampler        : tex_sampler,
         }
     }
 
-    /// Insert a chunk with initial occupancy data.
+    /// Insert a chunk with initial occupancy and material data.
     ///
     /// Allocates a page table slot and block storage, writes the page
-    /// table, and marks the chunk for building. Call
+    /// table and material volume, and marks the chunk for building. Call
     /// [`rebuild`](Self::rebuild) to dispatch the build compute shader.
     ///
     /// # Arguments
     ///
-    /// * `device` - The GPU device for resource creation.
-    /// * `queue`  - The queue for page table writes.
-    /// * `pos`    - The chunk position.
-    /// * `occ`    - Initial chunk occupancy bitmask.
+    /// * `device`   - The GPU device for resource creation.
+    /// * `queue`    - The queue for page table and material writes.
+    /// * `pos`      - The chunk position.
+    /// * `occ`      - Initial chunk occupancy bitmask.
+    /// * `material` - Per-voxel block IDs (32768 bytes, one byte per voxel).
     pub fn insert(
         &mut self,
-        device : &Device,
-        queue  : &Queue,
-        pos    : ChunkPos,
-        occ    : &[u32; 1024],
+        device   : &Device,
+        queue    : &Queue,
+        pos      : ChunkPos,
+        occ      : &[u32; 1024],
+        material : &[u8; 32768],
     )
     {
         let slot      = self.pool.alloc_slot();
@@ -357,6 +600,7 @@ impl GpuWorld {
         // Write block IDs to the page table and chunk world offset.
         self.pool.write_page_table(queue, slot, &block_ids);
         self.pool.write_chunk_offset(queue, slot, pos);
+        self.pool.write_material(queue, slot, material);
 
         let build = ChunkBuildData::new(
             device,

@@ -38,6 +38,22 @@ impl BlockId {
 }
 
 // ---------------------------------------------------------------------------
+// FaceTexture
+// ---------------------------------------------------------------------------
+
+/// Per-face texture assignment for a block type.
+///
+/// Direction index order: +X, -X, +Y, -Y, +Z, -Z. This matches
+/// the `Direction` enum discriminants in the render module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FaceTexture {
+    /// Same texture on all six faces.
+    Uniform(u16),
+    /// Different textures per face, indexed by direction.
+    PerFace([u16; 6]),
+}
+
+// ---------------------------------------------------------------------------
 // Material
 // ---------------------------------------------------------------------------
 
@@ -45,24 +61,77 @@ impl BlockId {
 ///
 /// Defines how a block appears when rendered. The fragment shader reads
 /// block identity from the volumetric material array and resolves it to
-/// surface color through the block registry.
+/// surface color and texture through the block registry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Material {
     /// Diffuse color as packed RGBA bytes (sRGB, alpha reserved).
-    color : [u8; 4],
+    color   : [u8; 4],
+    /// Texture assignment for block faces.
+    texture : FaceTexture,
 }
 
 impl Material {
     /// Create a material from RGB color components.
     ///
-    /// Alpha is set to 255 (fully opaque).
+    /// Alpha is set to 255 (fully opaque). Texture defaults to uniform
+    /// index 0 (untextured).
     pub fn from_rgb(r: u8, g: u8, b: u8) -> Self {
-        Material { color: [r, g, b, 255] }
+        Material {
+            color   : [r, g, b, 255],
+            texture : FaceTexture::Uniform(0),
+        }
+    }
+
+    /// Set a uniform texture for all faces.
+    pub fn with_texture(mut self, index: u16) -> Self {
+        self.texture = FaceTexture::Uniform(index);
+        self
+    }
+
+    /// Set per-face textures.
+    ///
+    /// Direction order: +X, -X, +Y, -Y, +Z, -Z.
+    pub fn with_face_textures(mut self, textures: [u16; 6]) -> Self {
+        self.texture = FaceTexture::PerFace(textures);
+        self
+    }
+
+    /// Set per-face textures using a top, bottom, side scheme.
+    ///
+    /// Applies `top` to +Y, `bottom` to -Y, and `side` to all four
+    /// horizontal faces (+X, -X, +Z, -Z).
+    pub fn with_top_bottom_side(
+        mut self,
+        top    : u16,
+        bottom : u16,
+        side   : u16,
+    ) -> Self
+    {
+        self.texture = FaceTexture::PerFace([
+            side, side, top, bottom, side, side,
+        ]);
+        self
     }
 
     /// Returns the diffuse color as RGBA bytes.
     pub fn color(self) -> [u8; 4] {
         self.color
+    }
+
+    /// Returns the face texture assignment.
+    pub fn face_texture(self) -> FaceTexture {
+        self.texture
+    }
+
+    /// Returns the default texture array index.
+    ///
+    /// For uniform materials this is the shared texture. For per-face
+    /// materials this returns the +X face texture.
+    pub fn texture(self) -> u16 {
+        match self.texture {
+            FaceTexture::Uniform(idx) => idx,
+            FaceTexture::PerFace(t)   => t[0],
+        }
     }
 }
 
@@ -222,5 +291,31 @@ mod tests {
         let block = reg.get(BlockId::AIR);
 
         assert_eq!(block.name(), "air");
+    }
+
+    // -- uniform_texture --
+
+    #[test]
+    fn uniform_texture() {
+        let mat = Material::from_rgb(128, 128, 128).with_texture(5);
+
+        assert_eq!(mat.texture(), 5);
+        assert_eq!(mat.face_texture(), FaceTexture::Uniform(5));
+    }
+
+    // -- per_face_textures --
+
+    #[test]
+    fn per_face_textures() {
+        let mat = Material::from_rgb(80, 160, 50)
+            .with_top_bottom_side(3, 2, 4);
+
+        assert_eq!(
+            mat.face_texture(),
+            FaceTexture::PerFace([4, 4, 3, 2, 4, 4]),
+        );
+
+        // texture() returns the +X face for per-face materials.
+        assert_eq!(mat.texture(), 4);
     }
 }
