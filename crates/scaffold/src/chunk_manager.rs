@@ -4,6 +4,8 @@
 //! loading chunks within a view distance of a center position and keeping
 //! the GPU representation in sync with the source data.
 
+use std::collections::HashSet;
+
 use glam::Vec3;
 use voxel::chunk::ChunkPos;
 use voxel::world::{ChunkProvider, World};
@@ -31,6 +33,9 @@ pub struct ChunkManager {
     center           : ChunkPos,
     /// Positions queued for loading, sorted nearest-first.
     load_queue       : Vec<ChunkPos>,
+    /// Positions where the provider returned `None`. Tracked to avoid
+    /// re-queuing empty positions every time the load queue is rebuilt.
+    rejected         : HashSet<ChunkPos>,
     /// Maximum chunk generations per frame.
     loads_per_frame  : usize,
     /// Maximum GPU rebuilds per frame.
@@ -60,6 +65,7 @@ impl ChunkManager {
             view_distance    : view_distance,
             center           : ChunkPos::new(0, 0, 0),
             load_queue       : Vec::new(),
+            rejected         : HashSet::new(),
             loads_per_frame  : loads_per_frame,
             builds_per_frame : builds_per_frame,
         }
@@ -165,7 +171,9 @@ impl ChunkManager {
 
                     let pos = ChunkPos::new(cx + dx, cy + dy, cz + dz);
 
-                    if self.world.chunk(pos).is_none() {
+                    if self.world.chunk(pos).is_none()
+                        && !self.rejected.contains(&pos)
+                    {
                         self.load_queue.push(pos);
                     }
                 }
@@ -211,6 +219,15 @@ impl ChunkManager {
             self.world.remove_chunk(pos);
             gpu.remove(queue, pos);
         }
+
+        // Evict stale rejected positions outside the unload threshold
+        // so the set doesn't grow unboundedly as the camera moves.
+        self.rejected.retain(|pos| {
+            let dx = pos.x - cx;
+            let dy = pos.y - cy;
+            let dz = pos.z - cz;
+            dx * dx + dy * dy + dz * dz <= threshold
+        });
     }
 
     /// Load chunks from the front of the queue via the provider.
@@ -248,6 +265,7 @@ impl ChunkManager {
 
             let Some(chunk) = provider.generate(pos)
             else {
+                self.rejected.insert(pos);
                 continue;
             };
 

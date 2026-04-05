@@ -177,6 +177,12 @@ pub trait ChunkProvider {
     fn generate(&self, pos: ChunkPos) -> Option<Chunk>;
 }
 
+impl<P: ChunkProvider + ?Sized> ChunkProvider for Box<P> {
+    fn generate(&self, pos: ChunkPos) -> Option<Chunk> {
+        (**self).generate(pos)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

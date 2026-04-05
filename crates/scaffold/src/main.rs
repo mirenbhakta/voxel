@@ -8,6 +8,7 @@ mod build;
 mod camera;
 mod chunk_manager;
 mod world;
+mod worldgen;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,7 +43,6 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use camera::Camera;
 use chunk_manager::ChunkManager;
-use voxel::chunk::{Chunk, ChunkPos};
 use voxel::world::ChunkProvider;
 use world::{build_material_tables, GpuWorld, RenderStats};
 
@@ -145,8 +145,8 @@ struct Gpu {
     gpu_world     : GpuWorld,
     /// The chunk manager (owns CPU world, drives loading/unloading).
     chunk_mgr     : ChunkManager,
-    /// The test terrain provider.
-    provider      : TestTerrainProvider,
+    /// The world generator (chunk provider).
+    provider      : Box<dyn ChunkProvider>,
     /// The egui context shared across frames.
     egui_ctx      : egui::Context,
     /// The egui-winit integration state.
@@ -239,10 +239,10 @@ impl ApplicationHandler for App {
         // Register block types.
         let mut registry = BlockRegistry::new();
         let stone = registry.register(
-            "stone", Material::from_rgb(128, 128, 128).with_texture(1),
+            "stone", Material::from_rgb(255, 255, 255).with_texture(1),
         );
         let dirt = registry.register(
-            "dirt", Material::from_rgb(139, 90, 43).with_texture(2),
+            "dirt", Material::from_rgb(255, 255, 255).with_texture(2),
         );
         let grass = registry.register(
             "grass",
@@ -449,11 +449,9 @@ impl ApplicationHandler for App {
         // rebuild up to 16 chunks/frame.
         let mut chunk_mgr = ChunkManager::new(6, 8, 16);
 
-        let provider = TestTerrainProvider {
-            stone : stone,
-            dirt  : dirt,
-            grass : grass,
-        };
+        let provider: Box<dyn ChunkProvider> = Box::new(
+            worldgen::SurfaceTerrain::new(42, stone, dirt, grass),
+        );
 
         // Initial load pass from camera position.
         chunk_mgr.set_center(Vec3::new(
@@ -989,64 +987,6 @@ fn create_depth_texture(
     });
 
     texture.create_view(&TextureViewDescriptor::default())
-}
-
-// ---------------------------------------------------------------------------
-// Test terrain provider
-// ---------------------------------------------------------------------------
-
-/// A [`ChunkProvider`] that generates simple layered terrain.
-///
-/// Produces stone at the bottom, dirt in the middle, and grass on top.
-/// Only generates chunks at y=0 (single ground layer). Fill height
-/// varies by chunk XZ position so adjacent chunks are distinguishable.
-struct TestTerrainProvider {
-    /// Block ID for stone layers.
-    stone : BlockId,
-    /// Block ID for dirt layers.
-    dirt  : BlockId,
-    /// Block ID for the grass surface layer.
-    grass : BlockId,
-}
-
-impl ChunkProvider for TestTerrainProvider {
-    fn generate(&self, pos: ChunkPos) -> Option<Chunk> {
-        // Only generate the ground layer.
-        if pos.y != 0 {
-            return None;
-        }
-
-        let cx = pos.x;
-        let cz = pos.z;
-
-        let height = (4 + ((cx * 3 + cz * 7).unsigned_abs() % 8)) as u8;
-        let height = height.min(32);
-
-        let mut chunk = Chunk::new();
-
-        for z in 0..32u8 {
-            for x in 0..32u8 {
-                for y in 0..height {
-                    // Assign block type based on depth from surface.
-                    let block = if y == height - 1 {
-                        self.grass
-                    }
-                    else if y + 3 >= height {
-                        self.dirt
-                    }
-                    else {
-                        self.stone
-                    };
-
-                    chunk.set_block(
-                        &eden_math::Vector3::new(x, y, z), block,
-                    );
-                }
-            }
-        }
-
-        Some(chunk)
-    }
 }
 
 // ---------------------------------------------------------------------------
