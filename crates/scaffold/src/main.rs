@@ -477,7 +477,7 @@ impl ApplicationHandler for App {
         // Chunk manager: view distance 6, load up to 8 chunks/frame,
         // rebuild up to 16 chunks/frame, 4ms worldgen budget.
         let mut chunk_mgr = ChunkManager::new(
-            6, 8, 16, Duration::from_millis(4), 4096,
+            6, 8, 16, Duration::from_millis(4),
         );
 
         let provider: Box<dyn ChunkProvider + Sync> = Box::new(

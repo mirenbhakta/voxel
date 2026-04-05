@@ -216,7 +216,11 @@ impl QuadPool {
             mapped_at_creation : false,
         });
 
-        let free_blocks = (0..POOL_BLOCKS).rev().collect();
+        // Block 0 is reserved as a null block. Stale page table entries
+        // are zeroed after trimming so that any overflow writes from the
+        // build shader land in block 0 instead of corrupting another
+        // chunk's storage.
+        let free_blocks = (1..POOL_BLOCKS).rev().collect();
         let free_slots  = (0..MAX_CHUNKS).rev().collect();
 
         QuadPool {
@@ -278,6 +282,38 @@ impl QuadPool {
             &self.page_table,
             offset,
             bytemuck::cast_slice(block_ids),
+        );
+    }
+
+    /// Zero page table entries from `start` to `MAX_CHUNK_BLOCKS` for a slot.
+    ///
+    /// Called after trimming to invalidate stale entries that would
+    /// otherwise point to freed blocks. Zeroed entries resolve to the
+    /// null block (block 0), containing any overflow writes harmlessly.
+    fn clear_page_table_tail(
+        &self,
+        queue : &Queue,
+        slot  : u32,
+        start : u32,
+    )
+    {
+        let count = MAX_CHUNK_BLOCKS - start;
+
+        if count == 0 {
+            return;
+        }
+
+        let offset = u64::from(slot)
+                   * u64::from(MAX_CHUNK_BLOCKS)
+                   * 4
+                   + u64::from(start) * 4;
+
+        let zeros = vec![0u32; count as usize];
+
+        queue.write_buffer(
+            &self.page_table,
+            offset,
+            bytemuck::cast_slice(&zeros),
         );
     }
 
@@ -876,18 +912,83 @@ impl GpuWorld {
 
         queue.submit(Some(encoder.finish()));
 
-        // Read back quad counts and trim excess blocks.
+        // Read back quad counts, handle overflow, and trim.
         for pos in to_build {
-            if let Some(chunk) = self.chunks.get_mut(&pos) {
-                chunk.count = chunk.build.read_quad_count(device);
+            let Some(chunk) = self.chunks.get_mut(&pos)
+            else {
+                continue;
+            };
+
+            let raw_count = chunk.build.read_quad_count(device);
+            let needed    = ((raw_count + BLOCK_SIZE - 1) / BLOCK_SIZE)
+                .max(1) as usize;
+            let current   = chunk.alloc.block_ids.len();
+
+            if needed <= current {
+                // Normal case: enough blocks allocated.
+                chunk.count = raw_count;
                 chunk.dirty = false;
 
-                let needed = (chunk.count + BLOCK_SIZE - 1) / BLOCK_SIZE;
-                let needed = needed.max(1) as usize;
-
-                if needed < chunk.alloc.block_ids.len() {
+                if needed < current {
                     let excess = chunk.alloc.block_ids.split_off(needed);
                     self.pool.free_blocks(&excess);
+
+                    // Zero freed page table entries so future overflow
+                    // writes land in the null block (block 0).
+                    self.pool.clear_page_table_tail(
+                        queue, chunk.alloc.slot, needed as u32,
+                    );
+                }
+            }
+            else {
+                // Overflow: the build produced more quads than blocks
+                // allocated. Greedy merge is non-monotonic across
+                // neighbor configurations, so a rebuild can exceed a
+                // previous trim. Grow the allocation by the exact
+                // deficit and re-dispatch to write all quads correctly.
+                let deficit = (needed - current) as u32;
+
+                if (self.pool.free_blocks.len() as u32) >= deficit {
+                    let new_blocks = self.pool.alloc_blocks(deficit);
+                    chunk.alloc.block_ids.extend_from_slice(&new_blocks);
+                    self.pool.write_page_table(
+                        queue,
+                        chunk.alloc.slot,
+                        &chunk.alloc.block_ids,
+                    );
+
+                    // Re-dispatch with the grown allocation.
+                    let block_base = chunk.alloc.slot * MAX_CHUNK_BLOCKS;
+                    let mut enc    = device.create_command_encoder(
+                        &CommandEncoderDescriptor::default(),
+                    );
+
+                    chunk.build.dispatch(
+                        &mut enc, &self.build_pipeline, block_base,
+                    );
+                    queue.submit(Some(enc.finish()));
+
+                    chunk.count = chunk.build.read_quad_count(device);
+                    chunk.dirty = false;
+
+                    // Trim the retry result.
+                    let needed2 = ((chunk.count + BLOCK_SIZE - 1)
+                        / BLOCK_SIZE)
+                        .max(1) as usize;
+
+                    if needed2 < chunk.alloc.block_ids.len() {
+                        let excess =
+                            chunk.alloc.block_ids.split_off(needed2);
+                        self.pool.free_blocks(&excess);
+                        self.pool.clear_page_table_tail(
+                            queue, chunk.alloc.slot, needed2 as u32,
+                        );
+                    }
+                }
+                else {
+                    // Pool exhausted. Cap to allocated capacity and
+                    // leave dirty for retry next frame.
+                    chunk.count = current as u32 * BLOCK_SIZE;
                 }
             }
         }
