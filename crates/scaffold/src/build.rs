@@ -126,7 +126,7 @@ impl BuildPipeline {
 
 /// GPU resources for building one chunk's quad buffer.
 pub struct ChunkBuildData {
-    /// The chunk's occupancy bitmask on the GPU (4 KB).
+    /// The chunk's occupancy bitmask and neighbor boundary slices on the GPU.
     occupancy_buf  : Buffer,
     /// Atomic quad count (4 bytes, zeroed before dispatch).
     quad_count_buf : Buffer,
@@ -158,10 +158,14 @@ impl ChunkBuildData {
         page_table : &Buffer,
     ) -> Self
     {
+        // Extend with zeroed neighbor boundary slices (6 x 32 words).
+        let mut extended_occ = [0u32; 1216];
+        extended_occ[..1024].copy_from_slice(occ);
+
         let occupancy_buf = device.create_buffer_init(
             &wgpu::util::BufferInitDescriptor {
                 label    : Some("build_occ"),
-                contents : bytemuck::cast_slice(occ),
+                contents : bytemuck::cast_slice(&extended_occ),
                 usage    : BufferUsages::STORAGE
                          | BufferUsages::COPY_DST,
             },
@@ -271,6 +275,19 @@ impl ChunkBuildData {
             &self.occupancy_buf,
             0,
             bytemuck::cast_slice(occ),
+        );
+    }
+
+    /// Upload neighbor boundary slices to the occupancy buffer.
+    ///
+    /// Write the 192-word neighbor slice region at byte offset 4096,
+    /// directly after the 1024-word chunk occupancy. Each of the 6
+    /// directions contributes 32 words (one 32x32 boundary layer).
+    pub fn upload_neighbor_slices(&self, queue: &Queue, slices: &[u32; 192]) {
+        queue.write_buffer(
+            &self.occupancy_buf,
+            4096,
+            bytemuck::cast_slice(slices),
         );
     }
 

@@ -9,8 +9,19 @@
 // Direction indices match the Direction enum discriminants:
 //   0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z
 
-// Chunk occupancy: 1024 x u32, layout occ[z*32 + y], bit x.
-@group(0) @binding(0) var<storage, read> occupancy : array<u32, 1024>;
+// Chunk occupancy (1024 words, layout occ[z*32 + y], bit x) followed
+// by 6 neighbor boundary slices (32 words each, 192 total).
+@group(0) @binding(0) var<storage, read> occupancy : array<u32, 1216>;
+
+// Neighbor boundary slice offsets. Each slice is 32 words appended
+// after the 1024-word occupancy region. Direction order matches the
+// Direction enum discriminants.
+const NEIGH_POS_X = 1024u;  // +X neighbor x=0:  word[z], bit y
+const NEIGH_NEG_X = 1056u;  // -X neighbor x=31: word[z], bit y
+const NEIGH_POS_Y = 1088u;  // +Y neighbor y=0:  word[z], bit x
+const NEIGH_NEG_Y = 1120u;  // -Y neighbor y=31: word[z], bit x
+const NEIGH_POS_Z = 1152u;  // +Z neighbor z=0:  word[y], bit x
+const NEIGH_NEG_Z = 1184u;  // -Z neighbor z=31: word[y], bit x
 
 // Atomic quad count (initialized to 0 before dispatch).
 @group(0) @binding(1) var<storage, read_write> quad_count : atomic<u32>;
@@ -149,17 +160,23 @@ fn build(
 fn derive_z(layer: u32, row: u32, positive: bool) -> u32 {
     let here = occupancy[layer * 32u + row];
 
-    var there = 0u;
+    var there: u32;
     if positive {
-        // +Z: compare with z+1.
+        // +Z: compare with z+1, or the +Z neighbor's z=0 slice.
         if layer < 31u {
             there = occupancy[(layer + 1u) * 32u + row];
         }
+        else {
+            there = occupancy[NEIGH_POS_Z + row];
+        }
     }
     else {
-        // -Z: compare with z-1.
+        // -Z: compare with z-1, or the -Z neighbor's z=31 slice.
         if layer > 0u {
             there = occupancy[(layer - 1u) * 32u + row];
+        }
+        else {
+            there = occupancy[NEIGH_NEG_Z + row];
         }
     }
 
@@ -174,17 +191,23 @@ fn derive_z(layer: u32, row: u32, positive: bool) -> u32 {
 fn derive_y(layer: u32, z: u32, positive: bool) -> u32 {
     let here = occupancy[z * 32u + layer];
 
-    var there = 0u;
+    var there: u32;
     if positive {
-        // +Y: compare with y+1.
+        // +Y: compare with y+1, or the +Y neighbor's y=0 slice.
         if layer < 31u {
             there = occupancy[z * 32u + layer + 1u];
         }
+        else {
+            there = occupancy[NEIGH_POS_Y + z];
+        }
     }
     else {
-        // -Y: compare with y-1.
+        // -Y: compare with y-1, or the -Y neighbor's y=31 slice.
         if layer > 0u {
             there = occupancy[z * 32u + layer - 1u];
+        }
+        else {
+            there = occupancy[NEIGH_NEG_Y + z];
         }
     }
 
@@ -199,19 +222,37 @@ fn derive_y(layer: u32, z: u32, positive: bool) -> u32 {
 // boundaries. The extraction loop transposes inline: for each y, extract
 // bit `layer` from the face word and pack as bit y in the result.
 fn derive_x(layer: u32, z: u32, positive: bool) -> u32 {
+    // Load neighbor boundary word once outside the loop. At the
+    // boundary layer (x=31 for +X, x=0 for -X) bit y indicates
+    // whether the adjacent chunk's boundary voxel is occupied.
+    // Non-boundary layers get 0, making the correction a no-op.
+    var neighbor = 0u;
+    if positive && layer == 31u {
+        neighbor = occupancy[NEIGH_POS_X + z];
+    }
+    else if !positive && layer == 0u {
+        neighbor = occupancy[NEIGH_NEG_X + z];
+    }
+
     var result = 0u;
 
     for (var y = 0u; y < 32u; y++) {
         let word = occupancy[z * 32u + y];
+        let nb   = (neighbor >> y) & 1u;
 
         var face: u32;
         if positive {
             // +X: face at bit x if occupied here and x+1 is empty.
+            // At x=31, the right-shift brings in 0; the neighbor
+            // correction clears the face if the adjacent chunk is solid.
             face = word & ~(word >> 1u);
+            face &= ~(nb << 31u);
         }
         else {
             // -X: face at bit x if occupied here and x-1 is empty.
+            // At x=0, the left-shift brings in 0; same correction.
             face = word & ~(word << 1u);
+            face &= ~nb;
         }
 
         // Extract bit `layer` (= x position) and pack as bit y.

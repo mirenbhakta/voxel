@@ -42,6 +42,30 @@ const MAX_CHUNKS: u32       = 256;
 /// `instance_index / 256` yields the correct global block index.
 const SLOT_INSTANCE_STRIDE: u32 = MAX_CHUNK_BLOCKS * BLOCK_SIZE;
 
+/// Words per neighbor boundary slice (one 32x32 face layer).
+const SLICE_WORDS: usize    = 32;
+
+/// Total words for all 6 neighbor boundary slices.
+const NEIGHBOR_WORDS: usize = 6 * SLICE_WORDS;
+
+/// Neighbor slice offset for +X direction within the 192-word region.
+const DIR_POS_X: usize = 0 * SLICE_WORDS;
+
+/// Neighbor slice offset for -X direction.
+const DIR_NEG_X: usize = 1 * SLICE_WORDS;
+
+/// Neighbor slice offset for +Y direction.
+const DIR_POS_Y: usize = 2 * SLICE_WORDS;
+
+/// Neighbor slice offset for -Y direction.
+const DIR_NEG_Y: usize = 3 * SLICE_WORDS;
+
+/// Neighbor slice offset for +Z direction.
+const DIR_POS_Z: usize = 4 * SLICE_WORDS;
+
+/// Neighbor slice offset for -Z direction.
+const DIR_NEG_Z: usize = 5 * SLICE_WORDS;
+
 // ---------------------------------------------------------------------------
 // QuadPool
 // ---------------------------------------------------------------------------
@@ -199,6 +223,8 @@ struct GpuChunk {
     build : ChunkBuildData,
     /// Block allocation state for this chunk.
     alloc : ChunkAlloc,
+    /// CPU-side occupancy shadow for neighbor boundary slice extraction.
+    occ   : Box<[u32; 1024]>,
     /// Current quad count from the last completed build.
     count : u32,
     /// Whether this chunk's occupancy has changed since the last build.
@@ -346,11 +372,15 @@ impl GpuWorld {
                 slot      : slot,
                 block_ids : block_ids,
             },
+            occ   : Box::new(*occ),
             count : 0,
             dirty : true,
         });
 
         self.dirty.push(pos);
+
+        // Neighbors need rebuilt -- their boundary faces may change.
+        self.dirty_neighbors(pos);
     }
 
     /// Remove a chunk and release its GPU resources.
@@ -364,6 +394,10 @@ impl GpuWorld {
         }
 
         self.dirty.retain(|&p| p != pos);
+
+        // Neighbors' boundary faces are now exposed.
+        self.dirty_neighbors(pos);
+
         self.rebuild_indirect(queue);
     }
 
@@ -383,12 +417,16 @@ impl GpuWorld {
             return;
         };
 
+        *chunk.occ = *occ;
         chunk.build.upload_occupancy(queue, occ);
 
         if !chunk.dirty {
             chunk.dirty = true;
             self.dirty.push(pos);
         }
+
+        // Neighbors may need new boundary slices.
+        self.dirty_neighbors(pos);
     }
 
     /// Dispatch the build shader for all dirty chunks and read back
@@ -406,6 +444,14 @@ impl GpuWorld {
     {
         if self.dirty.is_empty() {
             return;
+        }
+
+        // Upload neighbor boundary slices for all dirty chunks.
+        for &pos in &self.dirty {
+            let slices = build_neighbor_slices(&self.chunks, pos);
+            if let Some(chunk) = self.chunks.get(&pos) {
+                chunk.build.upload_neighbor_slices(queue, &slices);
+            }
         }
 
         // Encode all dirty chunk rebuilds into one command buffer.
@@ -490,4 +536,97 @@ impl GpuWorld {
             );
         }
     }
+
+    /// Mark the six cardinal neighbors of a position as dirty.
+    ///
+    /// Called when a chunk is inserted, removed, or has its occupancy
+    /// updated, since neighboring chunks' boundary face derivation
+    /// depends on this chunk's boundary layer.
+    fn dirty_neighbors(&mut self, pos: ChunkPos) {
+        for &[dx, dy, dz] in &[
+            [ 1,  0,  0], [-1,  0,  0],
+            [ 0,  1,  0], [ 0, -1,  0],
+            [ 0,  0,  1], [ 0,  0, -1],
+        ] {
+            let npos = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+
+            if let Some(chunk) = self.chunks.get_mut(&npos) {
+                if !chunk.dirty {
+                    chunk.dirty = true;
+                    self.dirty.push(npos);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Neighbor boundary slices
+// ---------------------------------------------------------------------------
+
+/// Build neighbor boundary slices for a chunk's build shader.
+///
+/// Extract the 6 boundary layers from neighboring chunks' occupancy
+/// shadows and pack them into a 192-word array matching the shader's
+/// expected layout. Missing neighbors produce zero slices, leaving
+/// boundary faces visible.
+fn build_neighbor_slices(
+    chunks : &HashMap<ChunkPos, GpuChunk>,
+    pos    : ChunkPos,
+) -> [u32; NEIGHBOR_WORDS]
+{
+    let mut slices = [0u32; NEIGHBOR_WORDS];
+
+    let neighbor_occ = |dx: i32, dy: i32, dz: i32| -> Option<&[u32; 1024]> {
+        let npos = ChunkPos::new(pos.x + dx, pos.y + dy, pos.z + dz);
+        chunks.get(&npos).map(|c| c.occ.as_ref())
+    };
+
+    // +X: x=0 column of neighbor at (+1,0,0). Word[z], bit y.
+    if let Some(occ) = neighbor_occ(1, 0, 0) {
+        for z in 0..32 {
+            let mut word = 0u32;
+            for y in 0..32 {
+                word |= (occ[z * 32 + y] & 1) << y;
+            }
+            slices[DIR_POS_X + z] = word;
+        }
+    }
+
+    // -X: x=31 column of neighbor at (-1,0,0). Word[z], bit y.
+    if let Some(occ) = neighbor_occ(-1, 0, 0) {
+        for z in 0..32 {
+            let mut word = 0u32;
+            for y in 0..32 {
+                word |= ((occ[z * 32 + y] >> 31) & 1) << y;
+            }
+            slices[DIR_NEG_X + z] = word;
+        }
+    }
+
+    // +Y: y=0 row of neighbor at (0,+1,0). Word[z], bit x.
+    if let Some(occ) = neighbor_occ(0, 1, 0) {
+        for z in 0..32 {
+            slices[DIR_POS_Y + z] = occ[z * 32];
+        }
+    }
+
+    // -Y: y=31 row of neighbor at (0,-1,0). Word[z], bit x.
+    if let Some(occ) = neighbor_occ(0, -1, 0) {
+        for z in 0..32 {
+            slices[DIR_NEG_Y + z] = occ[z * 32 + 31];
+        }
+    }
+
+    // +Z: z=0 layer of neighbor at (0,0,+1). Word[y], bit x.
+    if let Some(occ) = neighbor_occ(0, 0, 1) {
+        slices[DIR_POS_Z..DIR_POS_Z + 32].copy_from_slice(&occ[..32]);
+    }
+
+    // -Z: z=31 layer of neighbor at (0,0,-1). Word[y], bit x.
+    if let Some(occ) = neighbor_occ(0, 0, -1) {
+        slices[DIR_NEG_Z..DIR_NEG_Z + 32].copy_from_slice(&occ[992..]);
+    }
+
+    slices
 }
