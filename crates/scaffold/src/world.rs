@@ -342,6 +342,31 @@ struct GpuChunk {
 }
 
 // ---------------------------------------------------------------------------
+// RenderStats
+// ---------------------------------------------------------------------------
+
+/// Rendering statistics from the GPU world.
+///
+/// A snapshot of current chunk loading, quad generation, and pool
+/// utilization. All values are derived from CPU-side state at zero cost.
+pub struct RenderStats {
+    /// Total loaded chunks.
+    pub chunks_loaded     : u32,
+    /// Chunks included in draw calls (non-zero quad count).
+    pub chunks_drawn      : u32,
+    /// Total quads across all chunks.
+    pub total_quads       : u32,
+    /// Pool blocks currently allocated.
+    pub pool_blocks_used  : u32,
+    /// Pool blocks total capacity.
+    pub pool_blocks_total : u32,
+    /// Page table slots currently allocated.
+    pub pool_slots_used   : u32,
+    /// Page table slots total capacity.
+    pub pool_slots_total  : u32,
+}
+
+// ---------------------------------------------------------------------------
 // GpuWorld
 // ---------------------------------------------------------------------------
 
@@ -734,6 +759,27 @@ impl GpuWorld {
 
         // Rebuild the indirect draw buffer from all chunks.
         self.rebuild_indirect(queue);
+    }
+
+    /// Returns a snapshot of current rendering statistics.
+    ///
+    /// All values come from CPU-side state. No GPU queries are issued.
+    pub fn stats(&self) -> RenderStats {
+        let total_quads: u32 = self.chunks.values()
+            .map(|c| c.count)
+            .sum();
+
+        RenderStats {
+            chunks_loaded     : self.chunks.len() as u32,
+            chunks_drawn      : self.draw_count,
+            total_quads       : total_quads,
+            pool_blocks_used  : POOL_BLOCKS
+                              - self.pool.free_blocks.len() as u32,
+            pool_blocks_total : POOL_BLOCKS,
+            pool_slots_used   : MAX_CHUNKS
+                              - self.pool.free_slots.len() as u32,
+            pool_slots_total  : MAX_CHUNKS,
+        }
     }
 
     /// Issue a single multi-draw-indirect call for all chunks with quads.

@@ -41,7 +41,9 @@ use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use camera::Camera;
 use voxel::chunk::ChunkPos;
-use world::{build_material_tables, GpuWorld};
+use world::{build_material_tables, GpuWorld, RenderStats};
+
+use egui_wgpu::ScreenDescriptor;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -105,37 +107,45 @@ impl InputState {
 /// Top-level application state for the scaffold window.
 struct App {
     /// The GPU state, initialized on resume.
-    gpu        : Option<Gpu>,
+    gpu            : Option<Gpu>,
     /// The first-person camera.
-    camera     : Camera,
+    camera         : Camera,
     /// Currently held movement keys.
-    input      : InputState,
+    input          : InputState,
     /// Whether the cursor is grabbed for mouse look.
-    grabbed    : bool,
+    grabbed        : bool,
     /// Timestamp of the previous frame for delta time.
-    last_frame : Instant,
+    last_frame     : Instant,
+    /// Exponentially smoothed frame time for display.
+    frame_time_avg : f32,
 }
 
 /// Initialized GPU resources tied to a window surface.
 struct Gpu {
     /// The window handle, kept alive for the surface.
-    window     : Arc<Window>,
+    window        : Arc<Window>,
     /// The wgpu rendering surface.
-    surface    : Surface<'static>,
+    surface       : Surface<'static>,
     /// The surface configuration (format, size, present mode).
-    config     : SurfaceConfiguration,
+    config        : SurfaceConfiguration,
     /// The logical device.
-    device     : Device,
+    device        : Device,
     /// The command submission queue.
-    queue      : Queue,
+    queue         : Queue,
     /// The voxel rendering pipeline.
-    pipeline   : RenderPipeline,
+    pipeline      : RenderPipeline,
     /// The camera uniform buffer.
-    camera_buf : Buffer,
+    camera_buf    : Buffer,
     /// The depth buffer texture view.
-    depth_view : TextureView,
+    depth_view    : TextureView,
     /// The GPU world manager (chunks, build pipeline, draw state).
-    world      : GpuWorld,
+    world         : GpuWorld,
+    /// The egui context shared across frames.
+    egui_ctx      : egui::Context,
+    /// The egui-winit integration state.
+    egui_state    : egui_winit::State,
+    /// The egui wgpu renderer.
+    egui_renderer : egui_wgpu::Renderer,
 }
 
 // --- App ---
@@ -144,11 +154,12 @@ impl App {
     /// Create a new application with no GPU state.
     fn new() -> Self {
         Self {
-            gpu        : None,
-            camera     : Camera::new(),
-            input      : InputState::new(),
-            grabbed    : false,
-            last_frame : Instant::now(),
+            gpu            : None,
+            camera         : Camera::new(),
+            input          : InputState::new(),
+            grabbed        : false,
+            last_frame     : Instant::now(),
+            frame_time_avg : 0.0,
         }
     }
 }
@@ -440,9 +451,29 @@ impl ApplicationHandler for App {
 
         world.rebuild(&device, &queue);
 
+        // Initialize egui.
+        let egui_ctx = egui::Context::default();
+
+        let max_tex = device.limits().max_texture_dimension_2d as usize;
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui_ctx.viewport_id(),
+            event_loop,
+            None,
+            None,
+            Some(max_tex),
+        );
+
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
+
         self.gpu = Some(Gpu {
             window, surface, config, device, queue,
             pipeline, camera_buf, depth_view, world,
+            egui_ctx, egui_state, egui_renderer,
         });
 
         // Start the render loop.
@@ -459,6 +490,15 @@ impl ApplicationHandler for App {
         else {
             return;
         };
+
+        // Forward to egui. Skip further processing if consumed.
+        let egui_resp = gpu.egui_state.on_window_event(
+            &gpu.window, &event,
+        );
+
+        if egui_resp.consumed {
+            return;
+        }
 
         match event {
             WindowEvent::CloseRequested => {
@@ -538,6 +578,15 @@ impl ApplicationHandler for App {
                 let dt  = (now - self.last_frame).as_secs_f32();
                 self.last_frame = now;
 
+                // Smooth frame time for display.
+                if self.frame_time_avg == 0.0 {
+                    self.frame_time_avg = dt;
+                }
+                else {
+                    self.frame_time_avg +=
+                        (dt - self.frame_time_avg) * 0.05;
+                }
+
                 // Update camera position from keyboard input.
                 update_camera_movement(&mut self.camera, &self.input, dt);
 
@@ -573,11 +622,61 @@ impl ApplicationHandler for App {
                 let view = frame.texture
                     .create_view(&TextureViewDescriptor::default());
 
+                // Build the egui frame.
+                let stats      = gpu.world.stats();
+                let egui_input = gpu.egui_state.take_egui_input(
+                    &gpu.window,
+                );
+
+                gpu.egui_ctx.begin_pass(egui_input);
+
+                draw_stats_ui(
+                    &gpu.egui_ctx,
+                    &stats,
+                    &self.camera,
+                    self.frame_time_avg,
+                );
+
+                let egui_output = gpu.egui_ctx.end_pass();
+
+                gpu.egui_state.handle_platform_output(
+                    &gpu.window, egui_output.platform_output,
+                );
+
+                let paint_jobs = gpu.egui_ctx.tessellate(
+                    egui_output.shapes,
+                    egui_output.pixels_per_point,
+                );
+
+                let screen_desc = ScreenDescriptor {
+                    size_in_pixels   : [
+                        gpu.config.width,
+                        gpu.config.height,
+                    ],
+                    pixels_per_point : egui_output.pixels_per_point,
+                };
+
+                // Upload egui textures.
+                for (id, delta) in &egui_output.textures_delta.set {
+                    gpu.egui_renderer.update_texture(
+                        &gpu.device, &gpu.queue, *id, delta,
+                    );
+                }
+
                 let mut encoder = gpu.device.create_command_encoder(
                     &CommandEncoderDescriptor::default(),
                 );
 
-                // Render pass: clear + draw quads.
+                // Prepare egui vertex and index buffers.
+                gpu.egui_renderer.update_buffers(
+                    &gpu.device,
+                    &gpu.queue,
+                    &mut encoder,
+                    &paint_jobs,
+                    &screen_desc,
+                );
+
+                // Voxel render pass: clear + draw quads.
                 {
                     let mut pass = encoder.begin_render_pass(
                         &RenderPassDescriptor {
@@ -616,8 +715,38 @@ impl ApplicationHandler for App {
                     gpu.world.draw(&mut pass);
                 }
 
+                // Egui render pass: overlay on top of the scene.
+                {
+                    let mut pass = encoder.begin_render_pass(
+                        &RenderPassDescriptor {
+                            label             : Some("egui"),
+                            color_attachments : &[Some(
+                                RenderPassColorAttachment {
+                                    view           : &view,
+                                    depth_slice    : None,
+                                    resolve_target : None,
+                                    ops            : Operations {
+                                        load  : LoadOp::Load,
+                                        store : StoreOp::Store,
+                                    },
+                                },
+                            )],
+                            ..Default::default()
+                        },
+                    ).forget_lifetime();
+
+                    gpu.egui_renderer.render(
+                        &mut pass, &paint_jobs, &screen_desc,
+                    );
+                }
+
                 gpu.queue.submit(Some(encoder.finish()));
                 frame.present();
+
+                // Release stale egui textures after submission.
+                for id in &egui_output.textures_delta.free {
+                    gpu.egui_renderer.free_texture(id);
+                }
 
                 gpu.window.request_redraw();
             }
@@ -683,6 +812,91 @@ fn update_camera_movement(
     if velocity.length_squared() > 0.0 {
         camera.position += velocity.normalize() * speed * dt;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Statistics overlay
+// ---------------------------------------------------------------------------
+
+/// Draw the rendering statistics overlay.
+fn draw_stats_ui(
+    ctx    : &egui::Context,
+    stats  : &RenderStats,
+    camera : &Camera,
+    dt_avg : f32,
+) {
+    egui::Window::new("Stats")
+        .default_open(true)
+        .resizable(false)
+        .show(ctx, |ui| {
+            egui::Grid::new("perf")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("FPS");
+                    ui.label(format!("{:.0}", 1.0 / dt_avg));
+                    ui.end_row();
+
+                    ui.label("Frame");
+                    ui.label(format!("{:.2} ms", dt_avg * 1000.0));
+                    ui.end_row();
+                });
+
+            ui.separator();
+
+            egui::Grid::new("world")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Chunks");
+                    ui.label(format!(
+                        "{} loaded, {} drawn",
+                        stats.chunks_loaded, stats.chunks_drawn,
+                    ));
+                    ui.end_row();
+
+                    ui.label("Quads");
+                    ui.label(format!("{}", stats.total_quads));
+                    ui.end_row();
+
+                    ui.label("Vertices");
+                    ui.label(format!("{}", stats.total_quads * 6));
+                    ui.end_row();
+
+                    ui.label("Triangles");
+                    ui.label(format!("{}", stats.total_quads * 2));
+                    ui.end_row();
+                });
+
+            ui.separator();
+
+            egui::Grid::new("pool")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label("Blocks");
+                    ui.label(format!(
+                        "{} / {}",
+                        stats.pool_blocks_used,
+                        stats.pool_blocks_total,
+                    ));
+                    ui.end_row();
+
+                    ui.label("Slots");
+                    ui.label(format!(
+                        "{} / {}",
+                        stats.pool_slots_used,
+                        stats.pool_slots_total,
+                    ));
+                    ui.end_row();
+                });
+
+            ui.separator();
+
+            ui.label(format!(
+                "({:.1}, {:.1}, {:.1})",
+                camera.position.x,
+                camera.position.y,
+                camera.position.z,
+            ));
+        });
 }
 
 // ---------------------------------------------------------------------------
