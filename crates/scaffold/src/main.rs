@@ -58,6 +58,21 @@ use egui_wgpu::ScreenDescriptor;
 /// Width and height of each texture layer in pixels.
 const TEX_SIZE: u32 = 16;
 
+/// Default sun direction (normalized toward the light) and ambient factor.
+///
+/// Points upper-right-forward. The w component is the ambient floor so
+/// faces pointing away from the sun still receive some light.
+const SUN_DIR: [f32; 4] = {
+    // normalize(1, 3, 2) = (0.267, 0.802, 0.535), ambient = 0.35
+    let len = 3.742; // sqrt(1+9+4)
+    [1.0 / len, 3.0 / len, 2.0 / len, 0.35]
+};
+
+/// Pack shading toggle bits into the GPU flags word.
+fn shading_flags(lit: bool, outline: bool) -> u32 {
+    (lit as u32) | ((outline as u32) << 1)
+}
+
 // ---------------------------------------------------------------------------
 // GPU types
 // ---------------------------------------------------------------------------
@@ -68,6 +83,12 @@ const TEX_SIZE: u32 = 16;
 struct CameraUniform {
     /// Column-major view-projection matrix.
     view_proj : [f32; 16],
+    /// Normalized direction toward the sun (xyz), ambient factor (w).
+    sun_dir   : [f32; 4],
+    /// Bit 0: shading enabled, bit 1: outline enabled.
+    flags     : u32,
+    /// Padding to 16-byte alignment.
+    _pad      : [u32; 3],
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +160,10 @@ struct App {
     frame_time_avg : f32,
     /// Which world generator is active.
     gen_mode       : WorldGenMode,
+    /// Whether directional shading is enabled.
+    shading_lit    : bool,
+    /// Whether voxel edge outlines are drawn.
+    outline        : bool,
 }
 
 /// Initialized GPU resources tied to a window surface.
@@ -194,6 +219,8 @@ impl App {
             last_frame     : Instant::now(),
             frame_time_avg : 0.0,
             gen_mode       : WorldGenMode::Terrain,
+            shading_lit    : true,
+            outline        : false,
         }
     }
 }
@@ -257,6 +284,9 @@ impl ApplicationHandler for App {
         // Camera uniform buffer.
         let camera_uniform = CameraUniform {
             view_proj : self.camera.view_proj().to_cols_array(),
+            sun_dir   : SUN_DIR,
+            flags     : shading_flags(self.shading_lit, self.outline),
+            _pad      : [0; 3],
         };
 
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -294,7 +324,7 @@ impl ApplicationHandler for App {
                 entries : &[
                     BindGroupLayoutEntry {
                         binding    : 0,
-                        visibility : ShaderStages::VERTEX,
+                        visibility : ShaderStages::VERTEX_FRAGMENT,
                         ty         : BindingType::Buffer {
                             ty                 : BufferBindingType::Uniform,
                             has_dynamic_offset : false,
@@ -436,7 +466,7 @@ impl ApplicationHandler for App {
                 compilation_options : PipelineCompilationOptions::default(),
             }),
             primitive : PrimitiveState {
-                topology   : PrimitiveTopology::TriangleList,
+                topology   : PrimitiveTopology::TriangleStrip,
                 front_face : FrontFace::Ccw,
                 cull_mode  : Some(Face::Back),
                 polygon_mode : PolygonMode::Fill,
@@ -666,6 +696,11 @@ impl ApplicationHandler for App {
                 // Write camera uniform to the GPU buffer.
                 let uniform = CameraUniform {
                     view_proj : self.camera.view_proj().to_cols_array(),
+                    sun_dir   : SUN_DIR,
+                    flags     : shading_flags(
+                        self.shading_lit, self.outline,
+                    ),
+                    _pad      : [0; 3],
                 };
 
                 gpu.queue.write_buffer(
@@ -719,6 +754,8 @@ impl ApplicationHandler for App {
                     &gpu.chunk_mgr,
                     &mut view_dist,
                     &mut self.gen_mode,
+                    &mut self.shading_lit,
+                    &mut self.outline,
                 );
 
                 gpu.chunk_mgr.set_view_distance(view_dist);
@@ -947,14 +984,16 @@ fn update_camera_movement(
 
 /// Draw the rendering statistics overlay.
 fn draw_stats_ui(
-    ctx        : &egui::Context,
-    stats      : &RenderStats,
-    camera     : &Camera,
-    dt_avg     : f32,
-    gpu_render : f32,
-    chunk_mgr  : &ChunkManager,
-    view_dist  : &mut i32,
-    gen_mode   : &mut WorldGenMode,
+    ctx         : &egui::Context,
+    stats       : &RenderStats,
+    camera      : &Camera,
+    dt_avg      : f32,
+    gpu_render  : f32,
+    chunk_mgr   : &ChunkManager,
+    view_dist   : &mut i32,
+    gen_mode    : &mut WorldGenMode,
+    shading_lit : &mut bool,
+    outline     : &mut bool,
 ) {
     egui::Window::new("Stats")
         .default_open(true)
@@ -1076,6 +1115,11 @@ fn draw_stats_ui(
                         gen_mode, WorldGenMode::Asteroid, "Asteroid",
                     );
                 });
+
+            ui.separator();
+
+            ui.checkbox(shading_lit, "Shading");
+            ui.checkbox(outline, "Outlines");
         });
 }
 

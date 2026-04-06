@@ -1212,7 +1212,7 @@ impl GpuWorld {
             }
 
             args.push(DrawIndirectArgs {
-                vertex_count   : 6,
+                vertex_count   : 4,
                 instance_count : chunk.count,
                 first_vertex   : 0,
                 first_instance : chunk.alloc.slot * SLOT_INSTANCE_STRIDE,

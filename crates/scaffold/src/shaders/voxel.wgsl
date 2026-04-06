@@ -1,6 +1,10 @@
-// Camera uniform with the combined view-projection matrix.
+// Camera uniform with the combined view-projection matrix and shading params.
 struct Camera {
     view_proj : mat4x4<f32>,
+    // xyz: normalized direction toward the sun, w: ambient light factor.
+    sun_dir   : vec4<f32>,
+    // Bit 0: shading enabled, bit 1: outline enabled.
+    flags     : u32,
 }
 
 @group(0) @binding(0) var<uniform> camera : Camera;
@@ -48,8 +52,10 @@ struct Camera {
 struct VertexOutput {
     @builtin(position) clip_position : vec4<f32>,
     @location(0)       world_pos     : vec3<f32>,
-    @location(1) @interpolate(flat)  direction : u32,
-    @location(2) @interpolate(flat)  slot      : u32,
+    @location(1) @interpolate(flat)  direction  : u32,
+    @location(2) @interpolate(flat)  slot       : u32,
+    @location(3)                     quad_uv    : vec2<f32>,
+    @location(4) @interpolate(flat)  quad_size  : vec2<f32>,
 }
 
 // Outward face normal per direction.
@@ -95,23 +101,19 @@ const LAYER_VEC = array<vec3<f32>, 6>(
 // Face offset along normal: 1.0 for positive dirs, 0.0 for negative.
 const IS_POSITIVE = array<f32, 6>(1.0, 0.0, 1.0, 0.0, 1.0, 0.0);
 
-// Quad corner offsets for two-triangle quad (CCW for positive dirs).
-const CORNERS_POS = array<vec2<f32>, 6>(
+// Quad corner offsets for triangle strip (CCW for positive dirs).
+const CORNERS_POS = array<vec2<f32>, 4>(
     vec2<f32>(0.0, 0.0),
     vec2<f32>(1.0, 0.0),
     vec2<f32>(0.0, 1.0),
-    vec2<f32>(0.0, 1.0),
-    vec2<f32>(1.0, 0.0),
     vec2<f32>(1.0, 1.0),
 );
 
 // Reversed winding for negative directions (outward normal).
-const CORNERS_NEG = array<vec2<f32>, 6>(
+const CORNERS_NEG = array<vec2<f32>, 4>(
     vec2<f32>(0.0, 0.0),
     vec2<f32>(0.0, 1.0),
     vec2<f32>(1.0, 0.0),
-    vec2<f32>(1.0, 0.0),
-    vec2<f32>(0.0, 1.0),
     vec2<f32>(1.0, 1.0),
 );
 
@@ -139,7 +141,7 @@ fn vs_main(
     let dir    = (packed >> 25u) & 0x7u;
 
     // Pick quad corner based on vertex index and face winding.
-    let vi = vertex_index % 6u;
+    let vi = vertex_index % 4u;
     var corner : vec2<f32>;
 
     if IS_POSITIVE[dir] > 0.5 {
@@ -169,6 +171,8 @@ fn vs_main(
     out.world_pos     = pos;
     out.direction     = dir;
     out.slot          = slot;
+    out.quad_uv       = corner;
+    out.quad_size     = vec2<f32>(width, height);
     return out;
 }
 
@@ -222,6 +226,34 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
 
     // Sample the texture array.
     let tex_color = textureSample(block_textures, tex_sampler, uv, i32(tex_idx));
+    var base = tex_color.rgb * color.rgb;
 
-    return vec4<f32>(tex_color.rgb * color.rgb, 1.0);
+    // Directional shading: Lambert diffuse with ambient floor.
+    let shading_on = (camera.flags & 1u) != 0u;
+
+    if shading_on {
+        let normal  = NORMAL_VEC[in.direction];
+        let n_dot_l = max(dot(normal, camera.sun_dir.xyz), 0.0);
+        let ambient = camera.sun_dir.w;
+        let light   = ambient + (1.0 - ambient) * n_dot_l;
+        base = base * light;
+    }
+
+    // Outline: darken fragments at quad edges to visualize greedy merges.
+    let outline_on = (camera.flags & 2u) != 0u;
+
+    if outline_on {
+        // Distance to nearest quad edge in voxel units.
+        let d = in.quad_uv * in.quad_size;
+        let edge_dist = min(
+            min(d.x, in.quad_size.x - d.x),
+            min(d.y, in.quad_size.y - d.y),
+        );
+
+        // Fixed-width edge line regardless of quad size.
+        let edge = 1.0 - smoothstep(0.02, 0.06, edge_dist);
+        base = mix(base, vec3<f32>(0.0, 0.0, 0.0), edge * 0.8);
+    }
+
+    return vec4<f32>(base, 1.0);
 }
