@@ -31,7 +31,7 @@ use wgpu::{
     PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment,
     RenderPassDepthStencilAttachment, RenderPassDescriptor, RenderPipeline,
     RenderPipelineDescriptor, RequestAdapterOptions, SamplerBindingType,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages, StencilState,
+    ShaderModuleDescriptorPassthrough, ShaderStages, StencilState,
     StoreOp, Surface, SurfaceConfiguration, TextureDescriptor,
     TextureDimension, TextureFormat, TextureSampleType, TextureUsages,
     TextureView, TextureViewDescriptor, TextureViewDimension, VertexState,
@@ -260,9 +260,10 @@ impl ApplicationHandler for App {
                 required_features : Features::IMMEDIATES
                                   | Features::INDIRECT_FIRST_INSTANCE
                                   | Features::MULTI_DRAW_INDIRECT_COUNT
-                                  | Features::TIMESTAMP_QUERY,
+                                  | Features::TIMESTAMP_QUERY
+                                  | Features::PASSTHROUGH_SHADERS,
                 required_limits   : Limits {
-                    max_immediate_size : 4,
+                    max_immediate_size : 8,
                     ..Limits::default()
                 },
                 ..Default::default()
@@ -316,8 +317,8 @@ impl ApplicationHandler for App {
         let texture_pixels = generate_textures();
         let texture_layers = 5u32;
 
-        // Bind group layout: camera, quad pool, page table, chunk offsets,
-        // material volume, material table, texture array, sampler.
+        // Bind group layout: camera, quad_buf, chunk_offsets, draw_data,
+        // material_volume, material_table, face_textures, textures, sampler.
         let bind_group_layout = device.create_bind_group_layout(
             &BindGroupLayoutDescriptor {
                 label   : Some("main_bgl"),
@@ -428,13 +429,38 @@ impl ApplicationHandler for App {
             },
         );
 
-        // Load the shader.
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label  : Some("voxel_shader"),
-            source : ShaderSource::Wgsl(
-                include_str!("shaders/voxel.wgsl").into(),
-            ),
-        });
+        // Load SPIR-V shaders compiled from HLSL by DXC.
+        // Safety: SPIR-V is compiled from trusted HLSL by DXC at build
+        // time. Passthrough bypasses naga entirely, sending SPIR-V
+        // directly to the Vulkan driver. Required because naga does not
+        // support SPV_KHR_shader_draw_parameters (DrawIndex built-in).
+        let vs_shader = unsafe {
+            device.create_shader_module_passthrough(
+                ShaderModuleDescriptorPassthrough {
+                    label  : Some("voxel_vs"),
+                    spirv  : Some(wgpu::util::make_spirv_raw(
+                        include_bytes!(concat!(
+                            env!("OUT_DIR"), "/voxel.vs.spv"
+                        )),
+                    )),
+                    ..Default::default()
+                },
+            )
+        };
+
+        let ps_shader = unsafe {
+            device.create_shader_module_passthrough(
+                ShaderModuleDescriptorPassthrough {
+                    label  : Some("voxel_ps"),
+                    spirv  : Some(wgpu::util::make_spirv_raw(
+                        include_bytes!(concat!(
+                            env!("OUT_DIR"), "/voxel.ps.spv"
+                        )),
+                    )),
+                    ..Default::default()
+                },
+            )
+        };
 
         // Pipeline layout.
         let pipeline_layout = device.create_pipeline_layout(
@@ -450,14 +476,14 @@ impl ApplicationHandler for App {
             label    : Some("voxel_pipeline"),
             layout   : Some(&pipeline_layout),
             vertex   : VertexState {
-                module              : &shader,
-                entry_point         : Some("vs_main"),
+                module              : &vs_shader,
+                entry_point         : Some("main"),
                 buffers             : &[],
                 compilation_options : PipelineCompilationOptions::default(),
             },
             fragment : Some(FragmentState {
-                module              : &shader,
-                entry_point         : Some("fs_main"),
+                module              : &ps_shader,
+                entry_point         : Some("main"),
                 targets             : &[Some(ColorTargetState {
                     format     : config.format,
                     blend      : None,
@@ -1032,7 +1058,7 @@ fn draw_stats_ui(
                     ui.end_row();
 
                     ui.label("Vertices");
-                    ui.label(format!("{}", stats.total_quads * 6));
+                    ui.label(format!("{}", stats.total_quads * 4));
                     ui.end_row();
 
                     ui.label("Triangles");
@@ -1071,22 +1097,28 @@ fn draw_stats_ui(
 
             ui.separator();
 
-            egui::Grid::new("pool")
+            egui::Grid::new("gpu_mem")
                 .num_columns(2)
                 .show(ui, |ui| {
-                    ui.label("Blocks");
+                    ui.label("Quad buffer");
                     ui.label(format!(
-                        "{} / {}",
-                        stats.pool_blocks_used,
-                        stats.pool_blocks_total,
+                        "{:.1} / {:.0} MB",
+                        stats.quad_buf_used as f64 / (1024.0 * 1024.0),
+                        stats.quad_buf_total as f64 / (1024.0 * 1024.0),
                     ));
                     ui.end_row();
 
-                    ui.label("Slots");
+                    ui.label("Slot buffers");
                     ui.label(format!(
-                        "{} / {}",
-                        stats.pool_slots_used,
-                        stats.pool_slots_total,
+                        "{:.1} MB",
+                        stats.slot_buf_total as f64 / (1024.0 * 1024.0),
+                    ));
+                    ui.end_row();
+
+                    ui.label("GPU total");
+                    ui.label(format!(
+                        "{:.1} MB",
+                        stats.gpu_mem_total as f64 / (1024.0 * 1024.0),
                     ));
                     ui.end_row();
                 });

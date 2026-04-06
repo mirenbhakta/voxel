@@ -1,16 +1,17 @@
 //! GPU compute frustum culling stage.
 //!
-//! Reads CPU-written source draw commands and chunk world offsets,
-//! tests each chunk's AABB against the camera frustum, and writes
-//! visible draws to a compacted output buffer. An atomic counter
-//! tracks the visible count for [`multi_draw_indirect_count`].
+//! Iterates all chunk slots, reads per-chunk metadata and quad ranges,
+//! tests each chunk's AABB against the camera frustum, and emits
+//! indirect draw commands and per-draw slot/direction metadata for
+//! visible chunks. An atomic counter tracks the visible draw count
+//! for [`multi_draw_indirect_count`].
 
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType,
     ComputePipeline, ComputePipelineDescriptor, Device,
     PipelineCompilationOptions, PipelineLayoutDescriptor,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages,
+    ShaderModuleDescriptorPassthrough, ShaderStages,
 };
 
 // ---------------------------------------------------------------------------
@@ -19,9 +20,10 @@ use wgpu::{
 
 /// The compute pipeline for frustum culling.
 ///
-/// Reads source indirect draw commands and chunk offsets, tests each
-/// chunk's AABB against six frustum planes, and appends visible draws
-/// to a compacted output buffer with an atomic draw count.
+/// Iterates all chunk slots, reads chunk_meta_buf for quad counts
+/// (skipping empty slots), tests each chunk's AABB against six frustum
+/// planes, and appends visible draws to a compacted output buffer with
+/// per-draw slot metadata and an atomic draw count.
 pub struct CullPipeline {
     /// The compiled compute pipeline.
     pipeline  : ComputePipeline,
@@ -29,15 +31,25 @@ pub struct CullPipeline {
     bg_layout : wgpu::BindGroupLayout,
 }
 
+// --- CullPipeline ---
+
 impl CullPipeline {
     /// Create the frustum cull compute pipeline.
     pub fn new(device: &Device) -> Self {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label  : Some("cull_shader"),
-            source : ShaderSource::Wgsl(
-                include_str!("shaders/cull.wgsl").into(),
-            ),
-        });
+        // Safety: SPIR-V compiled from trusted HLSL by DXC at build time.
+        let shader = unsafe {
+            device.create_shader_module_passthrough(
+                ShaderModuleDescriptorPassthrough {
+                    label : Some("cull_shader"),
+                    spirv : Some(wgpu::util::make_spirv_raw(
+                        include_bytes!(concat!(
+                            env!("OUT_DIR"), "/cull.cs.spv"
+                        )),
+                    )),
+                    ..Default::default()
+                },
+            )
+        };
 
         let bg_layout = device.create_bind_group_layout(
             &BindGroupLayoutDescriptor {
@@ -54,7 +66,7 @@ impl CullPipeline {
                         },
                         count : None,
                     },
-                    // binding 1: source indirect draws (read-only storage)
+                    // binding 1: chunk offsets (read-only storage)
                     BindGroupLayoutEntry {
                         binding    : 1,
                         visibility : ShaderStages::COMPUTE,
@@ -67,7 +79,7 @@ impl CullPipeline {
                         },
                         count : None,
                     },
-                    // binding 2: chunk offsets (read-only storage)
+                    // binding 2: chunk_meta_buf (read-only storage)
                     BindGroupLayoutEntry {
                         binding    : 2,
                         visibility : ShaderStages::COMPUTE,
@@ -80,9 +92,22 @@ impl CullPipeline {
                         },
                         count : None,
                     },
-                    // binding 3: output indirect draws (read-write storage)
+                    // binding 3: quad_range_buf (read-only storage)
                     BindGroupLayoutEntry {
                         binding    : 3,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 4: output indirect draws (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 4,
                         visibility : ShaderStages::COMPUTE,
                         ty         : BindingType::Buffer {
                             ty                 : BufferBindingType::Storage {
@@ -93,9 +118,22 @@ impl CullPipeline {
                         },
                         count : None,
                     },
-                    // binding 4: atomic draw count (read-write storage)
+                    // binding 5: draw_data_buf (read-write storage)
                     BindGroupLayoutEntry {
-                        binding    : 4,
+                        binding    : 5,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 6: atomic draw count (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 6,
                         visibility : ShaderStages::COMPUTE,
                         ty         : BindingType::Buffer {
                             ty                 : BufferBindingType::Storage {
@@ -123,34 +161,39 @@ impl CullPipeline {
                 label               : Some("cull_pipeline"),
                 layout              : Some(&pipeline_layout),
                 module              : &shader,
-                entry_point         : Some("cull_main"),
+                entry_point         : Some("main"),
                 compilation_options : PipelineCompilationOptions::default(),
                 cache               : None,
             },
         );
 
-        CullPipeline { pipeline, bg_layout }
+        CullPipeline { pipeline: pipeline, bg_layout: bg_layout }
     }
 
     /// Create a bind group for the cull dispatch.
     ///
     /// # Arguments
     ///
-    /// * `device`      - The wgpu device.
-    /// * `frustum_buf` - Uniform buffer with 6 frustum planes (96 bytes).
-    /// * `src_buf`     - Source indirect draw buffer (read-only storage).
-    /// * `offsets_buf` - Chunk offset buffer (read-only storage).
-    /// * `dst_buf`     - Output indirect draw buffer (read-write storage).
-    /// * `count_buf`   - Atomic draw count buffer (read-write storage).
+    /// * `device`         - The wgpu device.
+    /// * `frustum_buf`    - Uniform buffer with 6 frustum planes (96 bytes).
+    /// * `offsets_buf`    - Chunk offset buffer (read-only storage).
+    /// * `chunk_meta_buf` - Per-chunk metadata buffer (read-only storage).
+    /// * `quad_range_buf` - Per-chunk quad range buffer (read-only storage).
+    /// * `dst_buf`        - Output indirect draw buffer (read-write storage).
+    /// * `draw_data_buf`  - Per-draw slot/direction metadata (read-write storage).
+    /// * `count_buf`      - Atomic draw count buffer (read-write storage).
     pub fn create_bind_group(
         &self,
-        device      : &Device,
-        frustum_buf : &Buffer,
-        src_buf     : &Buffer,
-        offsets_buf : &Buffer,
-        dst_buf     : &Buffer,
-        count_buf   : &Buffer,
-    ) -> BindGroup {
+        device         : &Device,
+        frustum_buf    : &Buffer,
+        offsets_buf    : &Buffer,
+        chunk_meta_buf : &Buffer,
+        quad_range_buf : &Buffer,
+        dst_buf        : &Buffer,
+        draw_data_buf  : &Buffer,
+        count_buf      : &Buffer,
+    ) -> BindGroup
+    {
         device.create_bind_group(&BindGroupDescriptor {
             label   : Some("cull_bg"),
             layout  : &self.bg_layout,
@@ -161,18 +204,26 @@ impl CullPipeline {
                 },
                 BindGroupEntry {
                     binding  : 1,
-                    resource : src_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding  : 2,
                     resource : offsets_buf.as_entire_binding(),
                 },
                 BindGroupEntry {
+                    binding  : 2,
+                    resource : chunk_meta_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
                     binding  : 3,
-                    resource : dst_buf.as_entire_binding(),
+                    resource : quad_range_buf.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding  : 4,
+                    resource : dst_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 5,
+                    resource : draw_data_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 6,
                     resource : count_buf.as_entire_binding(),
                 },
             ],

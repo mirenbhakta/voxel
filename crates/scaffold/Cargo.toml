@@ -14,5 +14,5 @@ noise      = "0.9"
 pollster   = "0.4.0"
 rayon      = "1"
 voxel      = { path = "../.." }
-wgpu       = "29.0.1"
+wgpu       = { version = "29.0.1", features = ["spirv"] }
 winit      = "0.30.13"

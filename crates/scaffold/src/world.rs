@@ -1,9 +1,13 @@
 //! GPU world manager for chunk lifecycle and rendering.
 //!
-//! Manages the build compute pipeline, a shared block pool for quad
-//! storage, and per-chunk GPU resources. Handles occupancy upload,
-//! build dispatch, quad count readback, block allocation/trimming,
-//! and draw call emission.
+//! Manages shared slot-indexed GPU buffers, a contiguous quad allocator,
+//! and per-chunk state. Handles occupancy upload, build dispatch, quad
+//! count readback, allocation management, frustum culling, and draw call
+//! emission.
+//!
+//! The buffer layout uses a single set of shared buffers indexed by slot
+//! rather than per-chunk GPU resources. The build shader reads occupancy
+//! and boundary data from shared buffers via push-constant slot indices.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -19,39 +23,48 @@ use wgpu::{
     Extent3d, FilterMode, Queue, RenderPass, SamplerDescriptor,
     TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
     TextureView, TextureViewDescriptor, TextureViewDimension,
-    util::DrawIndirectArgs,
 };
 
-use crate::build::{BuildPipeline, ChunkBuildData};
+use crate::build::{BuildCountPipeline, BuildWritePipeline};
 use crate::cull::CullPipeline;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Quads per block. Each quad is one u32 (4 bytes).
-const BLOCK_SIZE: u32       = 256;
+/// Maximum concurrent loaded chunks (slot count).
+const MAX_CHUNKS: u32 = 4096;
 
-/// Bytes per block.
-const BLOCK_BYTES: u64      = BLOCK_SIZE as u64 * 4;
+/// Total quad buffer size in bytes (64 MB).
+const QUAD_BUF_SIZE: u64 = 64 * 1024 * 1024;
 
-/// Total blocks in the pool. 65536 blocks = 64 MB total quad storage.
-const POOL_BLOCKS: u32      = 65536;
+/// Total quad buffer capacity in quads (one quad = 4 bytes).
+const QUAD_BUF_QUADS: u32 = (QUAD_BUF_SIZE / 4) as u32;
 
-/// Maximum blocks any single chunk can use (worst case: 98304 / 256).
-pub(crate) const MAX_CHUNK_BLOCKS: u32 = 384;
+/// Occupancy words per slot (32x32 = 1024 bits packed into 32 words
+/// per layer, 32 layers).
+const OCC_WORDS_PER_SLOT: u32 = 1024;
 
-/// Maximum concurrent loaded chunks.
-const MAX_CHUNKS: u32       = 4096;
+/// Neighbor boundary words per slot (6 directions x 32 words each).
+const BOUNDARY_WORDS_PER_SLOT: u32 = 192;
 
-/// Quads per page-table slot (blocks per slot * quads per block).
-///
-/// Used as the `first_instance` stride in indirect draw args so that
-/// `instance_index / 256` yields the correct global block index.
-const SLOT_INSTANCE_STRIDE: u32 = MAX_CHUNK_BLOCKS * BLOCK_SIZE;
+/// Bytes per quad range entry. Layout: buffer_index (4) + base_offset (4)
+/// + dir_layer_counts (6 x 32 x 4 = 768) = 776 bytes.
+const QUAD_RANGE_BYTES: u32 = 776;
+
+/// Bytes per chunk metadata entry (quad_count, flags, reserved, reserved).
+const CHUNK_META_BYTES: u32 = 16;
+
+/// Bytes per draw data entry (slot, direction).
+const DRAW_DATA_BYTES: u32 = 8;
+
+/// Conservative upper bound on quads per chunk. Used for capacity
+/// estimation when throttling chunk loads. Derived from the worst-case
+/// checkerboard pattern (98304 faces) rounded to a convenient number.
+pub(crate) const MAX_CHUNK_QUADS: u32 = 98304;
 
 /// Words per neighbor boundary slice (one 32x32 face layer).
-const SLICE_WORDS: usize    = 32;
+const SLICE_WORDS: usize = 32;
 
 /// Total words for all 6 neighbor boundary slices.
 const NEIGHBOR_WORDS: usize = 6 * SLICE_WORDS;
@@ -143,10 +156,10 @@ pub fn build_material_tables(
         };
 
         materials.push(GpuMaterial {
-            color_rgba,
-            texture_idx,
-            face_offset,
-            _pad : 0,
+            color_rgba  : color_rgba,
+            texture_idx : texture_idx,
+            face_offset : face_offset,
+            _pad        : 0,
         });
     }
 
@@ -154,230 +167,180 @@ pub fn build_material_tables(
 }
 
 // ---------------------------------------------------------------------------
-// QuadPool
+// ContiguousAllocator
 // ---------------------------------------------------------------------------
 
-/// Shared GPU quad storage pool with fixed-size block allocation.
+/// Contiguous range allocator for the quad buffer.
 ///
-/// One large buffer divided into blocks of [`BLOCK_SIZE`] quads each.
-/// A CPU-side free stack manages block allocation. A separate page
-/// table buffer maps per-chunk logical block indices to physical
-/// block IDs in the pool.
-struct QuadPool {
-    /// The shared quad storage buffer.
-    quad_buf            : Buffer,
-    /// The page table mapping logical to physical block IDs.
-    page_table          : Buffer,
-    /// Per-slot chunk world offsets (`vec4<i32>` stride, xyz in voxel units).
-    chunk_offset_buf    : Buffer,
-    /// Volumetric material buffer for per-voxel block IDs.
-    material_volume_buf : Buffer,
-    /// Free block IDs (LIFO stack).
-    free_blocks         : Vec<u32>,
-    /// Free page table slot indices (LIFO stack).
-    free_slots          : Vec<u32>,
+/// Manages a single buffer as a bump allocator with a coalescing free
+/// list. New allocations advance the bump pointer when the free list
+/// cannot satisfy the request. Freed ranges go to the free list and
+/// are reused first-fit, coalescing with adjacent free ranges to reduce
+/// fragmentation.
+struct ContiguousAllocator {
+    /// High-water mark in the quad buffer (next bump allocation offset).
+    bump_offset : u32,
+    /// Free ranges sorted by offset for coalescing. Each entry is
+    /// (offset, size) in quads.
+    free_list   : Vec<(u32, u32)>,
+    /// Total capacity in quads.
+    capacity    : u32,
 }
 
-// --- QuadPool ---
+// --- ContiguousAllocator ---
 
-impl QuadPool {
-    /// Create a new quad pool with all blocks and slots free.
-    fn new(device: &Device) -> Self {
-        let quad_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("quad_pool"),
-            size               : u64::from(POOL_BLOCKS) * BLOCK_BYTES,
-            usage              : BufferUsages::STORAGE,
-            mapped_at_creation : false,
-        });
-
-        let page_table = device.create_buffer(&BufferDescriptor {
-            label              : Some("page_table"),
-            size               : u64::from(MAX_CHUNKS)
-                               * u64::from(MAX_CHUNK_BLOCKS)
-                               * 4,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
-
-        let chunk_offset_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("chunk_offsets"),
-            size               : u64::from(MAX_CHUNKS) * 16,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
-
-        let material_volume_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("material_volume"),
-            size               : u64::from(MAX_CHUNKS) * 32768,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
-
-        // Block 0 is reserved as a null block. Stale page table entries
-        // are zeroed after trimming so that any overflow writes from the
-        // build shader land in block 0 instead of corrupting another
-        // chunk's storage.
-        let free_blocks = (1..POOL_BLOCKS).rev().collect();
-        let free_slots  = (0..MAX_CHUNKS).rev().collect();
-
-        QuadPool {
-            quad_buf            : quad_buf,
-            page_table          : page_table,
-            chunk_offset_buf    : chunk_offset_buf,
-            material_volume_buf : material_volume_buf,
-            free_blocks         : free_blocks,
-            free_slots          : free_slots,
+impl ContiguousAllocator {
+    /// Create a new allocator with the given capacity.
+    fn new(capacity: u32) -> Self {
+        ContiguousAllocator {
+            bump_offset : 0,
+            free_list   : Vec::new(),
+            capacity    : capacity,
         }
     }
 
-    /// Allocate `count` blocks from the pool.
+    /// Allocate a contiguous range of `size` quads.
     ///
-    /// # Panics
-    ///
-    /// Panics if the pool has fewer than `count` free blocks.
-    fn alloc_blocks(&mut self, count: u32) -> Vec<u32> {
-        let len = self.free_blocks.len();
-        assert!(
-            count as usize <= len,
-            "quad pool exhausted: need {count}, have {len}",
-        );
-        self.free_blocks.split_off(len - count as usize)
+    /// Returns the offset into the quad buffer on success, or `None` if
+    /// the allocator cannot satisfy the request. Tries the free list
+    /// first (first-fit), then falls back to the bump pointer.
+    fn alloc(&mut self, size: u32) -> Option<u32> {
+        if size == 0 {
+            return Some(0);
+        }
+
+        // First-fit search through free list.
+        for i in 0..self.free_list.len() {
+            let (offset, free_size) = self.free_list[i];
+
+            if free_size >= size {
+                if free_size == size {
+                    self.free_list.remove(i);
+                }
+                else {
+                    // Shrink the free range from the front.
+                    self.free_list[i] = (offset + size, free_size - size);
+                }
+
+                return Some(offset);
+            }
+        }
+
+        // Bump allocation.
+        let remaining = self.capacity - self.bump_offset;
+
+        if remaining >= size {
+            let offset = self.bump_offset;
+            self.bump_offset += size;
+            return Some(offset);
+        }
+
+        None
     }
 
-    /// Return blocks to the pool.
-    fn free_blocks(&mut self, blocks: &[u32]) {
-        self.free_blocks.extend_from_slice(blocks);
-    }
-
-    /// Allocate a page table slot for a new chunk.
+    /// Free a contiguous range starting at `offset` with the given `size`.
     ///
-    /// # Panics
-    ///
-    /// Panics if no slots are available.
-    fn alloc_slot(&mut self) -> u32 {
-        self.free_slots.pop().expect("page table slots exhausted")
-    }
-
-    /// Free a page table slot.
-    fn free_slot(&mut self, slot: u32) {
-        self.free_slots.push(slot);
-    }
-
-    /// Write block IDs into the page table for a chunk's slot.
-    fn write_page_table(
-        &self,
-        queue     : &Queue,
-        slot      : u32,
-        block_ids : &[u32],
-    )
-    {
-        let offset = u64::from(slot)
-                   * u64::from(MAX_CHUNK_BLOCKS)
-                   * 4;
-
-        queue.write_buffer(
-            &self.page_table,
-            offset,
-            bytemuck::cast_slice(block_ids),
-        );
-    }
-
-    /// Zero page table entries from `start` to `MAX_CHUNK_BLOCKS` for a slot.
-    ///
-    /// Called after trimming to invalidate stale entries that would
-    /// otherwise point to freed blocks. Zeroed entries resolve to the
-    /// null block (block 0), containing any overflow writes harmlessly.
-    fn clear_page_table_tail(
-        &self,
-        queue : &Queue,
-        slot  : u32,
-        start : u32,
-    )
-    {
-        let count = MAX_CHUNK_BLOCKS - start;
-
-        if count == 0 {
+    /// Coalesces with adjacent free ranges to prevent fragmentation.
+    /// If the freed range is at the bump pointer, the pointer is
+    /// retracted instead of adding to the free list.
+    fn free(&mut self, offset: u32, size: u32) {
+        if size == 0 {
             return;
         }
 
-        let offset = u64::from(slot)
-                   * u64::from(MAX_CHUNK_BLOCKS)
-                   * 4
-                   + u64::from(start) * 4;
+        let end = offset + size;
 
-        let zeros = vec![0u32; count as usize];
+        // If this range is at the top of the bump region, retract.
+        if end == self.bump_offset {
+            self.bump_offset = offset;
 
-        queue.write_buffer(
-            &self.page_table,
-            offset,
-            bytemuck::cast_slice(&zeros),
-        );
+            // Check if any free list entry now abuts the new bump pointer.
+            self.coalesce_bump();
+            return;
+        }
+
+        // Insert into the free list maintaining sort order by offset,
+        // then coalesce with neighbors.
+        let insert_pos = self.free_list
+            .partition_point(|&(o, _)| o < offset);
+
+        self.free_list.insert(insert_pos, (offset, size));
+        self.coalesce_at(insert_pos);
     }
 
-    /// Write a chunk's world-space voxel offset into the offset buffer.
-    fn write_chunk_offset(
-        &self,
-        queue : &Queue,
-        slot  : u32,
-        pos   : ChunkPos,
-    )
-    {
-        let data: [i32; 4] = [pos.x * 32, pos.y * 32, pos.z * 32, 0];
+    /// Returns the number of free quads available (free list + remaining
+    /// bump space).
+    fn free_quads(&self) -> u32 {
+        let free_list_total: u32 = self.free_list
+            .iter()
+            .map(|&(_, size)| size)
+            .sum();
 
-        queue.write_buffer(
-            &self.chunk_offset_buf,
-            u64::from(slot) * 16,
-            bytemuck::cast_slice(&data),
-        );
+        free_list_total + (self.capacity - self.bump_offset)
     }
 
-    /// Write per-voxel material data for a chunk's slot.
-    fn write_material(
-        &self,
-        queue    : &Queue,
-        slot     : u32,
-        material : &[u8; 32768],
-    )
-    {
-        queue.write_buffer(
-            &self.material_volume_buf,
-            u64::from(slot) * 32768,
-            material,
-        );
+    /// Coalesce the free list entry at `idx` with its neighbors.
+    fn coalesce_at(&mut self, idx: usize) {
+        // Merge with the entry after idx, if adjacent.
+        if idx + 1 < self.free_list.len() {
+            let (off_a, size_a) = self.free_list[idx];
+            let (off_b, size_b) = self.free_list[idx + 1];
+
+            if off_a + size_a == off_b {
+                self.free_list[idx] = (off_a, size_a + size_b);
+                self.free_list.remove(idx + 1);
+            }
+        }
+
+        // Merge with the entry before idx, if adjacent.
+        if idx > 0 {
+            let (off_prev, size_prev) = self.free_list[idx - 1];
+            let (off_cur, size_cur)   = self.free_list[idx];
+
+            if off_prev + size_prev == off_cur {
+                self.free_list[idx - 1] = (off_prev, size_prev + size_cur);
+                self.free_list.remove(idx);
+            }
+        }
     }
-}
 
-// ---------------------------------------------------------------------------
-// ChunkAlloc
-// ---------------------------------------------------------------------------
-
-/// Per-chunk block allocation state.
-struct ChunkAlloc {
-    /// Slot index in the page table.
-    slot      : u32,
-    /// Physical block IDs currently allocated to this chunk.
-    block_ids : Vec<u32>,
+    /// Retract the bump pointer by absorbing any free list entry that
+    /// now abuts it from below.
+    fn coalesce_bump(&mut self) {
+        while let Some(&(offset, size)) = self.free_list.last() {
+            if offset + size == self.bump_offset {
+                self.bump_offset = offset;
+                self.free_list.pop();
+            }
+            else {
+                break;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // GpuChunk
 // ---------------------------------------------------------------------------
 
-/// Per-chunk GPU resources and rendering state.
+/// Per-chunk GPU state.
+///
+/// Tracks the slot index, quad buffer allocation, and CPU-side occupancy
+/// shadow. All actual GPU data lives in shared slot-indexed buffers
+/// managed by [`GpuWorld`].
 struct GpuChunk {
-    /// Build-stage GPU resources (occupancy, quad count, staging, compute bg).
-    build : ChunkBuildData,
-    /// Block allocation state for this chunk.
-    alloc : ChunkAlloc,
-    /// CPU-side occupancy shadow for neighbor boundary slice extraction.
-    occ   : Box<[u32; 1024]>,
-    /// Current quad count from the last completed build.
-    count : u32,
-    /// Whether this chunk's occupancy has changed since the last build.
-    dirty : bool,
+    /// Slot index in the shared buffers.
+    slot        : u32,
+    /// Offset into the quad buffer (from the contiguous allocator).
+    quad_offset : u32,
+    /// Allocated size in quads (may exceed actual quad count).
+    quad_alloc  : u32,
+    /// Actual quad count from the last completed build.
+    quad_count  : u32,
+    /// CPU-side occupancy shadow for neighbor boundary extraction.
+    occ         : Box<[u32; 1024]>,
+    /// Whether this chunk needs rebuilding.
+    dirty       : bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -386,25 +349,25 @@ struct GpuChunk {
 
 /// Rendering statistics from the GPU world.
 ///
-/// A snapshot of current chunk loading, quad generation, and pool
+/// A snapshot of current chunk loading, quad generation, and allocator
 /// utilization. All values are derived from CPU-side state at zero cost.
 pub struct RenderStats {
     /// Total loaded chunks.
-    pub chunks_loaded     : u32,
-    /// Chunks included in draw calls (non-zero quad count).
-    pub chunks_drawn      : u32,
+    pub chunks_loaded  : u32,
     /// Chunks visible after frustum culling (one frame latency).
-    pub chunks_visible    : u32,
+    pub chunks_visible : u32,
     /// Total quads across all chunks.
-    pub total_quads       : u32,
-    /// Pool blocks currently allocated.
-    pub pool_blocks_used  : u32,
-    /// Pool blocks total capacity.
-    pub pool_blocks_total : u32,
-    /// Page table slots currently allocated.
-    pub pool_slots_used   : u32,
-    /// Page table slots total capacity.
-    pub pool_slots_total  : u32,
+    pub total_quads    : u32,
+    /// Quad buffer bytes currently allocated.
+    pub quad_buf_used  : u64,
+    /// Quad buffer total capacity in bytes.
+    pub quad_buf_total : u64,
+    /// Total bytes used by fixed per-slot buffers (occupancy, boundary
+    /// cache, chunk meta, quad range, chunk offsets, material volume,
+    /// indirect draws, draw data).
+    pub slot_buf_total : u64,
+    /// Total GPU buffer memory (quad buffer + slot buffers + small buffers).
+    pub gpu_mem_total  : u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -413,58 +376,111 @@ pub struct RenderStats {
 
 /// Manages GPU resources for all loaded chunks.
 ///
-/// Owns the build compute pipeline, a shared block pool for quad
-/// storage, and per-chunk GPU state. The typical per-frame workflow:
+/// Owns shared slot-indexed buffers and a contiguous quad allocator.
+/// The build and cull compute pipelines are created externally (in
+/// `build.rs` and `cull.rs`) and referenced here for dispatching.
+///
+/// Per-frame workflow:
 ///
 /// 1. Modify chunks via [`update_occupancy`](Self::update_occupancy).
-/// 2. Call [`rebuild`](Self::rebuild) to dispatch the build shader for
-///    dirty chunks and read back quad counts.
-/// 3. In the render pass, call [`draw`](Self::draw) to issue draw calls.
+/// 2. Call [`rebuild_subset`](Self::rebuild_subset) or
+///    [`rebuild`](Self::rebuild) to dispatch the build shader.
+/// 3. Call [`dispatch_cull`](Self::dispatch_cull) to run frustum culling.
+/// 4. In the render pass, call [`draw`](Self::draw) to issue draw calls.
 pub struct GpuWorld {
-    /// The shared build compute pipeline.
-    build_pipeline     : BuildPipeline,
-    /// The render bind group layout.
-    render_bgl         : BindGroupLayout,
-    /// The shared camera uniform buffer.
-    camera_buf         : Buffer,
-    /// Shared render bind group (camera + pool + page table + materials + textures).
-    render_bg          : BindGroup,
-    /// The shared block pool.
-    pool               : QuadPool,
-    /// Per-chunk GPU state.
-    chunks             : HashMap<ChunkPos, GpuChunk>,
-    /// Positions of chunks that need rebuilding.
-    dirty              : Vec<ChunkPos>,
-    /// The frustum culling compute pipeline.
-    cull_pipeline      : CullPipeline,
-    /// Source indirect draw buffer (CPU-written, all chunks with quads).
-    src_indirect_buf   : Buffer,
+    // -- Shared buffers (slot-indexed) --
+
+    /// Shared quad storage buffer (64 MB, contiguous per chunk).
+    quad_buf             : Buffer,
+    /// Occupancy bitmasks, slot-indexed (4096 x 4096 B = 16 MB).
+    occupancy_buf        : Buffer,
+    /// Neighbor boundary cache, slot-indexed (4096 x 768 B = 3 MB).
+    boundary_cache_buf   : Buffer,
+    /// Per-chunk metadata: {quad_count, flags, _, _} per slot.
+    chunk_meta_buf       : Buffer,
+    /// Per-chunk quad range data: {buffer_index, base_offset,
+    /// dir_layer_counts} per slot.
+    quad_range_buf       : Buffer,
+    /// Per-slot chunk world offsets (ivec4 per slot).
+    chunk_offset_buf     : Buffer,
+    /// Volumetric material buffer for per-voxel block IDs.
+    material_volume_buf  : Buffer,
+
+    // -- Cull/draw buffers --
+
     /// Output indirect draw buffer (GPU-written, visible chunks only).
-    dst_indirect_buf   : Buffer,
+    dst_indirect_buf     : Buffer,
+    /// Per-draw metadata: {slot, direction} written by cull shader.
+    draw_data_buf        : Buffer,
     /// GPU-side atomic draw count for `multi_draw_indirect_count`.
-    draw_count_buf     : Buffer,
-    /// Frustum plane uniform buffer (6 x `vec4<f32>`).
-    frustum_buf        : Buffer,
-    /// Cull pass bind group.
-    cull_bg            : BindGroup,
-    /// Total source draws before culling.
-    src_draw_count     : u32,
-    /// Staging buffer for async readback of the visible draw count.
-    count_staging      : Buffer,
-    /// Set by the map callback when the visible count is ready.
-    count_ready        : Arc<AtomicBool>,
-    /// Whether a count readback request is currently in flight.
-    count_pending      : bool,
-    /// Last known visible chunk count (one frame latency).
-    visible_count      : u32,
-    /// The material property table buffer (per-block color + texture config).
-    material_table_buf : Buffer,
+    draw_count_buf       : Buffer,
+    /// Frustum plane uniform buffer (6 x vec4<f32>).
+    frustum_buf          : Buffer,
+
+    // -- Pipelines and bind groups --
+
+    /// The build count compute pipeline (pass 1, created in build.rs).
+    build_count_pipeline : BuildCountPipeline,
+    /// Bind group for build count dispatches (shared buffers).
+    build_count_bg       : BindGroup,
+    /// The build write compute pipeline (pass 2, created in build.rs).
+    build_write_pipeline : BuildWritePipeline,
+    /// Bind group for build write dispatches (shared buffers).
+    build_write_bg       : BindGroup,
+    /// The frustum culling compute pipeline (created in cull.rs).
+    cull_pipeline        : CullPipeline,
+    /// Bind group for the cull dispatch.
+    cull_bg              : BindGroup,
+    /// The render bind group layout (created in main.rs).
+    render_bgl           : BindGroupLayout,
+    /// Shared render bind group (camera + quad + offsets + draw_data +
+    /// materials + textures).
+    render_bg            : BindGroup,
+
+    // -- Render resources --
+
+    /// The shared camera uniform buffer.
+    camera_buf           : Buffer,
+    /// The material property table buffer.
+    material_table_buf   : Buffer,
     /// Per-face texture override table for non-uniform blocks.
-    face_texture_buf   : Buffer,
+    face_texture_buf     : Buffer,
     /// The block texture array view.
-    texture_view       : TextureView,
+    texture_view         : TextureView,
     /// The texture sampler.
-    tex_sampler        : wgpu::Sampler,
+    tex_sampler          : wgpu::Sampler,
+
+    // -- Allocator and chunk state --
+
+    /// Contiguous quad buffer allocator.
+    allocator            : ContiguousAllocator,
+    /// Free slot indices (LIFO stack).
+    free_slots           : Vec<u32>,
+    /// Per-chunk GPU state keyed by world position.
+    chunks               : HashMap<ChunkPos, GpuChunk>,
+    /// Positions of chunks that need rebuilding.
+    dirty                : Vec<ChunkPos>,
+
+    // -- Build synchronization --
+
+    /// Staging buffer for synchronous readback of chunk_meta after build.
+    meta_staging         : Buffer,
+
+    // -- Visible count async readback --
+
+    /// Staging buffer for async readback of the visible draw count.
+    count_staging        : Buffer,
+    /// Set by the map callback when the visible count is ready.
+    count_ready          : Arc<AtomicBool>,
+    /// Whether a count readback request is currently in flight.
+    count_pending        : bool,
+    /// Last known visible chunk count (one frame latency).
+    visible_count        : u32,
+
+    // -- Draw state --
+
+    /// Total slots with non-zero quad counts (upper bound for cull).
+    active_slot_count    : u32,
 }
 
 // --- GpuWorld ---
@@ -499,13 +515,131 @@ impl GpuWorld {
         texture_layers : u32,
     ) -> Self
     {
-        let pool = QuadPool::new(device);
+        // -- Shared slot-indexed buffers --
 
-        // Create the material table buffer from the provided entries.
+        let quad_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("quad_buf"),
+            size               : QUAD_BUF_SIZE,
+            usage              : BufferUsages::STORAGE,
+            mapped_at_creation : false,
+        });
+
+        let occupancy_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("occupancy_buf"),
+            size               : u64::from(MAX_CHUNKS)
+                               * u64::from(OCC_WORDS_PER_SLOT) * 4,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let boundary_cache_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("boundary_cache_buf"),
+            size               : u64::from(MAX_CHUNKS)
+                               * u64::from(BOUNDARY_WORDS_PER_SLOT) * 4,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let chunk_meta_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("chunk_meta_buf"),
+            size               : u64::from(MAX_CHUNKS)
+                               * u64::from(CHUNK_META_BYTES),
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_SRC
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let quad_range_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("quad_range_buf"),
+            size               : u64::from(MAX_CHUNKS)
+                               * u64::from(QUAD_RANGE_BYTES),
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let chunk_offset_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("chunk_offsets"),
+            size               : u64::from(MAX_CHUNKS) * 16,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let material_volume_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("material_volume"),
+            size               : u64::from(MAX_CHUNKS) * 32768,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        // -- Cull / draw buffers --
+
+        let dst_indirect_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("dst_indirect_buf"),
+            size               : u64::from(MAX_CHUNKS) * 16,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::INDIRECT,
+            mapped_at_creation : false,
+        });
+
+        let draw_data_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("draw_data_buf"),
+            size               : u64::from(MAX_CHUNKS)
+                               * u64::from(DRAW_DATA_BYTES),
+            usage              : BufferUsages::STORAGE,
+            mapped_at_creation : false,
+        });
+
+        let draw_count_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("draw_count_buf"),
+            size               : 4,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::INDIRECT
+                               | BufferUsages::COPY_SRC
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let frustum_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("frustum_buf"),
+            size               : 96,
+            usage              : BufferUsages::UNIFORM
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        // -- Build synchronization --
+
+        let meta_staging = device.create_buffer(&BufferDescriptor {
+            label              : Some("meta_staging"),
+            size               : u64::from(CHUNK_META_BYTES),
+            usage              : BufferUsages::COPY_DST
+                               | BufferUsages::MAP_READ,
+            mapped_at_creation : false,
+        });
+
+        // -- Visible count readback --
+
+        let count_staging = device.create_buffer(&BufferDescriptor {
+            label              : Some("cull_count_staging"),
+            size               : 4,
+            usage              : BufferUsages::COPY_DST
+                               | BufferUsages::MAP_READ,
+            mapped_at_creation : false,
+        });
+
+        // -- Material table --
+
         let material_table_buf = device.create_buffer(&BufferDescriptor {
             label              : Some("material_table"),
-            size               : (materials.len() * std::mem::size_of::<GpuMaterial>())
-                                     .max(16) as u64,
+            size               : (materials.len()
+                                    * std::mem::size_of::<GpuMaterial>())
+                                    .max(16) as u64,
             usage              : BufferUsages::STORAGE
                                | BufferUsages::COPY_DST,
             mapped_at_creation : false,
@@ -517,7 +651,8 @@ impl GpuWorld {
             bytemuck::cast_slice(materials),
         );
 
-        // Create the face texture buffer. Minimum 4 bytes for wgpu.
+        // -- Face texture table (minimum 4 bytes for wgpu) --
+
         let face_texture_buf = device.create_buffer(&BufferDescriptor {
             label              : Some("face_textures"),
             size               : (face_textures.len() * 4).max(4) as u64,
@@ -534,7 +669,8 @@ impl GpuWorld {
             );
         }
 
-        // Create the block texture array.
+        // -- Block texture array --
+
         let texture = device.create_texture(&TextureDescriptor {
             label           : Some("block_textures"),
             size            : Extent3d {
@@ -551,7 +687,6 @@ impl GpuWorld {
             view_formats    : &[],
         });
 
-        // Upload all layers in a single write.
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture   : &texture,
@@ -587,7 +722,18 @@ impl GpuWorld {
             ..Default::default()
         });
 
-        // Build the render bind group with all 9 bindings.
+        // -- Render bind group (matches bindings.hlsl Render layout) --
+        //
+        //   binding 0: camera          (uniform)
+        //   binding 1: quad_buf        (read-only storage)
+        //   binding 2: chunk_offsets    (read-only storage)
+        //   binding 3: draw_data_buf   (read-only storage)
+        //   binding 4: material_volume (read-only storage)
+        //   binding 5: material_table  (read-only storage)
+        //   binding 6: face_textures   (read-only storage)
+        //   binding 7: block_textures  (Texture2DArray)
+        //   binding 8: tex_sampler     (SamplerState)
+
         let render_bg = device.create_bind_group(&BindGroupDescriptor {
             label   : Some("render_bg"),
             layout  : &render_bgl,
@@ -598,19 +744,19 @@ impl GpuWorld {
                 },
                 BindGroupEntry {
                     binding  : 1,
-                    resource : pool.quad_buf.as_entire_binding(),
+                    resource : quad_buf.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding  : 2,
-                    resource : pool.page_table.as_entire_binding(),
+                    resource : chunk_offset_buf.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding  : 3,
-                    resource : pool.chunk_offset_buf.as_entire_binding(),
+                    resource : draw_data_buf.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding  : 4,
-                    resource : pool.material_volume_buf.as_entire_binding(),
+                    resource : material_volume_buf.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding  : 5,
@@ -631,134 +777,149 @@ impl GpuWorld {
             ],
         });
 
-        // Culling buffers: source (CPU-written), destination (GPU-written),
-        // and an atomic draw count that feeds multi_draw_indirect_count.
-        let src_indirect_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("src_indirect_buf"),
-            size               : u64::from(MAX_CHUNKS) * 16,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
+        // -- Build count pipeline + bind group (pass 1) --
+        //
+        //   binding 0: occupancy_buf       (read-only storage)
+        //   binding 1: boundary_cache_buf  (read-only storage)
+        //   binding 2: chunk_meta_buf      (read-write storage)
+        //   binding 3: quad_range_buf      (read-write storage)
 
-        let dst_indirect_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("dst_indirect_buf"),
-            size               : u64::from(MAX_CHUNKS) * 16,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::INDIRECT,
-            mapped_at_creation : false,
-        });
+        let build_count_pipeline = BuildCountPipeline::new(device);
 
-        let draw_count_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("draw_count_buf"),
-            size               : 4,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::INDIRECT
-                               | BufferUsages::COPY_SRC
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
+        let build_count_bg = build_count_pipeline.create_bind_group(
+            device,
+            &occupancy_buf,
+            &boundary_cache_buf,
+            &chunk_meta_buf,
+            &quad_range_buf,
+        );
 
-        let count_staging = device.create_buffer(&BufferDescriptor {
-            label              : Some("cull_count_staging"),
-            size               : 4,
-            usage              : BufferUsages::COPY_DST
-                               | BufferUsages::MAP_READ,
-            mapped_at_creation : false,
-        });
+        // -- Build write pipeline + bind group (pass 2) --
+        //
+        //   binding 0: occupancy_buf       (read-only storage)
+        //   binding 1: boundary_cache_buf  (read-only storage)
+        //   binding 2: quad_range_buf      (read-only storage)
+        //   binding 3: quad_buf            (read-write storage)
 
-        let frustum_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("frustum_buf"),
-            size               : 96,
-            usage              : BufferUsages::UNIFORM
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
+        let build_write_pipeline = BuildWritePipeline::new(device);
+
+        let build_write_bg = build_write_pipeline.create_bind_group(
+            device,
+            &occupancy_buf,
+            &boundary_cache_buf,
+            &quad_range_buf,
+            &quad_buf,
+        );
+
+        // -- Cull pipeline + bind group --
+        //
+        //   binding 0: frustum_planes  (uniform)
+        //   binding 1: chunk_offsets   (read-only storage)
+        //   binding 2: chunk_meta_buf  (read-only storage)
+        //   binding 3: quad_range_buf  (read-only storage)
+        //   binding 4: dst_draws       (read-write storage)
+        //   binding 5: draw_data_buf   (read-write storage)
+        //   binding 6: draw_count      (read-write storage)
 
         let cull_pipeline = CullPipeline::new(device);
 
         let cull_bg = cull_pipeline.create_bind_group(
             device,
             &frustum_buf,
-            &src_indirect_buf,
-            &pool.chunk_offset_buf,
+            &chunk_offset_buf,
+            &chunk_meta_buf,
+            &quad_range_buf,
             &dst_indirect_buf,
+            &draw_data_buf,
             &draw_count_buf,
         );
 
+        // All slots start free.
+        let free_slots = (0..MAX_CHUNKS).rev().collect();
+
         GpuWorld {
-            build_pipeline     : BuildPipeline::new(device),
-            render_bgl         : render_bgl,
-            camera_buf         : camera_buf,
-            render_bg          : render_bg,
-            pool               : pool,
-            chunks             : HashMap::new(),
-            dirty              : Vec::new(),
-            cull_pipeline      : cull_pipeline,
-            src_indirect_buf   : src_indirect_buf,
-            dst_indirect_buf   : dst_indirect_buf,
-            draw_count_buf     : draw_count_buf,
-            frustum_buf        : frustum_buf,
-            cull_bg            : cull_bg,
-            src_draw_count     : 0,
-            count_staging      : count_staging,
-            count_ready        : Arc::new(AtomicBool::new(false)),
-            count_pending      : false,
-            visible_count      : 0,
-            material_table_buf : material_table_buf,
-            face_texture_buf   : face_texture_buf,
-            texture_view       : texture_view,
-            tex_sampler        : tex_sampler,
+            quad_buf             : quad_buf,
+            occupancy_buf        : occupancy_buf,
+            boundary_cache_buf   : boundary_cache_buf,
+            chunk_meta_buf       : chunk_meta_buf,
+            quad_range_buf       : quad_range_buf,
+            chunk_offset_buf     : chunk_offset_buf,
+            material_volume_buf  : material_volume_buf,
+            dst_indirect_buf     : dst_indirect_buf,
+            draw_data_buf        : draw_data_buf,
+            draw_count_buf       : draw_count_buf,
+            frustum_buf          : frustum_buf,
+            build_count_pipeline : build_count_pipeline,
+            build_count_bg       : build_count_bg,
+            build_write_pipeline : build_write_pipeline,
+            build_write_bg       : build_write_bg,
+            cull_pipeline        : cull_pipeline,
+            cull_bg              : cull_bg,
+            render_bgl           : render_bgl,
+            render_bg            : render_bg,
+            camera_buf           : camera_buf,
+            material_table_buf   : material_table_buf,
+            face_texture_buf     : face_texture_buf,
+            texture_view         : texture_view,
+            tex_sampler          : tex_sampler,
+            allocator            : ContiguousAllocator::new(QUAD_BUF_QUADS),
+            free_slots           : free_slots,
+            chunks               : HashMap::new(),
+            dirty                : Vec::new(),
+            meta_staging         : meta_staging,
+            count_staging        : count_staging,
+            count_ready          : Arc::new(AtomicBool::new(false)),
+            count_pending        : false,
+            visible_count        : 0,
+            active_slot_count    : 0,
         }
     }
 
     /// Insert a chunk with initial occupancy and material data.
     ///
-    /// Allocates a page table slot and block storage, writes the page
-    /// table and material volume, and marks the chunk for building. Call
-    /// [`rebuild`](Self::rebuild) to dispatch the build compute shader.
+    /// Allocates a slot and uploads occupancy, boundary, material, and
+    /// offset data to the shared buffers. No quad allocation is performed
+    /// until the first build determines the actual count. The chunk is
+    /// marked dirty for building.
     ///
     /// # Arguments
     ///
-    /// * `device`   - The GPU device for resource creation.
-    /// * `queue`    - The queue for page table and material writes.
+    /// * `device`   - The GPU device (unused in current flow, reserved).
+    /// * `queue`    - The queue for buffer writes.
     /// * `pos`      - The chunk position.
     /// * `occ`      - Initial chunk occupancy bitmask.
     /// * `material` - Per-voxel block IDs (32768 bytes, one byte per voxel).
     pub fn insert(
         &mut self,
-        device   : &Device,
+        _device  : &Device,
         queue    : &Queue,
         pos      : ChunkPos,
         occ      : &[u32; 1024],
         material : &[u8; 32768],
     )
     {
-        let slot      = self.pool.alloc_slot();
-        let block_ids = self.pool.alloc_blocks(MAX_CHUNK_BLOCKS);
+        let slot = self.alloc_slot();
 
-        // Write block IDs to the page table and chunk world offset.
-        self.pool.write_page_table(queue, slot, &block_ids);
-        self.pool.write_chunk_offset(queue, slot, pos);
-        self.pool.write_material(queue, slot, material);
+        // Upload occupancy to the shared buffer at this slot's region.
+        self.write_occupancy(queue, slot, occ);
 
-        let build = ChunkBuildData::new(
-            device,
-            &self.build_pipeline,
-            occ,
-            &self.pool.quad_buf,
-            &self.pool.page_table,
-        );
+        // Upload chunk world offset.
+        self.write_chunk_offset(queue, slot, pos);
+
+        // Upload material volume.
+        self.write_material(queue, slot, material);
+
+        // Zero the chunk metadata so the cull shader skips this slot
+        // until the first build completes.
+        self.zero_chunk_meta(queue, slot);
 
         self.chunks.insert(pos, GpuChunk {
-            build : build,
-            alloc : ChunkAlloc {
-                slot      : slot,
-                block_ids : block_ids,
-            },
-            occ   : Box::new(*occ),
-            count : 0,
-            dirty : true,
+            slot        : slot,
+            quad_offset : 0,
+            quad_alloc  : 0,
+            quad_count  : 0,
+            occ         : Box::new(*occ),
+            dirty       : true,
         });
 
         self.dirty.push(pos);
@@ -769,12 +930,16 @@ impl GpuWorld {
 
     /// Remove a chunk and release its GPU resources.
     ///
-    /// Rebuilds the indirect draw buffer so that `draw` never references
-    /// freed page table slots.
+    /// Frees the slot and quad allocation. Zeros the chunk metadata so
+    /// the cull shader stops processing this slot.
     pub fn remove(&mut self, queue: &Queue, pos: ChunkPos) {
         if let Some(chunk) = self.chunks.remove(&pos) {
-            self.pool.free_blocks(&chunk.alloc.block_ids);
-            self.pool.free_slot(chunk.alloc.slot);
+            if chunk.quad_alloc > 0 {
+                self.allocator.free(chunk.quad_offset, chunk.quad_alloc);
+            }
+
+            self.free_slot(chunk.slot);
+            self.zero_chunk_meta(queue, chunk.slot);
         }
 
         self.dirty.retain(|&p| p != pos);
@@ -782,13 +947,13 @@ impl GpuWorld {
         // Neighbors' boundary faces are now exposed.
         self.dirty_neighbors(pos);
 
-        self.rebuild_indirect(queue);
+        self.recount_active_slots();
     }
 
     /// Remove all loaded chunks from the GPU.
     ///
-    /// Frees every slot and zeroes occupancy for all positions. Used when
-    /// switching world generators to start with a clean slate.
+    /// Frees every slot and quad allocation. Used when switching world
+    /// generators to start with a clean slate.
     pub fn clear(&mut self, queue: &Queue) {
         let positions: Vec<ChunkPos> =
             self.chunks.keys().copied().collect();
@@ -801,7 +966,8 @@ impl GpuWorld {
     /// Upload new occupancy data for a chunk and mark it for rebuilding.
     ///
     /// The occupancy buffer is written immediately via the queue. The
-    /// build shader is not dispatched until [`rebuild`](Self::rebuild).
+    /// build shader is not dispatched until
+    /// [`rebuild`](Self::rebuild) or [`rebuild_subset`](Self::rebuild_subset).
     pub fn update_occupancy(
         &mut self,
         queue : &Queue,
@@ -815,12 +981,14 @@ impl GpuWorld {
         };
 
         *chunk.occ = *occ;
-        chunk.build.upload_occupancy(queue, occ);
+        let slot   = chunk.slot;
 
         if !chunk.dirty {
             chunk.dirty = true;
             self.dirty.push(pos);
         }
+
+        self.write_occupancy(queue, slot, occ);
 
         // Neighbors may need new boundary slices.
         self.dirty_neighbors(pos);
@@ -831,14 +999,14 @@ impl GpuWorld {
         self.chunks.contains_key(&pos)
     }
 
-    /// Returns the number of free page table slots.
+    /// Returns the number of free slots.
     pub fn free_slots(&self) -> u32 {
-        self.pool.free_slots.len() as u32
+        self.free_slots.len() as u32
     }
 
-    /// Returns the number of free pool blocks.
-    pub fn free_blocks(&self) -> u32 {
-        self.pool.free_blocks.len() as u32
+    /// Returns the number of free quads in the allocator.
+    pub fn free_quads(&self) -> u32 {
+        self.allocator.free_quads()
     }
 
     /// Upload new material data for an existing chunk.
@@ -855,7 +1023,7 @@ impl GpuWorld {
     )
     {
         if let Some(chunk) = self.chunks.get(&pos) {
-            self.pool.write_material(queue, chunk.alloc.slot, material);
+            self.write_material(queue, chunk.slot, material);
         }
     }
 
@@ -863,14 +1031,19 @@ impl GpuWorld {
     ///
     /// Only chunks in `positions` that are currently marked dirty will be
     /// dispatched. Chunks not in the set remain dirty for a future call.
-    /// After this call, the indirect draw buffer is rebuilt to reflect
-    /// updated quad counts.
+    ///
+    /// For each dirty chunk the build runs synchronously:
+    /// 1. Upload neighbor boundary slices to the shared buffer.
+    /// 2. Dispatch the build count pass (push constants: slot, 0).
+    /// 3. Read back the quad count from chunk_meta_buf.
+    /// 4. Allocate or resize the quad range in the contiguous allocator.
+    /// 5. Dispatch the build write pass (push constants: slot, base_offset).
     pub fn rebuild_subset(
         &mut self,
-        device   : &Device,
-        queue    : &Queue,
+        device    : &Device,
+        queue     : &Queue,
         positions : &[ChunkPos],
-        rejected : &HashSet<ChunkPos>,
+        rejected  : &HashSet<ChunkPos>,
     )
     {
         // Collect the subset of requested positions that are actually dirty.
@@ -892,105 +1065,154 @@ impl GpuWorld {
             );
 
             if let Some(chunk) = self.chunks.get(&pos) {
-                chunk.build.upload_neighbor_slices(queue, &slices);
+                self.write_boundary(queue, chunk.slot, &slices);
             }
         }
 
-        // Encode all rebuilds into one command buffer.
-        let mut encoder = device.create_command_encoder(
-            &CommandEncoderDescriptor::default(),
-        );
-
-        for &pos in &to_build {
-            if let Some(chunk) = self.chunks.get(&pos) {
-                let block_base = chunk.alloc.slot * MAX_CHUNK_BLOCKS;
-                chunk.build.dispatch(
-                    &mut encoder, &self.build_pipeline, block_base,
-                );
-            }
-        }
-
-        queue.submit(Some(encoder.finish()));
-
-        // Read back quad counts, handle overflow, and trim.
+        // Process each chunk: count pass, readback, allocate, write pass.
         for pos in to_build {
-            let Some(chunk) = self.chunks.get_mut(&pos)
+            let Some(chunk) = self.chunks.get(&pos)
             else {
                 continue;
             };
 
-            let raw_count = chunk.build.read_quad_count(device);
-            let needed    = ((raw_count + BLOCK_SIZE - 1) / BLOCK_SIZE)
-                .max(1) as usize;
-            let current   = chunk.alloc.block_ids.len();
+            let slot = chunk.slot;
 
-            if needed <= current {
-                // Normal case: enough blocks allocated.
-                chunk.count = raw_count;
-                chunk.dirty = false;
+            // -- Count pass: determine how many quads this chunk produces --
 
-                if needed < current {
-                    let excess = chunk.alloc.block_ids.split_off(needed);
-                    self.pool.free_blocks(&excess);
+            {
+                let mut encoder = device.create_command_encoder(
+                    &CommandEncoderDescriptor::default(),
+                );
 
-                    // Zero freed page table entries so future overflow
-                    // writes land in the null block (block 0).
-                    self.pool.clear_page_table_tail(
-                        queue, chunk.alloc.slot, needed as u32,
+                // Zero the chunk_meta entry so the count starts at 0.
+                encoder.clear_buffer(
+                    &self.chunk_meta_buf,
+                    u64::from(slot) * u64::from(CHUNK_META_BYTES),
+                    Some(u64::from(CHUNK_META_BYTES)),
+                );
+
+                // Dispatch the build count pass.
+                {
+                    let mut pass = encoder.begin_compute_pass(
+                        &ComputePassDescriptor {
+                            label            : Some("build_count"),
+                            timestamp_writes : None,
+                        },
                     );
+
+                    pass.set_pipeline(
+                        self.build_count_pipeline.pipeline(),
+                    );
+                    pass.set_bind_group(0, &self.build_count_bg, &[]);
+
+                    // Push constants: {slot_index, base_offset}.
+                    // For the count pass, base_offset is 0 (unused).
+                    let push = [slot, 0u32];
+                    pass.set_immediates(
+                        0, bytemuck::cast_slice(&push),
+                    );
+
+                    pass.dispatch_workgroups(32, 6, 1);
                 }
+
+                // Copy the quad_count field from chunk_meta to staging.
+                encoder.copy_buffer_to_buffer(
+                    &self.chunk_meta_buf,
+                    u64::from(slot) * u64::from(CHUNK_META_BYTES),
+                    &self.meta_staging,
+                    0,
+                    4,
+                );
+
+                queue.submit(Some(encoder.finish()));
             }
-            else {
-                // Overflow: the build produced more quads than blocks
-                // allocated. Greedy merge is non-monotonic across
-                // neighbor configurations, so a rebuild can exceed a
-                // previous trim. Grow the allocation by the exact
-                // deficit and re-dispatch to write all quads correctly.
-                let deficit = (needed - current) as u32;
 
-                if (self.pool.free_blocks.len() as u32) >= deficit {
-                    let new_blocks = self.pool.alloc_blocks(deficit);
-                    chunk.alloc.block_ids.extend_from_slice(&new_blocks);
-                    self.pool.write_page_table(
-                        queue,
-                        chunk.alloc.slot,
-                        &chunk.alloc.block_ids,
+            // Synchronous readback of the quad count.
+            let quad_count = self.read_meta_staging(device);
+
+            // -- Allocate or resize the quad range --
+
+            let chunk = self.chunks.get_mut(&pos).unwrap();
+
+            // Free old allocation if the new count doesn't fit.
+            if quad_count > chunk.quad_alloc {
+                if chunk.quad_alloc > 0 {
+                    self.allocator.free(
+                        chunk.quad_offset, chunk.quad_alloc,
                     );
 
-                    // Re-dispatch with the grown allocation.
-                    let block_base = chunk.alloc.slot * MAX_CHUNK_BLOCKS;
-                    let mut enc    = device.create_command_encoder(
-                        &CommandEncoderDescriptor::default(),
-                    );
+                    chunk.quad_offset = 0;
+                    chunk.quad_alloc  = 0;
+                }
 
-                    chunk.build.dispatch(
-                        &mut enc, &self.build_pipeline, block_base,
-                    );
-                    queue.submit(Some(enc.finish()));
-
-                    chunk.count = chunk.build.read_quad_count(device);
-                    chunk.dirty = false;
-
-                    // Trim the retry result.
-                    let needed2 = ((chunk.count + BLOCK_SIZE - 1)
-                        / BLOCK_SIZE)
-                        .max(1) as usize;
-
-                    if needed2 < chunk.alloc.block_ids.len() {
-                        let excess =
-                            chunk.alloc.block_ids.split_off(needed2);
-                        self.pool.free_blocks(&excess);
-                        self.pool.clear_page_table_tail(
-                            queue, chunk.alloc.slot, needed2 as u32,
-                        );
-                    }
+                // Allocate exactly the needed range. The two-pass
+                // build knows the exact count before allocating.
+                if let Some(offset) = self.allocator.alloc(quad_count) {
+                    chunk.quad_offset = offset;
+                    chunk.quad_alloc  = quad_count;
                 }
                 else {
-                    // Pool exhausted. Cap to allocated capacity and
-                    // leave dirty for retry next frame.
-                    chunk.count = current as u32 * BLOCK_SIZE;
+                    // Allocator exhausted. Leave dirty for retry.
+                    chunk.quad_count = 0;
+                    continue;
                 }
             }
+
+            chunk.quad_count = quad_count;
+            let base_offset  = chunk.quad_offset;
+            let slot         = chunk.slot;
+            chunk.dirty      = false;
+
+
+            // Write base_offset into quad_range_buf so the cull shader
+            // can read it when constructing MDI entries.
+            queue.write_buffer(
+                &self.quad_range_buf,
+                u64::from(slot) * u64::from(QUAD_RANGE_BYTES) + 4,
+                bytemuck::bytes_of(&base_offset),
+            );
+
+            // -- Write pass: emit quads into the allocated range --
+
+            if quad_count > 0 {
+                let mut encoder = device.create_command_encoder(
+                    &CommandEncoderDescriptor::default(),
+                );
+
+                {
+                    let mut pass = encoder.begin_compute_pass(
+                        &ComputePassDescriptor {
+                            label            : Some("build_write"),
+                            timestamp_writes : None,
+                        },
+                    );
+
+                    pass.set_pipeline(
+                        self.build_write_pipeline.pipeline(),
+                    );
+                    pass.set_bind_group(0, &self.build_write_bg, &[]);
+
+                    let push = [slot, base_offset];
+                    pass.set_immediates(
+                        0, bytemuck::cast_slice(&push),
+                    );
+
+                    pass.dispatch_workgroups(32, 6, 1);
+                }
+
+                queue.submit(Some(encoder.finish()));
+            }
+
+            // Write quad_count to chunk_meta_buf so the cull shader can
+            // read it. The count pass wrote it there originally but the
+            // write pass doesn't touch chunk_meta_buf, so we restore it
+            // from the CPU-side value.
+            queue.write_buffer(
+                &self.chunk_meta_buf,
+                u64::from(slot) * u64::from(CHUNK_META_BYTES),
+                bytemuck::bytes_of(&quad_count),
+            );
         }
 
         // Remove rebuilt positions from the master dirty list.
@@ -998,16 +1220,14 @@ impl GpuWorld {
             self.chunks.get(pos).is_some_and(|c| c.dirty)
         });
 
-        self.rebuild_indirect(queue);
+        self.recount_active_slots();
     }
 
     /// Dispatch the build shader for all dirty chunks and read back
     /// quad counts.
     ///
-    /// Encodes compute dispatches into a single command buffer, submits
-    /// it, then blocks until the GPU finishes. After this call all chunks
-    /// have up-to-date quad counts, excess blocks are freed, and the
-    /// dirty list is empty.
+    /// Convenience wrapper around [`rebuild_subset`](Self::rebuild_subset)
+    /// that processes every dirty chunk.
     pub fn rebuild(
         &mut self,
         device   : &Device,
@@ -1029,28 +1249,43 @@ impl GpuWorld {
     /// All values come from CPU-side state. No GPU queries are issued.
     pub fn stats(&self) -> RenderStats {
         let total_quads: u32 = self.chunks.values()
-            .map(|c| c.count)
+            .map(|c| c.quad_count)
             .sum();
 
+        let quad_buf_used = u64::from(
+            QUAD_BUF_QUADS - self.allocator.free_quads()
+        ) * 4;
+
+        // Per-slot buffer sizes (all pre-allocated for MAX_CHUNKS slots).
+        let slot_buf_total =
+            u64::from(MAX_CHUNKS) * u64::from(OCC_WORDS_PER_SLOT) * 4      // occupancy
+          + u64::from(MAX_CHUNKS) * u64::from(BOUNDARY_WORDS_PER_SLOT) * 4 // boundary
+          + u64::from(MAX_CHUNKS) * u64::from(CHUNK_META_BYTES)            // chunk meta
+          + u64::from(MAX_CHUNKS) * u64::from(QUAD_RANGE_BYTES)            // quad range
+          + u64::from(MAX_CHUNKS) * 16                                     // chunk offsets
+          + u64::from(MAX_CHUNKS) * 32768                                  // material volume
+          + u64::from(MAX_CHUNKS) * 16                                     // dst indirect
+          + u64::from(MAX_CHUNKS) * u64::from(DRAW_DATA_BYTES);           // draw data
+
+        // Small constant buffers (frustum, staging, counters).
+        let small_bufs = 96 + 4 + 16 + 4;
+
         RenderStats {
-            chunks_loaded     : self.chunks.len() as u32,
-            chunks_drawn      : self.src_draw_count,
-            chunks_visible    : self.visible_count,
-            total_quads       : total_quads,
-            pool_blocks_used  : POOL_BLOCKS
-                              - self.pool.free_blocks.len() as u32,
-            pool_blocks_total : POOL_BLOCKS,
-            pool_slots_used   : MAX_CHUNKS
-                              - self.pool.free_slots.len() as u32,
-            pool_slots_total  : MAX_CHUNKS,
+            chunks_loaded  : self.chunks.len() as u32,
+            chunks_visible : self.visible_count,
+            total_quads    : total_quads,
+            quad_buf_used  : quad_buf_used,
+            quad_buf_total : QUAD_BUF_SIZE,
+            slot_buf_total : slot_buf_total,
+            gpu_mem_total  : QUAD_BUF_SIZE + slot_buf_total + small_bufs,
         }
     }
 
     /// Record the frustum cull compute pass.
     ///
     /// Clears the draw count buffer, uploads frustum planes, and
-    /// dispatches the cull compute shader. Must be called after
-    /// `rebuild_indirect` and before the render pass.
+    /// dispatches the cull compute shader. The cull shader iterates all
+    /// slots directly, reading chunk_meta_buf to skip empty slots.
     ///
     /// # Arguments
     ///
@@ -1064,7 +1299,7 @@ impl GpuWorld {
         planes  : &[[f32; 4]; 6],
     )
     {
-        if self.src_draw_count == 0 {
+        if self.active_slot_count == 0 {
             return;
         }
 
@@ -1078,7 +1313,7 @@ impl GpuWorld {
         // Clear the atomic draw count to zero.
         encoder.clear_buffer(&self.draw_count_buf, 0, None);
 
-        // Frustum cull compute pass.
+        // Frustum cull compute pass: iterate all slots, skip empty.
         {
             let mut pass = encoder.begin_compute_pass(
                 &ComputePassDescriptor {
@@ -1089,12 +1324,15 @@ impl GpuWorld {
 
             pass.set_pipeline(self.cull_pipeline.pipeline());
             pass.set_bind_group(0, &self.cull_bg, &[]);
+
+            // Push constant: total_slots (the cull shader iterates
+            // [0, total_slots) and skips slots with quad_count == 0).
             pass.set_immediates(
                 0,
-                bytemuck::bytes_of(&self.src_draw_count),
+                bytemuck::bytes_of(&MAX_CHUNKS),
             );
 
-            let workgroups = (self.src_draw_count + 63) / 64;
+            let workgroups = (MAX_CHUNKS + 63) / 64;
             pass.dispatch_workgroups(workgroups, 1, 1);
         }
     }
@@ -1102,9 +1340,10 @@ impl GpuWorld {
     /// Copy the GPU-written visible draw count to the staging buffer.
     ///
     /// Call after the cull compute pass but before `encoder.finish()`.
-    /// Results arrive one frame later via [`poll_visible_count`](Self::poll_visible_count).
+    /// Results arrive one frame later via
+    /// [`poll_visible_count`](Self::poll_visible_count).
     pub fn resolve_visible_count(&mut self, encoder: &mut CommandEncoder) {
-        if self.src_draw_count == 0 {
+        if self.active_slot_count == 0 {
             return;
         }
 
@@ -1132,7 +1371,7 @@ impl GpuWorld {
     /// Call after `queue.submit()`. The result becomes available in the
     /// next frame's [`poll_visible_count`](Self::poll_visible_count).
     pub fn request_count_readback(&mut self) {
-        if self.src_draw_count == 0 || self.count_pending {
+        if self.active_slot_count == 0 || self.count_pending {
             return;
         }
 
@@ -1151,7 +1390,7 @@ impl GpuWorld {
 
     /// Poll for completed visible count readback.
     ///
-    /// Call at the start of each frame. Updates `visible_count` if
+    /// Call at the start of each frame. Updates the visible count if
     /// results are available.
     pub fn poll_visible_count(&mut self, device: &Device) {
         if !self.count_pending {
@@ -1164,6 +1403,164 @@ impl GpuWorld {
             self.consume_count_readback();
         }
     }
+
+    /// Issue a single multi-draw-indirect-count call for all visible
+    /// chunks.
+    ///
+    /// Sets the shared render bind group and dispatches all visible
+    /// draws from the compacted indirect buffer. The caller must have
+    /// already set the render pipeline on the pass.
+    pub fn draw<'a>(&'a self, pass: &mut RenderPass<'a>) {
+        if self.active_slot_count == 0 {
+            return;
+        }
+
+        pass.set_bind_group(0, &self.render_bg, &[]);
+        pass.multi_draw_indirect_count(
+            &self.dst_indirect_buf,
+            0,
+            &self.draw_count_buf,
+            0,
+            MAX_CHUNKS,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Private: slot management
+    // -----------------------------------------------------------------------
+
+    /// Allocate a slot index from the free stack.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no slots are available.
+    fn alloc_slot(&mut self) -> u32 {
+        self.free_slots.pop().expect("chunk slots exhausted")
+    }
+
+    /// Return a slot to the free stack.
+    fn free_slot(&mut self, slot: u32) {
+        self.free_slots.push(slot);
+    }
+
+    // -----------------------------------------------------------------------
+    // Private: shared buffer writes
+    // -----------------------------------------------------------------------
+
+    /// Write occupancy data to the shared occupancy buffer at a slot.
+    fn write_occupancy(
+        &self,
+        queue : &Queue,
+        slot  : u32,
+        occ   : &[u32; 1024],
+    )
+    {
+        let offset = u64::from(slot)
+                   * u64::from(OCC_WORDS_PER_SLOT) * 4;
+
+        queue.write_buffer(
+            &self.occupancy_buf,
+            offset,
+            bytemuck::cast_slice(occ),
+        );
+    }
+
+    /// Write neighbor boundary slices to the shared boundary cache at a slot.
+    fn write_boundary(
+        &self,
+        queue  : &Queue,
+        slot   : u32,
+        slices : &[u32; NEIGHBOR_WORDS],
+    )
+    {
+        let offset = u64::from(slot)
+                   * u64::from(BOUNDARY_WORDS_PER_SLOT) * 4;
+
+        queue.write_buffer(
+            &self.boundary_cache_buf,
+            offset,
+            bytemuck::cast_slice(slices),
+        );
+    }
+
+    /// Write a chunk's world-space voxel offset into the offset buffer.
+    fn write_chunk_offset(
+        &self,
+        queue : &Queue,
+        slot  : u32,
+        pos   : ChunkPos,
+    )
+    {
+        let data: [i32; 4] = [pos.x * 32, pos.y * 32, pos.z * 32, 0];
+
+        queue.write_buffer(
+            &self.chunk_offset_buf,
+            u64::from(slot) * 16,
+            bytemuck::cast_slice(&data),
+        );
+    }
+
+    /// Write per-voxel material data for a chunk's slot.
+    fn write_material(
+        &self,
+        queue    : &Queue,
+        slot     : u32,
+        material : &[u8; 32768],
+    )
+    {
+        queue.write_buffer(
+            &self.material_volume_buf,
+            u64::from(slot) * 32768,
+            material,
+        );
+    }
+
+    /// Zero the chunk metadata entry for a slot.
+    ///
+    /// Sets quad_count to 0 so the cull shader skips this slot.
+    fn zero_chunk_meta(&self, queue: &Queue, slot: u32) {
+        let zeros = [0u32; 4];
+
+        queue.write_buffer(
+            &self.chunk_meta_buf,
+            u64::from(slot) * u64::from(CHUNK_META_BYTES),
+            bytemuck::cast_slice(&zeros),
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Private: build synchronization
+    // -----------------------------------------------------------------------
+
+    /// Synchronously read back the quad count from the meta staging buffer.
+    ///
+    /// Blocks until the GPU delivers the mapped data. Used during the
+    /// synchronous build path; will be replaced by async feedback later.
+    fn read_meta_staging(&self, device: &Device) -> u32 {
+        let slice = self.meta_staging.slice(..);
+
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            result.unwrap();
+            tx.send(()).unwrap();
+        });
+
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap();
+
+        let data  = slice.get_mapped_range();
+        let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        drop(data);
+
+        self.meta_staging.unmap();
+
+        count
+    }
+
+    // -----------------------------------------------------------------------
+    // Private: visible count readback
+    // -----------------------------------------------------------------------
 
     /// Read mapped staging data and update the visible count.
     fn consume_count_readback(&mut self) {
@@ -1179,56 +1576,9 @@ impl GpuWorld {
         self.visible_count = count;
     }
 
-    /// Issue a single multi-draw-indirect call for all chunks with quads.
-    ///
-    /// Sets the shared render bind group and dispatches all chunk draws
-    /// from the indirect buffer. The caller must have already set the
-    /// render pipeline on the pass.
-    pub fn draw<'a>(&'a self, pass: &mut RenderPass<'a>) {
-        if self.src_draw_count == 0 {
-            return;
-        }
-
-        pass.set_bind_group(0, &self.render_bg, &[]);
-        pass.multi_draw_indirect_count(
-            &self.dst_indirect_buf,
-            0,
-            &self.draw_count_buf,
-            0,
-            self.src_draw_count,
-        );
-    }
-
-    /// Rebuild the indirect draw buffer from all loaded chunks.
-    ///
-    /// Packs [`DrawIndirectArgs`] for every chunk with a non-zero quad
-    /// count and writes them to the GPU indirect buffer.
-    fn rebuild_indirect(&mut self, queue: &Queue) {
-        let mut args: Vec<DrawIndirectArgs> = Vec::new();
-
-        for chunk in self.chunks.values() {
-            if chunk.count == 0 {
-                continue;
-            }
-
-            args.push(DrawIndirectArgs {
-                vertex_count   : 4,
-                instance_count : chunk.count,
-                first_vertex   : 0,
-                first_instance : chunk.alloc.slot * SLOT_INSTANCE_STRIDE,
-            });
-        }
-
-        self.src_draw_count = args.len() as u32;
-
-        if !args.is_empty() {
-            queue.write_buffer(
-                &self.src_indirect_buf,
-                0,
-                bytemuck::cast_slice(&args),
-            );
-        }
-    }
+    // -----------------------------------------------------------------------
+    // Private: dirty tracking
+    // -----------------------------------------------------------------------
 
     /// Mark the six cardinal neighbors of a position as dirty.
     ///
@@ -1250,6 +1600,16 @@ impl GpuWorld {
                 }
             }
         }
+    }
+
+    /// Recompute the count of slots with non-zero quad counts.
+    ///
+    /// Used as the upper bound for the cull shader dispatch and as a
+    /// fast early-exit check for draw and cull methods.
+    fn recount_active_slots(&mut self) {
+        self.active_slot_count = self.chunks.values()
+            .filter(|c| c.quad_count > 0)
+            .count() as u32;
     }
 }
 

@@ -1,47 +1,88 @@
-//! GPU compute build stage for chunk face derivation and greedy merge.
+//! GPU compute build pipelines for two-pass chunk quad generation.
 //!
-//! Takes a chunk's occupancy bitmask, derives per-direction face bitmasks
-//! via AND-NOT, performs material-agnostic greedy merge, and writes packed
-//! quad descriptors to a GPU storage buffer. The output feeds the existing
-//! vertex shader directly.
+//! The build stage runs in two passes over slot-indexed shared buffers:
+//!
+//! 1. **Count pass** -- derives face bitmasks from occupancy and neighbor
+//!    boundaries, runs greedy merge, and writes per-(direction, layer)
+//!    quad counts to `quad_range_buf` and totals to `chunk_meta_buf`.
+//!
+//! 2. **Write pass** -- re-derives faces and merge, then writes packed
+//!    quad descriptors to contiguous ranges in `quad_buf` at prefix-summed
+//!    offsets computed from the count pass output.
+//!
+//! Both passes use push constants (`BuildPush`) to select the chunk slot
+//! and base offset. All buffers are shared across chunks; no per-chunk GPU
+//! resources exist.
 
-use wgpu::util::DeviceExt;
+use bytemuck::{Pod, Zeroable};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType,
-    BufferDescriptor, BufferUsages, CommandEncoder, ComputePassDescriptor,
-    ComputePipeline, ComputePipelineDescriptor, Device, Queue,
+    ComputePipeline, ComputePipelineDescriptor, Device,
     PipelineCompilationOptions, PipelineLayoutDescriptor,
-    ShaderModuleDescriptor, ShaderSource, ShaderStages,
+    ShaderModuleDescriptorPassthrough, ShaderStages,
 };
 
 // ---------------------------------------------------------------------------
-// BuildPipeline
+// BuildPush
 // ---------------------------------------------------------------------------
 
-/// The compute pipeline for the build stage.
-pub struct BuildPipeline {
+/// Push constants for build shaders.
+///
+/// Passed via immediates at offset 0. Both the count and write passes
+/// share this layout so the pipeline layouts are compatible.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BuildPush {
+    /// The slot index into the shared buffers for this chunk.
+    pub slot_index  : u32,
+    /// The starting quad index in the quad buffer (write pass only).
+    pub base_offset : u32,
+}
+
+// ---------------------------------------------------------------------------
+// BuildCountPipeline
+// ---------------------------------------------------------------------------
+
+/// The compute pipeline for the build count pass (pass 1).
+///
+/// Reads chunk occupancy and neighbor boundary data from shared
+/// slot-indexed buffers. Runs face derivation and greedy merge in
+/// count-only mode, writing per-(direction, layer) quad counts to
+/// `quad_range_buf` and accumulating the total in `chunk_meta_buf`.
+pub struct BuildCountPipeline {
     /// The compiled compute pipeline.
     pipeline  : ComputePipeline,
-    /// The bind group layout shared by all chunk build dispatches.
+    /// The bind group layout for count pass dispatches.
     bg_layout : wgpu::BindGroupLayout,
 }
 
-impl BuildPipeline {
-    /// Create the build stage compute pipeline.
+impl BuildCountPipeline {
+    /// Create the build count compute pipeline.
+    ///
+    /// Load the pre-compiled SPIR-V for `build_count.cs.hlsl` and build
+    /// the pipeline with the count pass bind group layout.
     pub fn new(device: &Device) -> Self {
-        let shader = device.create_shader_module(ShaderModuleDescriptor {
-            label  : Some("build_shader"),
-            source : ShaderSource::Wgsl(
-                include_str!("shaders/build.wgsl").into(),
-            ),
-        });
+        let count_spv = include_bytes!(
+            concat!(env!("OUT_DIR"), "/build_count.cs.spv")
+        );
+
+        // Safety: SPIR-V compiled from trusted HLSL by DXC at build time.
+        let shader = unsafe {
+            device.create_shader_module_passthrough(
+                ShaderModuleDescriptorPassthrough {
+                    label : Some("build_count_shader"),
+                    spirv : Some(wgpu::util::make_spirv_raw(count_spv)),
+                    ..Default::default()
+                },
+            )
+        };
 
         let bg_layout = device.create_bind_group_layout(
             &BindGroupLayoutDescriptor {
-                label   : Some("build_bgl"),
+                label   : Some("build_count_bgl"),
                 entries : &[
-                    // binding 0: occupancy (read-only storage)
+                    // binding 0: occupancy_buf (read-only storage)
                     BindGroupLayoutEntry {
                         binding    : 0,
                         visibility : ShaderStages::COMPUTE,
@@ -54,20 +95,20 @@ impl BuildPipeline {
                         },
                         count : None,
                     },
-                    // binding 1: quad count (read-write storage)
+                    // binding 1: boundary_cache_buf (read-only storage)
                     BindGroupLayoutEntry {
                         binding    : 1,
                         visibility : ShaderStages::COMPUTE,
                         ty         : BindingType::Buffer {
                             ty                 : BufferBindingType::Storage {
-                                read_only : false,
+                                read_only : true,
                             },
                             has_dynamic_offset : false,
                             min_binding_size   : None,
                         },
                         count : None,
                     },
-                    // binding 2: shared quad pool (read-write storage)
+                    // binding 2: chunk_meta_buf (read-write storage)
                     BindGroupLayoutEntry {
                         binding    : 2,
                         visibility : ShaderStages::COMPUTE,
@@ -80,13 +121,13 @@ impl BuildPipeline {
                         },
                         count : None,
                     },
-                    // binding 3: page table (read-only storage)
+                    // binding 3: quad_range_buf (read-write storage)
                     BindGroupLayoutEntry {
                         binding    : 3,
                         visibility : ShaderStages::COMPUTE,
                         ty         : BindingType::Buffer {
                             ty                 : BufferBindingType::Storage {
-                                read_only : true,
+                                read_only : false,
                             },
                             has_dynamic_offset : false,
                             min_binding_size   : None,
@@ -99,100 +140,51 @@ impl BuildPipeline {
 
         let pipeline_layout = device.create_pipeline_layout(
             &PipelineLayoutDescriptor {
-                label              : Some("build_pl"),
+                label              : Some("build_count_pl"),
                 bind_group_layouts : &[Some(&bg_layout)],
-                immediate_size     : 4,
+                immediate_size     : 8,
             },
         );
 
         let pipeline = device.create_compute_pipeline(
             &ComputePipelineDescriptor {
-                label               : Some("build_pipeline"),
+                label               : Some("build_count_pipeline"),
                 layout              : Some(&pipeline_layout),
                 module              : &shader,
-                entry_point         : Some("build"),
+                entry_point         : Some("main"),
                 compilation_options : PipelineCompilationOptions::default(),
                 cache               : None,
             },
         );
 
-        BuildPipeline { pipeline, bg_layout }
+        BuildCountPipeline { pipeline, bg_layout }
     }
-}
 
-// ---------------------------------------------------------------------------
-// ChunkBuildData
-// ---------------------------------------------------------------------------
-
-/// GPU resources for building one chunk's quad buffer.
-pub struct ChunkBuildData {
-    /// The chunk's occupancy bitmask and neighbor boundary slices on the GPU.
-    occupancy_buf  : Buffer,
-    /// Atomic quad count (4 bytes, zeroed before dispatch).
-    quad_count_buf : Buffer,
-    /// Staging buffer for reading back the quad count to CPU.
-    count_staging  : Buffer,
-    /// Bind group for the compute dispatch.
-    bind_group     : BindGroup,
-}
-
-impl ChunkBuildData {
-    /// Create GPU resources for building a chunk's quad buffer.
+    /// Create a bind group for the count pass.
     ///
-    /// Uploads the occupancy data and allocates per-chunk buffers. The
-    /// bind group references the shared quad pool and page table rather
-    /// than a per-chunk quad buffer.
+    /// The bind group references the shared slot-indexed buffers. It is
+    /// created once and reused for all chunk dispatches; the slot index
+    /// is passed via push constants.
     ///
     /// # Arguments
     ///
-    /// * `device`     - The GPU device for resource creation.
-    /// * `pipeline`   - The build compute pipeline (provides the BGL).
-    /// * `occ`        - Initial chunk occupancy bitmask.
-    /// * `quad_pool`  - The shared quad storage buffer.
-    /// * `page_table` - The shared page table buffer.
-    pub fn new(
-        device     : &Device,
-        pipeline   : &BuildPipeline,
-        occ        : &[u32; 1024],
-        quad_pool  : &Buffer,
-        page_table : &Buffer,
-    ) -> Self
+    /// * `device`            - The GPU device.
+    /// * `occupancy_buf`     - Shared occupancy bitmask buffer (read-only).
+    /// * `boundary_cache_buf`- Shared neighbor boundary cache (read-only).
+    /// * `chunk_meta_buf`    - Shared per-chunk metadata (read-write).
+    /// * `quad_range_buf`    - Shared per-chunk quad range data (read-write).
+    pub fn create_bind_group(
+        &self,
+        device             : &Device,
+        occupancy_buf      : &Buffer,
+        boundary_cache_buf : &Buffer,
+        chunk_meta_buf     : &Buffer,
+        quad_range_buf     : &Buffer,
+    ) -> BindGroup
     {
-        // Extend with zeroed neighbor boundary slices (6 x 32 words).
-        let mut extended_occ = [0u32; 1216];
-        extended_occ[..1024].copy_from_slice(occ);
-
-        let occupancy_buf = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label    : Some("build_occ"),
-                contents : bytemuck::cast_slice(&extended_occ),
-                usage    : BufferUsages::STORAGE
-                         | BufferUsages::COPY_DST,
-            },
-        );
-
-        // Quad count initialized to 0.
-        let quad_count_buf = device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
-                label    : Some("build_count"),
-                contents : bytemuck::bytes_of(&0u32),
-                usage    : BufferUsages::STORAGE
-                         | BufferUsages::COPY_SRC
-                         | BufferUsages::COPY_DST,
-            },
-        );
-
-        let count_staging = device.create_buffer(&BufferDescriptor {
-            label              : Some("build_count_staging"),
-            size               : 4,
-            usage              : BufferUsages::COPY_DST
-                               | BufferUsages::MAP_READ,
-            mapped_at_creation : false,
-        });
-
-        let bind_group = device.create_bind_group(&BindGroupDescriptor {
-            label   : Some("build_bg"),
-            layout  : &pipeline.bg_layout,
+        device.create_bind_group(&BindGroupDescriptor {
+            label   : Some("build_count_bg"),
+            layout  : &self.bg_layout,
             entries : &[
                 BindGroupEntry {
                     binding  : 0,
@@ -200,120 +192,195 @@ impl ChunkBuildData {
                 },
                 BindGroupEntry {
                     binding  : 1,
-                    resource : quad_count_buf.as_entire_binding(),
+                    resource : boundary_cache_buf.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding  : 2,
-                    resource : quad_pool.as_entire_binding(),
+                    resource : chunk_meta_buf.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding  : 3,
-                    resource : page_table.as_entire_binding(),
+                    resource : quad_range_buf.as_entire_binding(),
                 },
             ],
-        });
-
-        ChunkBuildData {
-            occupancy_buf  : occupancy_buf,
-            quad_count_buf : quad_count_buf,
-            count_staging  : count_staging,
-            bind_group     : bind_group,
-        }
+        })
     }
 
-    /// Record the compute dispatch and count readback copy.
+    /// Returns a reference to the compute pipeline.
+    pub fn pipeline(&self) -> &ComputePipeline {
+        &self.pipeline
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BuildWritePipeline
+// ---------------------------------------------------------------------------
+
+/// The compute pipeline for the build write pass (pass 2).
+///
+/// Re-derives faces and merge using the same occupancy and boundary
+/// data, then writes packed quad descriptors into contiguous ranges
+/// in `quad_buf`. The write offset for each (direction, layer) bucket
+/// is computed from the prefix-summed counts stored in `quad_range_buf`
+/// by the count pass.
+pub struct BuildWritePipeline {
+    /// The compiled compute pipeline.
+    pipeline  : ComputePipeline,
+    /// The bind group layout for write pass dispatches.
+    bg_layout : wgpu::BindGroupLayout,
+}
+
+impl BuildWritePipeline {
+    /// Create the build write compute pipeline.
     ///
-    /// Resets the atomic counter, dispatches the compute pass with the
-    /// chunk's page table offset, and copies the counter to the staging
-    /// buffer. After this call, submit the encoder to the queue, then
-    /// call [`read_quad_count`] to retrieve the result.
+    /// Load the pre-compiled SPIR-V for `build_write.cs.hlsl` and build
+    /// the pipeline with the write pass bind group layout.
+    pub fn new(device: &Device) -> Self {
+        let write_spv = include_bytes!(
+            concat!(env!("OUT_DIR"), "/build_write.cs.spv")
+        );
+
+        // Safety: SPIR-V compiled from trusted HLSL by DXC at build time.
+        let shader = unsafe {
+            device.create_shader_module_passthrough(
+                ShaderModuleDescriptorPassthrough {
+                    label : Some("build_write_shader"),
+                    spirv : Some(wgpu::util::make_spirv_raw(write_spv)),
+                    ..Default::default()
+                },
+            )
+        };
+
+        let bg_layout = device.create_bind_group_layout(
+            &BindGroupLayoutDescriptor {
+                label   : Some("build_write_bgl"),
+                entries : &[
+                    // binding 0: occupancy_buf (read-only storage)
+                    BindGroupLayoutEntry {
+                        binding    : 0,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 1: boundary_cache_buf (read-only storage)
+                    BindGroupLayoutEntry {
+                        binding    : 1,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 2: quad_range_buf (read-only storage)
+                    BindGroupLayoutEntry {
+                        binding    : 2,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 3: quad_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 3,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                ],
+            },
+        );
+
+        let pipeline_layout = device.create_pipeline_layout(
+            &PipelineLayoutDescriptor {
+                label              : Some("build_write_pl"),
+                bind_group_layouts : &[Some(&bg_layout)],
+                immediate_size     : 8,
+            },
+        );
+
+        let pipeline = device.create_compute_pipeline(
+            &ComputePipelineDescriptor {
+                label               : Some("build_write_pipeline"),
+                layout              : Some(&pipeline_layout),
+                module              : &shader,
+                entry_point         : Some("main"),
+                compilation_options : PipelineCompilationOptions::default(),
+                cache               : None,
+            },
+        );
+
+        BuildWritePipeline { pipeline, bg_layout }
+    }
+
+    /// Create a bind group for the write pass.
+    ///
+    /// The bind group references the shared slot-indexed buffers. It is
+    /// created once and reused for all chunk dispatches; the slot index
+    /// and base offset are passed via push constants.
     ///
     /// # Arguments
     ///
-    /// * `encoder`    - The command encoder to record into.
-    /// * `pipeline`   - The build compute pipeline.
-    /// * `block_base` - Offset into the page table for this chunk's slot.
-    pub fn dispatch(
+    /// * `device`            - The GPU device.
+    /// * `occupancy_buf`     - Shared occupancy bitmask buffer (read-only).
+    /// * `boundary_cache_buf`- Shared neighbor boundary cache (read-only).
+    /// * `quad_range_buf`    - Shared quad range data from count pass (read-only).
+    /// * `quad_buf`          - Shared quad descriptor buffer (read-write).
+    pub fn create_bind_group(
         &self,
-        encoder    : &mut CommandEncoder,
-        pipeline   : &BuildPipeline,
-        block_base : u32,
-    )
+        device             : &Device,
+        occupancy_buf      : &Buffer,
+        boundary_cache_buf : &Buffer,
+        quad_range_buf     : &Buffer,
+        quad_buf           : &Buffer,
+    ) -> BindGroup
     {
-        // Reset the atomic counter to zero.
-        encoder.clear_buffer(&self.quad_count_buf, 0, None);
-
-        // Compute pass: face derivation + greedy merge.
-        {
-            let mut pass = encoder.begin_compute_pass(
-                &ComputePassDescriptor {
-                    label            : Some("build"),
-                    timestamp_writes : None,
+        device.create_bind_group(&BindGroupDescriptor {
+            label   : Some("build_write_bg"),
+            layout  : &self.bg_layout,
+            entries : &[
+                BindGroupEntry {
+                    binding  : 0,
+                    resource : occupancy_buf.as_entire_binding(),
                 },
-            );
-
-            pass.set_pipeline(&pipeline.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.set_immediates(0, bytemuck::bytes_of(&block_base));
-            pass.dispatch_workgroups(32, 6, 1);
-        }
-
-        // Copy the atomic counter to the staging buffer.
-        encoder.copy_buffer_to_buffer(
-            &self.quad_count_buf, 0,
-            &self.count_staging,  0,
-            4,
-        );
+                BindGroupEntry {
+                    binding  : 1,
+                    resource : boundary_cache_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 2,
+                    resource : quad_range_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 3,
+                    resource : quad_buf.as_entire_binding(),
+                },
+            ],
+        })
     }
 
-    /// Upload new occupancy data to the GPU buffer.
-    ///
-    /// The data is written immediately via the queue. The caller must
-    /// dispatch the build shader afterward to update the quad buffer.
-    pub fn upload_occupancy(&self, queue: &Queue, occ: &[u32; 1024]) {
-        queue.write_buffer(
-            &self.occupancy_buf,
-            0,
-            bytemuck::cast_slice(occ),
-        );
-    }
-
-    /// Upload neighbor boundary slices to the occupancy buffer.
-    ///
-    /// Write the 192-word neighbor slice region at byte offset 4096,
-    /// directly after the 1024-word chunk occupancy. Each of the 6
-    /// directions contributes 32 words (one 32x32 boundary layer).
-    pub fn upload_neighbor_slices(&self, queue: &Queue, slices: &[u32; 192]) {
-        queue.write_buffer(
-            &self.occupancy_buf,
-            4096,
-            bytemuck::cast_slice(slices),
-        );
-    }
-
-    /// Read back the quad count after the dispatch has completed.
-    ///
-    /// Blocks until the GPU finishes and the staging buffer is mapped.
-    pub fn read_quad_count(&self, device: &Device) -> u32 {
-        let slice = self.count_staging.slice(..);
-
-        // Request mapping and block until the GPU delivers.
-        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            result.unwrap();
-            tx.send(()).unwrap();
-        });
-
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        rx.recv().unwrap();
-
-        let data  = slice.get_mapped_range();
-        let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        drop(data);
-
-        self.count_staging.unmap();
-
-        count
+    /// Returns a reference to the compute pipeline.
+    pub fn pipeline(&self) -> &ComputePipeline {
+        &self.pipeline
     }
 }

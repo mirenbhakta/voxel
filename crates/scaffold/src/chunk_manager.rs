@@ -15,7 +15,7 @@ use voxel::chunk::{Chunk, ChunkPos};
 use voxel::world::{ChunkProvider, World};
 use wgpu::{Device, Queue};
 
-use crate::world::{GpuWorld, MAX_CHUNK_BLOCKS};
+use crate::world::{GpuWorld, MAX_CHUNK_QUADS};
 
 // ---------------------------------------------------------------------------
 // GenOutcome
@@ -301,10 +301,10 @@ impl ChunkManager {
     )
     {
         // Determine batch size from per-frame budget and GPU capacity.
-        let available_slots  = gpu.free_slots() as usize;
-        let available_blocks = gpu.free_blocks() as usize
-                             / MAX_CHUNK_BLOCKS as usize;
-        let capacity         = available_slots.min(available_blocks);
+        let available_slots = gpu.free_slots() as usize;
+        let available_quads = gpu.free_quads() as usize
+                            / MAX_CHUNK_QUADS as usize;
+        let capacity        = available_slots.min(available_quads);
         let max_loads        = self.loads_per_frame.min(capacity);
 
         // Pop nearest positions from the queue.
