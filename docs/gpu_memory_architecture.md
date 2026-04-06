@@ -516,16 +516,235 @@ imperceptible.
 5. No stalls, no data movement, no rebuild.
 
 
-## Streaming and Occlusion
+## LOD via Decimation
 
-The visibility-driven material storage naturally supports streaming. The
-sub-block is the implicit streaming unit:
+Level of detail reduces quad count at distance without reducing grid resolution.
+The occupancy grid stays 32x32x32. Only the surface geometry is simplified.
 
-- A chunk behind an occluder can have its material range freed. The quad range
-  and slot metadata stay resident. The material is re-packed when the chunk
-  becomes visible again.
-- Chunks at LOD boundaries can skip material entirely if the LOD uses averaged
-  colors instead of per-voxel material identity.
+### Why not downsample
+
+Uniform downsampling (32x32x32 to 16x16x16) destroys thin features. A 1-voxel
+pillar either disappears (AND rule) or expands to double width (OR rule). This
+is information-theoretic, not algorithmic: a 1-voxel feature cannot exist in a
+half-resolution regular grid regardless of the downsampling method.
+
+### Topology-preserving decimation
+
+Instead of reducing resolution, iteratively remove surface voxels that disrupt
+greedy merge efficiency while preserving structural features through topology
+constraints.
+
+**Merge disruption metric.** The energy function measures how much a voxel
+prevents neighboring faces from merging into larger rectangles. A 1-voxel bump
+on flat terrain has high disruption: it scatters faces across multiple layers
+and breaks rectangular merging in each. A pillar voxel has low disruption: its
+side faces already merge into tall thin rectangles.
+
+**Simple point test.** A voxel can only be removed if doing so does not change
+the topology of the solid: no disconnections, no holes. A pillar's voxels are
+topologically protected because removing any one disconnects the column.
+
+**GPU implementation.** Sub-iteration parallel thinning divides voxels into 8
+subsets by xyz parity. Within a subset, no two voxels are 26-adjacent, so all
+can be tested and removed simultaneously without race conditions. Eight
+sub-iterations = one full pass. A few passes with decreasing importance
+thresholds produce progressive LOD levels.
+
+### Pipeline integration
+
+The decimation pass is a compute shader that runs before the build shader:
+
+```
+Occupancy (32x32x32, unchanged)
+  -> Decimation pass (produces smoothed occupancy)
+    -> Build pass 1 (count, unchanged)
+      -> Build pass 2 (write, unchanged)
+        -> Quads with vertex color, no material sub-blocks
+```
+
+The build shader is unchanged. It receives a smoother input and produces fewer
+quads. LOD chunks skip material packing entirely. The fragment shader reads a
+per-quad averaged color instead of sampling the material volume.
+
+### Natural behavior
+
+Mountain slope detail: many small height variations, each with high merge
+disruption and low individual importance. Decimated first, producing large
+merged quads.
+
+Single-voxel pillar: topologically protected (cannot remove without
+disconnecting), low merge disruption (already merges well). Survives even
+aggressive decimation budgets without explicit special-case logic.
+
+Flat terrain: already merges perfectly. Unaffected by decimation.
+
+
+## Far-Field Rendering
+
+Beyond the effective range of rasterization, chunks are rendered via bounded
+ray marching through the occupancy bitmask. No build shader, no greedy merge,
+no material storage.
+
+### Transition threshold
+
+The crossover distance where rasterization becomes inefficient is determined by
+perceptual acuity, not pixel count. Display resolution cancels out of the
+formula entirely. Only physical screen size, viewing distance, and field of
+view matter:
+
+```
+d = voxel_size * screen_phys_width / (2 * acuity * tan(fov / 2) * viewing_distance)
+```
+
+For a 27" monitor at 60 cm, 90 degree FOV, 1 m voxels:
+
+| Acuity | Distance | Context |
+|---|---|---|
+| 1 arcminute | 1713 m | Perfect vision, static target |
+| 2 arcminute | 856 m | Relaxed viewing |
+| 3 arcminute | 571 m | Motion, typical gaming |
+
+Practical gaming threshold: 600-850 m. A single user-facing "detail distance"
+slider. Display-independent.
+
+### Why ray marching works at distance
+
+The pathological cases that make full-scene ray marching unsuitable for primary
+visibility (see `design_rejections.md`) do not apply to chunk-bounded marching:
+
+- **No tree traversal.** The rasterizer handles spatial sorting. Each fragment
+  knows exactly which chunk it tests.
+- **No cross-chunk warp divergence.** Every fragment in a warp tests the same
+  chunk's data.
+- **Bounded within-chunk divergence.** At most 55 steps (32x32x32 diagonal).
+  At distance, rays are nearly parallel, so adjacent fragments take similar
+  step counts.
+- **No random memory access.** One chunk's occupancy is 4 KB. Fits in L1.
+  Adjacent fragments read adjacent columns.
+- **No register pressure.** Ray position, direction, current cell. No stack,
+  no node pointers.
+- **MSAA works.** Bounding box depth is used instead of per-voxel
+  `gl_FragDepth`, preserving early-Z and hardware multisampling. At distance,
+  the 32-voxel depth range within a chunk is negligible.
+
+### Rendering path
+
+1. Rasterize each far chunk as its bounding cube.
+2. Fragment shader: DDA through the chunk's 32x32x32 occupancy bitmask.
+3. On hit: output solid averaged color. On miss: discard.
+4. Depth: bounding box depth from rasterizer, not per-voxel.
+
+No build shader dispatch. No quad buffer allocation. No material sub-blocks.
+A far chunk needs only its 4 KB occupancy bitmask and an averaged color.
+
+
+## Streaming Hierarchy
+
+Chunk data residency is a continuous hierarchy, not discrete LOD tiers. Every
+level is a valid renderable. Coarser levels are always available as fallback.
+Nothing pops into existence because something is always there to display.
+
+### Hierarchy levels
+
+```
+Level 0:  Chunk averaged color (~4 B). Solid-colored cube.
+Level 1:  8x8x8 occupancy + color (~576 B). Ray marched.
+Level 2:  32x32x32 occupancy + averaged color (~4 KB). Ray marched or
+          rasterized with decimation.
+Level 3:  32x32x32 occupancy + full material. Full rasterization pipeline.
+```
+
+### Occlusion-driven promotion
+
+The cull cascade determines per-chunk visibility every frame. That visibility
+signal feeds back to the CPU (async, one-frame latency) and drives streaming
+priority:
+
+- Chunk becomes visible: promote to higher detail level.
+- Chunk becomes occluded: evict to coarser level, free memory.
+- Chunk approaches camera: promote further.
+- Chunk recedes: demote.
+
+Material storage can be freed for occluded chunks while keeping the quad range
+and slot metadata resident. Material is re-packed when the chunk becomes
+visible again. Chunks at higher LOD levels skip material entirely.
+
+### Imposter caching
+
+A chunk rendered via ray march can cache its result as a small texture mapped
+onto the bounding cube. Subsequent frames draw the textured cube with no ray
+march. Invalidated when the chunk's data changes or the camera angle shifts
+beyond a threshold. Sub-chunk imposters (octants) improve parallax fidelity
+at the cost of 8x storage and management.
+
+
+## Layered Generation
+
+Terrain generation is split between GPU and CPU to avoid the dual source of
+truth problem. Each layer has exactly one authoritative source.
+
+### The problem
+
+If both CPU and GPU independently evaluate the same noise function, floating
+point non-determinism (different hardware, instruction ordering, FMA behavior,
+transcendental implementations) produces slightly different occupancy at surface
+boundaries. At distance the mismatch is invisible, but the transition as a
+chunk promotes from GPU-generated to CPU-generated causes visible shimmer.
+
+### Layer model
+
+```
+Layer 0 (GPU):  Terrain shape. Noise -> occupancy. GPU is sole authority.
+Layer 1 (CPU):  Structure placement. Trees, rocks, buildings. Applied as
+                diffs on top of GPU occupancy.
+Layer 2 (CPU):  Material assignment. Per-voxel material identity. Only needed
+                at near LOD when the material texture is sampled.
+Layer 3 (CPU):  Player edits. Persistent modifications stored as diffs.
+```
+
+### Why structures stay on CPU
+
+Structure placement is a coordination problem. Each placement depends on what
+has already been placed nearby (spacing, collision, terrain fit). A tree needs
+to find a valid surface position, check for conflicts, stamp a 3D template
+that may span chunk boundaries. This is fundamentally serial and requires
+global knowledge that the GPU's local-only parallel model cannot provide.
+
+Simple scatter (rocks, small props) could theoretically run on GPU since each
+placement is independent, but these are unnecessary at far LOD distance.
+
+### CPU decision layer
+
+The CPU maintains a coarse spatial index of features that require full
+generation: large structures placed via voronoi or disk sampling, player
+modifications, biome boundaries. This index is precomputed and trivially
+cheap to query.
+
+```
+Per chunk load decision:
+  No features nearby + unmodified  ->  GPU fast path (immediate)
+  Features nearby or modified      ->  CPU generation (queued, budget-limited)
+```
+
+### GPU fast path
+
+A single compute dispatch batch-generates occupancy for hundreds of far chunks
+in parallel. No CPU-GPU roundtrip. No upload. No per-frame budget throttling.
+The occupancy goes straight into the ray march path without touching CPU
+memory.
+
+### Streaming lifecycle
+
+```
+Far:          GPU generates 8x8x8 coarse terrain. Ray march. Immediate.
+Approaching:  GPU generates 32x32x32 terrain. Ray march or rasterize.
+Near:         CPU applies structure diffs (layer 1). Build shader.
+Close:        CPU applies material (layer 2) + edits (layer 3). Full pipeline.
+```
+
+The coarse generation fills the view almost instantly. Detail refines
+progressively as chunks promote through the hierarchy. No pop-in because the
+coarse version is already on screen before the detailed version is needed.
 
 
 ## What This Eliminates
@@ -550,6 +769,11 @@ sub-block is the implicit streaming unit:
 | Direction in quad descriptor (3 bits) | Implicit in memory layout |
 | Rasterizer-only backface culling | Direction + layer + quad cull cascade |
 | MDI-level direction culling | Direction -> layer -> quad cull cascade with Hi-Z |
+| Uniform LOD downsampling (destroys thin features) | Topology-preserving decimation on full grid |
+| Single rendering path at all distances | Rasterization near + ray march far |
+| CPU-only chunk generation (streaming bottleneck) | GPU terrain generation for far unmodified chunks |
+| Hard LOD transitions (pop-in) | Continuous streaming hierarchy with imposter fallback |
+| Full generation cost regardless of distance | Coarse 8x8x8 for far, full 32x32x32 for near |
 
 
 ## Open Questions
@@ -610,3 +834,47 @@ surface, this could be thousands of quads per chunk. The test itself is cheap
 Need to measure whether stage 3 (layer Hi-Z) reduces the set enough that
 stage 4 is tractable, or whether stage 4 should be optional and only enabled
 at close range.
+
+### Decimation budget tuning
+
+How many voxels to remove per LOD level. Options: fixed budget per level,
+distance-to-camera mapped to a target quad count reduction, or adaptive based
+on screen-space quad density. The merge disruption metric needs measurement
+under real terrain to determine effective thresholds.
+
+### Decimation averaged color computation
+
+How to compute the averaged color for decimated chunks. Options: accumulate
+material colors from removed voxels into survivors during decimation, or
+precompute a per-chunk average from the material volume before discarding it.
+The former is more accurate but adds complexity to the decimation pass.
+
+### LOD boundary seams
+
+Two adjacent chunks at different LOD levels have different surface geometry at
+the shared boundary. The boundary cache stores neighbor surfaces, so the
+decimation pass could read neighbor boundary state to keep edges consistent.
+The severity of visual artifacts at LOD transitions needs testing.
+
+### Ray march depth precision
+
+Using bounding box depth instead of per-voxel depth avoids the cost of
+`gl_FragDepth` output but introduces depth error up to one chunk diagonal
+(~55 voxels). Whether this causes Z-fighting between adjacent far chunks
+needs testing. Potential mitigation: conservative depth bias.
+
+### Imposter invalidation policy
+
+Camera angle threshold for invalidating cached imposters, and whether
+per-octant sub-chunk imposters are worth the 8x storage cost for parallax
+fidelity. Depends on how noticeable the flat-billboard artifact is at the
+distances where imposters are used.
+
+### GPU terrain noise functions
+
+Which noise algorithms are suitable for GPU compute terrain generation.
+Integer-hash-based noise (cellular, value noise) avoids floating point
+entirely. Simplex noise needs careful implementation to avoid warp divergence
+from conditional branches. The noise function quality at 8x8x8 coarse
+resolution may differ visibly from 32x32x32 if the noise frequency is high
+relative to the coarse sample rate.
