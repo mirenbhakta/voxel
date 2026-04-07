@@ -123,9 +123,11 @@ impl ChunkManager {
     ///    world and the GPU.
     /// 2. Loads up to `loads_per_frame` new chunks from the provider,
     ///    generating in parallel with a time budget.
-    /// 3. Syncs dirty CPU chunks (from voxel edits) to the GPU.
-    /// 4. Triggers GPU rebuild for up to `builds_per_frame` dirty chunks,
-    ///    prioritized by distance to center.
+    /// 3. Harvests async build count results from the previous frame and
+    ///    dispatches write passes.
+    /// 4. Syncs dirty CPU chunks (from voxel edits) to the GPU.
+    /// 5. Dispatches build count passes for up to `builds_per_frame`
+    ///    dirty chunks, prioritized by distance to center.
     pub fn update(
         &mut self,
         provider : &(dyn ChunkProvider + Sync),
@@ -134,6 +136,10 @@ impl ChunkManager {
         queue    : &Queue,
     )
     {
+        // Harvest previous frame's async build count results and
+        // dispatch write passes before any new occupancy uploads.
+        gpu.process_build_feedback(device, queue);
+
         self.unload_distant_chunks(gpu, queue);
         self.load_queued_chunks(provider, gpu, device, queue);
         self.sync_dirty_to_gpu(gpu, queue);
@@ -426,7 +432,7 @@ impl ChunkManager {
 
         // Sort dirty positions by distance to center, take the budget.
         let center = self.center;
-        let mut prioritized: Vec<ChunkPos> = dirty.to_vec();
+        let mut prioritized = dirty;
 
         prioritized.sort_by_key(|pos| {
             let dx = pos.x - center.x;
@@ -437,6 +443,6 @@ impl ChunkManager {
 
         prioritized.truncate(self.builds_per_frame);
 
-        gpu.rebuild_subset(device, queue, &prioritized, &self.rejected);
+        gpu.dispatch_counts(device, queue, &prioritized, &self.rejected);
     }
 }

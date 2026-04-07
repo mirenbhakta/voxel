@@ -87,6 +87,12 @@ const DIR_POS_Z: usize = 4 * SLICE_WORDS;
 /// Neighbor slice offset for -Z direction.
 const DIR_NEG_Z: usize = 5 * SLICE_WORDS;
 
+/// Maximum number of chunk builds that can be in flight at once.
+///
+/// Determines the size of the async build staging buffer. The staging
+/// buffer holds one `u32` quad count per in-flight build.
+const MAX_BUILDS_IN_FLIGHT: u32 = 64;
+
 // ---------------------------------------------------------------------------
 // GpuMaterial
 // ---------------------------------------------------------------------------
@@ -330,17 +336,30 @@ impl ContiguousAllocator {
 /// managed by [`GpuWorld`].
 struct GpuChunk {
     /// Slot index in the shared buffers.
-    slot        : u32,
+    slot            : u32,
     /// Offset into the quad buffer (from the contiguous allocator).
-    quad_offset : u32,
+    quad_offset     : u32,
     /// Allocated size in quads (may exceed actual quad count).
-    quad_alloc  : u32,
+    quad_alloc      : u32,
     /// Actual quad count from the last completed build.
-    quad_count  : u32,
+    quad_count      : u32,
     /// CPU-side occupancy shadow for neighbor boundary extraction.
-    occ         : Box<[u32; 1024]>,
+    occ             : Box<[u32; 1024]>,
     /// Whether this chunk needs rebuilding.
-    dirty       : bool,
+    dirty           : bool,
+    /// Whether a count pass is in flight for this chunk.
+    count_in_flight : bool,
+}
+
+/// A chunk whose count pass has been dispatched but whose write pass
+/// has not yet run.
+struct PendingBuild {
+    /// Chunk world position.
+    pos           : ChunkPos,
+    /// Slot index in the shared buffers.
+    slot          : u32,
+    /// Index into the build staging buffer (read at offset * 4).
+    staging_index : u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -382,11 +401,13 @@ pub struct RenderStats {
 ///
 /// Per-frame workflow:
 ///
-/// 1. Modify chunks via [`update_occupancy`](Self::update_occupancy).
-/// 2. Call [`rebuild_subset`](Self::rebuild_subset) or
-///    [`rebuild`](Self::rebuild) to dispatch the build shader.
-/// 3. Call [`dispatch_cull`](Self::dispatch_cull) to run frustum culling.
-/// 4. In the render pass, call [`draw`](Self::draw) to issue draw calls.
+/// 1. Call [`process_build_feedback`](Self::process_build_feedback) to
+///    harvest results from the previous frame's count passes.
+/// 2. Modify chunks via [`update_occupancy`](Self::update_occupancy).
+/// 3. Call [`dispatch_counts`](Self::dispatch_counts) or
+///    [`rebuild`](Self::rebuild) to dispatch count passes.
+/// 4. Call [`dispatch_cull`](Self::dispatch_cull) to run frustum culling.
+/// 5. In the render pass, call [`draw`](Self::draw) to issue draw calls.
 pub struct GpuWorld {
     // -- Shared buffers (slot-indexed) --
 
@@ -461,10 +482,16 @@ pub struct GpuWorld {
     /// Positions of chunks that need rebuilding.
     dirty                : Vec<ChunkPos>,
 
-    // -- Build synchronization --
+    // -- Build synchronization (async) --
 
-    /// Staging buffer for synchronous readback of chunk_meta after build.
-    meta_staging         : Buffer,
+    /// Staging buffer for async readback of quad counts after count passes.
+    build_staging        : Buffer,
+    /// Whether an async build staging map is in flight.
+    build_pending        : bool,
+    /// Set by the map callback when the build staging data is ready.
+    build_ready          : Arc<AtomicBool>,
+    /// Chunks awaiting write pass dispatch (count in flight).
+    pending_builds       : Vec<PendingBuild>,
 
     // -- Visible count async readback --
 
@@ -613,11 +640,11 @@ impl GpuWorld {
             mapped_at_creation : false,
         });
 
-        // -- Build synchronization --
+        // -- Build synchronization (async) --
 
-        let meta_staging = device.create_buffer(&BufferDescriptor {
-            label              : Some("meta_staging"),
-            size               : u64::from(CHUNK_META_BYTES),
+        let build_staging = device.create_buffer(&BufferDescriptor {
+            label              : Some("build_staging"),
+            size               : u64::from(MAX_BUILDS_IN_FLIGHT) * 4,
             usage              : BufferUsages::COPY_DST
                                | BufferUsages::MAP_READ,
             mapped_at_creation : false,
@@ -866,7 +893,10 @@ impl GpuWorld {
             free_slots           : free_slots,
             chunks               : HashMap::new(),
             dirty                : Vec::new(),
-            meta_staging         : meta_staging,
+            build_staging        : build_staging,
+            build_pending        : false,
+            build_ready          : Arc::new(AtomicBool::new(false)),
+            pending_builds       : Vec::new(),
             count_staging        : count_staging,
             count_ready          : Arc::new(AtomicBool::new(false)),
             count_pending        : false,
@@ -914,12 +944,13 @@ impl GpuWorld {
         self.zero_chunk_meta(queue, slot);
 
         self.chunks.insert(pos, GpuChunk {
-            slot        : slot,
-            quad_offset : 0,
-            quad_alloc  : 0,
-            quad_count  : 0,
-            occ         : Box::new(*occ),
-            dirty       : true,
+            slot            : slot,
+            quad_offset     : 0,
+            quad_alloc      : 0,
+            quad_count      : 0,
+            occ             : Box::new(*occ),
+            dirty           : true,
+            count_in_flight : false,
         });
 
         self.dirty.push(pos);
@@ -967,7 +998,7 @@ impl GpuWorld {
     ///
     /// The occupancy buffer is written immediately via the queue. The
     /// build shader is not dispatched until
-    /// [`rebuild`](Self::rebuild) or [`rebuild_subset`](Self::rebuild_subset).
+    /// [`rebuild`](Self::rebuild) or [`dispatch_counts`](Self::dispatch_counts).
     pub fn update_occupancy(
         &mut self,
         queue : &Queue,
@@ -1027,18 +1058,16 @@ impl GpuWorld {
         }
     }
 
-    /// Rebuild a specific set of dirty chunks.
+    /// Dispatch count passes for a batch of dirty chunks.
     ///
-    /// Only chunks in `positions` that are currently marked dirty will be
-    /// dispatched. Chunks not in the set remain dirty for a future call.
+    /// Uploads neighbor boundary slices, dispatches the build count
+    /// compute shader for each chunk, copies quad counts to a staging
+    /// buffer, and starts an async map. Results are harvested next frame
+    /// by [`process_build_feedback`](Self::process_build_feedback).
     ///
-    /// For each dirty chunk the build runs synchronously:
-    /// 1. Upload neighbor boundary slices to the shared buffer.
-    /// 2. Dispatch the build count pass (push constants: slot, 0).
-    /// 3. Read back the quad count from chunk_meta_buf.
-    /// 4. Allocate or resize the quad range in the contiguous allocator.
-    /// 5. Dispatch the build write pass (push constants: slot, base_offset).
-    pub fn rebuild_subset(
+    /// If a previous batch is still in flight (`build_pending`), this
+    /// method returns immediately and the chunks remain dirty.
+    pub fn dispatch_counts(
         &mut self,
         device    : &Device,
         queue     : &Queue,
@@ -1046,19 +1075,26 @@ impl GpuWorld {
         rejected  : &HashSet<ChunkPos>,
     )
     {
-        // Collect the subset of requested positions that are actually dirty.
+        if self.build_pending {
+            return;
+        }
+
+        // Collect the subset of requested positions that are actually
+        // dirty and not already in flight.
         let to_build: Vec<ChunkPos> = positions.iter()
             .copied()
             .filter(|pos| {
-                self.chunks.get(pos).is_some_and(|c| c.dirty)
+                self.chunks.get(pos)
+                    .is_some_and(|c| c.dirty && !c.count_in_flight)
             })
+            .take(MAX_BUILDS_IN_FLIGHT as usize)
             .collect();
 
         if to_build.is_empty() {
             return;
         }
 
-        // Upload neighbor boundary slices for chunks being rebuilt.
+        // Upload neighbor boundary slices for chunks being counted.
         for &pos in &to_build {
             let slices = build_neighbor_slices(
                 &self.chunks, pos, rejected,
@@ -1069,8 +1105,12 @@ impl GpuWorld {
             }
         }
 
-        // Process each chunk: count pass, readback, allocate, write pass.
-        for pos in to_build {
+        // Batch all count passes into one encoder.
+        let mut encoder = device.create_command_encoder(
+            &CommandEncoderDescriptor::default(),
+        );
+
+        for (i, &pos) in to_build.iter().enumerate() {
             let Some(chunk) = self.chunks.get(&pos)
             else {
                 continue;
@@ -1078,62 +1118,170 @@ impl GpuWorld {
 
             let slot = chunk.slot;
 
-            // -- Count pass: determine how many quads this chunk produces --
+            // Zero the chunk_meta entry so the count starts at 0.
+            encoder.clear_buffer(
+                &self.chunk_meta_buf,
+                u64::from(slot) * u64::from(CHUNK_META_BYTES),
+                Some(u64::from(CHUNK_META_BYTES)),
+            );
 
+            // Dispatch the build count pass.
             {
-                let mut encoder = device.create_command_encoder(
-                    &CommandEncoderDescriptor::default(),
+                let mut pass = encoder.begin_compute_pass(
+                    &ComputePassDescriptor {
+                        label            : Some("build_count"),
+                        timestamp_writes : None,
+                    },
                 );
 
-                // Zero the chunk_meta entry so the count starts at 0.
-                encoder.clear_buffer(
-                    &self.chunk_meta_buf,
-                    u64::from(slot) * u64::from(CHUNK_META_BYTES),
-                    Some(u64::from(CHUNK_META_BYTES)),
+                pass.set_pipeline(
+                    self.build_count_pipeline.pipeline(),
+                );
+                pass.set_bind_group(0, &self.build_count_bg, &[]);
+
+                let push = [slot, 0u32];
+                pass.set_immediates(
+                    0, bytemuck::cast_slice(&push),
                 );
 
-                // Dispatch the build count pass.
-                {
-                    let mut pass = encoder.begin_compute_pass(
-                        &ComputePassDescriptor {
-                            label            : Some("build_count"),
-                            timestamp_writes : None,
-                        },
-                    );
-
-                    pass.set_pipeline(
-                        self.build_count_pipeline.pipeline(),
-                    );
-                    pass.set_bind_group(0, &self.build_count_bg, &[]);
-
-                    // Push constants: {slot_index, base_offset}.
-                    // For the count pass, base_offset is 0 (unused).
-                    let push = [slot, 0u32];
-                    pass.set_immediates(
-                        0, bytemuck::cast_slice(&push),
-                    );
-
-                    pass.dispatch_workgroups(32, 6, 1);
-                }
-
-                // Copy the quad_count field from chunk_meta to staging.
-                encoder.copy_buffer_to_buffer(
-                    &self.chunk_meta_buf,
-                    u64::from(slot) * u64::from(CHUNK_META_BYTES),
-                    &self.meta_staging,
-                    0,
-                    4,
-                );
-
-                queue.submit(Some(encoder.finish()));
+                pass.dispatch_workgroups(32, 6, 1);
             }
 
-            // Synchronous readback of the quad count.
-            let quad_count = self.read_meta_staging(device);
+            // Copy quad_count to the staging buffer at this chunk's
+            // index position.
+            encoder.copy_buffer_to_buffer(
+                &self.chunk_meta_buf,
+                u64::from(slot) * u64::from(CHUNK_META_BYTES),
+                &self.build_staging,
+                u64::from(i as u32) * 4,
+                4,
+            );
 
-            // -- Allocate or resize the quad range --
+            self.pending_builds.push(PendingBuild {
+                pos           : pos,
+                slot          : slot,
+                staging_index : i as u32,
+            });
+        }
 
-            let chunk = self.chunks.get_mut(&pos).unwrap();
+        queue.submit(Some(encoder.finish()));
+
+        // The count pass just wrote a new quad_count into chunk_meta_buf
+        // on the GPU. The cull shader runs later this frame and would
+        // read that count before the write pass has allocated quads or
+        // set base_offset, producing garbage draws. Restore each
+        // chunk's current CPU-side quad_count so:
+        //   - New chunks (quad_count = 0): cull shader skips them.
+        //   - Existing chunks (quad_count > 0): cull shader renders
+        //     the old quads at the old base_offset for one more frame.
+        // The staged writes are flushed at the next queue.submit (the
+        // main frame encoder). process_build_feedback sets the correct
+        // values next frame after the write pass.
+        for pb in &self.pending_builds {
+            let qc = self.chunks.get(&pb.pos)
+                .map_or(0u32, |c| c.quad_count);
+
+            queue.write_buffer(
+                &self.chunk_meta_buf,
+                u64::from(pb.slot) * u64::from(CHUNK_META_BYTES),
+                bytemuck::bytes_of(&qc),
+            );
+        }
+
+        // Mark counted chunks: clear dirty, set in-flight.
+        for pb in &self.pending_builds {
+            if let Some(chunk) = self.chunks.get_mut(&pb.pos) {
+                chunk.dirty           = false;
+                chunk.count_in_flight = true;
+            }
+        }
+
+        // Start async map of the staging buffer.
+        self.build_pending = true;
+        self.build_ready.store(false, Ordering::Release);
+
+        let ready = self.build_ready.clone();
+
+        self.build_staging
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                result.unwrap();
+                ready.store(true, Ordering::Release);
+            });
+
+        // Clean up the dirty list.
+        self.dirty.retain(|pos| {
+            self.chunks.get(pos).is_some_and(|c| c.dirty)
+        });
+    }
+
+    /// Harvest async build count results and dispatch write passes.
+    ///
+    /// Reads quad counts from the staging buffer mapped by the previous
+    /// frame's [`dispatch_counts`](Self::dispatch_counts), allocates or
+    /// resizes quad ranges, and dispatches the build write compute
+    /// shader for each chunk. Updates `chunk_meta_buf` and
+    /// `quad_range_buf` so the cull shader sees the new data.
+    ///
+    /// Call at the start of the frame, before `sync_dirty_to_gpu` and
+    /// `dispatch_counts`.
+    pub fn process_build_feedback(
+        &mut self,
+        device : &Device,
+        queue  : &Queue,
+    )
+    {
+        if !self.build_pending {
+            return;
+        }
+
+        // Non-blocking poll to advance the map callback.
+        let _ = device.poll(wgpu::PollType::Poll);
+
+        if !self.build_ready.load(Ordering::Acquire) {
+            return;
+        }
+
+        // Read quad counts from the mapped staging buffer.
+        let pending = std::mem::take(&mut self.pending_builds);
+        let counts: Vec<u32>;
+
+        {
+            let slice = self.build_staging.slice(..);
+            let data  = slice.get_mapped_range();
+
+            counts = pending.iter().map(|pb| {
+                let off = pb.staging_index as usize * 4;
+                u32::from_le_bytes([
+                    data[off], data[off + 1], data[off + 2], data[off + 3],
+                ])
+            }).collect();
+
+            drop(data);
+        }
+
+        self.build_staging.unmap();
+        self.build_pending = false;
+        self.build_ready.store(false, Ordering::Release);
+
+        // Allocate or resize quad ranges for each pending chunk.
+        //
+        // Collect (slot, base_offset, quad_count) for the write pass
+        // dispatch that follows.
+        struct WriteJob {
+            slot        : u32,
+            base_offset : u32,
+            quad_count  : u32,
+        }
+
+        let mut write_jobs: Vec<WriteJob> = Vec::with_capacity(pending.len());
+
+        for (pb, &quad_count) in pending.iter().zip(counts.iter()) {
+            let Some(chunk) = self.chunks.get_mut(&pb.pos)
+            else {
+                // Chunk was removed during flight. Skip.
+                continue;
+            };
 
             // Free old allocation if the new count doesn't fit.
             if quad_count > chunk.quad_alloc {
@@ -1146,76 +1294,96 @@ impl GpuWorld {
                     chunk.quad_alloc  = 0;
                 }
 
-                // Allocate exactly the needed range. The two-pass
-                // build knows the exact count before allocating.
                 if let Some(offset) = self.allocator.alloc(quad_count) {
                     chunk.quad_offset = offset;
                     chunk.quad_alloc  = quad_count;
                 }
                 else {
-                    // Allocator exhausted. Leave dirty for retry.
-                    chunk.quad_count = 0;
+                    // Allocator exhausted. Re-mark dirty for retry.
+                    chunk.quad_count      = 0;
+                    chunk.count_in_flight = false;
+
+                    if !chunk.dirty {
+                        chunk.dirty = true;
+                        self.dirty.push(pb.pos);
+                    }
+
                     continue;
                 }
             }
 
             chunk.quad_count = quad_count;
             let base_offset  = chunk.quad_offset;
-            let slot         = chunk.slot;
-            chunk.dirty      = false;
-
 
             // Write base_offset into quad_range_buf so the cull shader
             // can read it when constructing MDI entries.
             queue.write_buffer(
                 &self.quad_range_buf,
-                u64::from(slot) * u64::from(QUAD_RANGE_BYTES) + 4,
+                u64::from(pb.slot) * u64::from(QUAD_RANGE_BYTES) + 4,
                 bytemuck::bytes_of(&base_offset),
             );
 
-            // -- Write pass: emit quads into the allocated range --
+            write_jobs.push(WriteJob {
+                slot        : pb.slot,
+                base_offset : base_offset,
+                quad_count  : quad_count,
+            });
+        }
 
-            if quad_count > 0 {
-                let mut encoder = device.create_command_encoder(
-                    &CommandEncoderDescriptor::default(),
-                );
+        // Batch all write passes into one encoder.
+        let has_writes = write_jobs.iter().any(|j| j.quad_count > 0);
 
-                {
-                    let mut pass = encoder.begin_compute_pass(
-                        &ComputePassDescriptor {
-                            label            : Some("build_write"),
-                            timestamp_writes : None,
-                        },
-                    );
+        if has_writes {
+            let mut encoder = device.create_command_encoder(
+                &CommandEncoderDescriptor::default(),
+            );
 
-                    pass.set_pipeline(
-                        self.build_write_pipeline.pipeline(),
-                    );
-                    pass.set_bind_group(0, &self.build_write_bg, &[]);
-
-                    let push = [slot, base_offset];
-                    pass.set_immediates(
-                        0, bytemuck::cast_slice(&push),
-                    );
-
-                    pass.dispatch_workgroups(32, 6, 1);
+            for job in &write_jobs {
+                if job.quad_count == 0 {
+                    continue;
                 }
 
-                queue.submit(Some(encoder.finish()));
+                let mut pass = encoder.begin_compute_pass(
+                    &ComputePassDescriptor {
+                        label            : Some("build_write"),
+                        timestamp_writes : None,
+                    },
+                );
+
+                pass.set_pipeline(
+                    self.build_write_pipeline.pipeline(),
+                );
+                pass.set_bind_group(0, &self.build_write_bg, &[]);
+
+                let push = [job.slot, job.base_offset];
+                pass.set_immediates(
+                    0, bytemuck::cast_slice(&push),
+                );
+
+                pass.dispatch_workgroups(32, 6, 1);
             }
 
-            // Write quad_count to chunk_meta_buf so the cull shader can
-            // read it. The count pass wrote it there originally but the
-            // write pass doesn't touch chunk_meta_buf, so we restore it
-            // from the CPU-side value.
+            queue.submit(Some(encoder.finish()));
+        }
+
+        // Write quad_count to chunk_meta_buf so the cull shader can
+        // read it. Staged here, flushed at the next queue.submit
+        // (the main frame encoder with cull + render).
+        for job in &write_jobs {
             queue.write_buffer(
                 &self.chunk_meta_buf,
-                u64::from(slot) * u64::from(CHUNK_META_BYTES),
-                bytemuck::bytes_of(&quad_count),
+                u64::from(job.slot) * u64::from(CHUNK_META_BYTES),
+                bytemuck::bytes_of(&job.quad_count),
             );
         }
 
-        // Remove rebuilt positions from the master dirty list.
+        // Clear in-flight flags for all pending chunks.
+        for pb in &pending {
+            if let Some(chunk) = self.chunks.get_mut(&pb.pos) {
+                chunk.count_in_flight = false;
+            }
+        }
+
         self.dirty.retain(|pos| {
             self.chunks.get(pos).is_some_and(|c| c.dirty)
         });
@@ -1223,10 +1391,9 @@ impl GpuWorld {
         self.recount_active_slots();
     }
 
-    /// Dispatch the build shader for all dirty chunks and read back
-    /// quad counts.
+    /// Dispatch the build shader for all dirty chunks.
     ///
-    /// Convenience wrapper around [`rebuild_subset`](Self::rebuild_subset)
+    /// Convenience wrapper around [`dispatch_counts`](Self::dispatch_counts)
     /// that processes every dirty chunk.
     pub fn rebuild(
         &mut self,
@@ -1236,12 +1403,21 @@ impl GpuWorld {
     )
     {
         let all_dirty: Vec<ChunkPos> = self.dirty.clone();
-        self.rebuild_subset(device, queue, &all_dirty, rejected);
+        self.dispatch_counts(device, queue, &all_dirty, rejected);
     }
 
-    /// Returns the current list of dirty chunk positions.
-    pub fn dirty_positions(&self) -> &[ChunkPos] {
-        &self.dirty
+    /// Returns dirty chunk positions that are not currently in flight.
+    ///
+    /// Chunks with a count pass in flight are excluded so they are not
+    /// double-counted.
+    pub fn dirty_positions(&self) -> Vec<ChunkPos> {
+        self.dirty.iter()
+            .copied()
+            .filter(|pos| {
+                self.chunks.get(pos)
+                    .is_some_and(|c| !c.count_in_flight)
+            })
+            .collect()
     }
 
     /// Returns a snapshot of current rendering statistics.
@@ -1526,36 +1702,6 @@ impl GpuWorld {
             u64::from(slot) * u64::from(CHUNK_META_BYTES),
             bytemuck::cast_slice(&zeros),
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Private: build synchronization
-    // -----------------------------------------------------------------------
-
-    /// Synchronously read back the quad count from the meta staging buffer.
-    ///
-    /// Blocks until the GPU delivers the mapped data. Used during the
-    /// synchronous build path; will be replaced by async feedback later.
-    fn read_meta_staging(&self, device: &Device) -> u32 {
-        let slice = self.meta_staging.slice(..);
-
-        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
-
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            result.unwrap();
-            tx.send(()).unwrap();
-        });
-
-        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-        rx.recv().unwrap();
-
-        let data  = slice.get_mapped_range();
-        let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        drop(data);
-
-        self.meta_staging.unmap();
-
-        count
     }
 
     // -----------------------------------------------------------------------
