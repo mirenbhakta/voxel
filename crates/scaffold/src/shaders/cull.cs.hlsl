@@ -39,41 +39,29 @@ struct CullPush {
 
 [[vk::push_constant]] CullPush push;
 
-/// Sum all 32 layer counts for a single direction.
-uint sum_direction_quads(uint slot, uint dir) {
-    uint base  = slot * 776 + 8 + dir * 128;
-    uint total = 0;
-
-    for (uint l = 0; l < 32; l++) {
-        total += quad_range_buf.Load(base + l * 4);
-    }
-
-    return total;
+/// Read the total quad count for a direction from precomputed dir_prefix.
+uint read_direction_quads(uint slot, uint dir) {
+    return quad_range_buf.Load(
+        slot * QUAD_RANGE_BYTES + 8 + dir * 4
+    );
 }
 
-/// Sum layer counts in [l_min, l_max] and return the prefix to l_min.
+/// Read the visible quad count in [l_min, l_max] and the prefix to l_min
+/// from precomputed dir_layer_pfx.
 ///
-/// Reads all 32 layer entries (sequential, cache-friendly) and
-/// partitions them into the prefix before l_min and the visible range.
-uint sum_layer_range(uint slot, uint dir, uint l_min, uint l_max,
-                     out uint prefix_to_lmin) {
-    uint base   = slot * 776 + 8 + dir * 128;
-    uint total  = 0;
-    uint prefix = 0;
+/// dir_layer_pfx[d][l] = sum of layers [0, l) for direction d.
+/// visible count   = pfx[l_max + 1] - pfx[l_min].
+/// prefix_to_lmin  = pfx[l_min].
+uint read_layer_range(uint slot, uint dir, uint l_min, uint l_max,
+                      out uint prefix_to_lmin) {
+    uint pfx_base = slot * QUAD_RANGE_BYTES + QUAD_RANGE_COUNTS_OFFSET
+                  + dir * 132;
 
-    for (uint l = 0; l < 32; l++) {
-        uint count = quad_range_buf.Load(base + l * 4);
+    uint pfx_lo = quad_range_buf.Load(pfx_base + l_min * 4);
+    uint pfx_hi = quad_range_buf.Load(pfx_base + (l_max + 1) * 4);
 
-        if (l < l_min) {
-            prefix += count;
-        }
-        else if (l <= l_max) {
-            total += count;
-        }
-    }
-
-    prefix_to_lmin = prefix;
-    return total;
+    prefix_to_lmin = pfx_lo;
+    return pfx_hi - pfx_lo;
 }
 
 /// Test whether all faces in a direction are back-facing relative to
@@ -125,30 +113,21 @@ void main(uint3 gid : SV_DispatchThreadID) {
     }
 
     // Read quad range base offset.
-    // QuadRange: [buffer_index(4), base_offset(4), dir_layer_counts...]
-    uint base_offset = quad_range_buf.Load(slot * 776 + 4);
+    uint base_offset = quad_range_buf.Load(slot * QUAD_RANGE_BYTES + 4);
 
-    // Compute per-direction quad counts and prefix sums. Quads are
-    // stored direction-ordered, so prefix[d] gives the offset from
-    // base_offset to the start of direction d's quads.
+    // Read precomputed per-direction quad counts and compute running
+    // prefix for the direction-ordered layout.
     float3 origin = float3(offset_raw);
     uint dir_count[6];
-    uint dir_prefix[6];
+    uint dir_pfx[6];
     uint running         = 0;
     uint backface_total  = 0;
     uint layercull_total = 0;
 
     for (uint d = 0; d < 6; d++) {
-        dir_prefix[d] = running;
-        dir_count[d]  = sum_direction_quads(slot, d);
+        dir_pfx[d]   = running;
+        dir_count[d] = read_direction_quads(slot, d);
         running += dir_count[d];
-    }
-
-    // Guard against a 1-frame desync between restored quad_count and
-    // GPU-written dir_layer_counts during in-flight rebuilds. If the
-    // totals disagree the prefix sums are stale -- skip this chunk.
-    if (running != quad_count) {
-        return;
     }
 
     // Accumulate chunk and quad visibility counters.
@@ -178,9 +157,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
             continue;
         }
 
-        // Sum only the visible layers and get the prefix offset.
+        // Read visible count and prefix from precomputed sums.
         uint prefix_to_lmin;
-        uint visible_count = sum_layer_range(
+        uint visible_count = read_layer_range(
             slot, d, l_min, l_max, prefix_to_lmin
         );
 
@@ -201,7 +180,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
         dst_draws.Store(mdi_offset +  4, visible_count);   // instance_count
         dst_draws.Store(mdi_offset +  8, 0);               // first_vertex
         dst_draws.Store(mdi_offset + 12,                    // first_instance
-            base_offset + dir_prefix[d] + prefix_to_lmin);
+            base_offset + dir_pfx[d] + prefix_to_lmin);
 
         // Write per-draw metadata with the actual direction.
         uint dd_offset = draw_index * 8;

@@ -118,10 +118,11 @@ void main(uint3 lid : SV_GroupThreadID,
     // Thread 0 writes the layer count and sub-mask contributions.
     if (row == 0) {
         // QuadRange layout: buffer_index(4) + base_offset(4) +
-        // dir_layer_counts[6][32] (768 bytes).
-        // Offset to dir_layer_counts[dir][layer]:
-        uint range_offset = push.slot_index * 776 + 8
-                          + dir * 128 + layer * 4;
+        // dir_prefix[6] (24 bytes) + dir_layer_pfx[6][33] (792 bytes).
+        // Write raw counts into dir_layer_pfx[dir][layer]:
+        uint range_offset = push.slot_index * QUAD_RANGE_BYTES
+                          + QUAD_RANGE_COUNTS_OFFSET
+                          + dir * 132 + layer * 4;
 
         quad_range_buf.Store(range_offset, layer_quad_count);
 

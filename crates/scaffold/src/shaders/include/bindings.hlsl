@@ -14,11 +14,17 @@
 //     push constants    : BuildPush { slot_index, base_offset }
 //
 //   Build alloc:
-//     set 0, binding 0 : bump_state_buf     (read-write storage)
-//     set 0, binding 1 : build_batch_buf    (read-only storage)
-//     set 0, binding 2 : chunk_meta_buf     (read-write storage)
-//     set 0, binding 3 : quad_range_buf     (read-write storage)
-//     push constants    : AllocPush { batch_size, capacity }
+//     set 0, binding 0 : bump_state_buf          (read-write storage)
+//     set 0, binding 1 : build_batch_buf          (read-only storage)
+//     set 0, binding 2 : chunk_meta_buf           (read-write storage)
+//     set 0, binding 3 : quad_range_buf           (read-write storage)
+//     set 0, binding 4 : quad_free_list_buf       (read-write storage)
+//     set 0, binding 5 : material_range_buf       (read-write storage)
+//     set 0, binding 6 : material_bump_state_buf  (read-write storage)
+//     set 0, binding 7 : material_free_list_buf   (read-write storage)
+//     set 0, binding 8 : material_dispatch_buf    (read-write storage)
+//     push constants    : AllocPush { batch_size, quad_capacity,
+//                           material_capacity, material_segment_units }
 //
 //   Build write:
 //     set 0, binding 0 : occupancy_buf      (read-only storage)
@@ -86,15 +92,38 @@ struct ChunkMeta {
     uint sub_mask_hi;   // bits 32-63
 };
 
-/// Per-chunk quad range metadata.
-/// dir_layer_counts[d][l] = number of quads for direction d, layer l.
+/// Per-chunk quad range metadata with precomputed prefix sums.
+///
+/// The count pass writes raw dir_layer_counts. The alloc pass
+/// overwrites them with prefix sums:
+///   dir_prefix[d]       = total quads for direction d.
+///   dir_layer_pfx[d][l] = sum of layers [0, l) for direction d.
+///   dir_layer_pfx[d][32] = total for direction d (same as dir_prefix[d]).
+///
 /// base_offset = starting quad index in the quad buffer.
 /// buffer_index = which segment (Phase 4, always 0 for now).
+///
+/// Layout (824 bytes):
+///   buffer_index   : u32           //   4 B, offset 0
+///   base_offset    : u32           //   4 B, offset 4
+///   dir_prefix     : [u32; 6]      //  24 B, offset 8
+///   dir_layer_pfx  : [[u32; 33]; 6]// 792 B, offset 32
 struct QuadRange {
     uint buffer_index;
     uint base_offset;
-    uint dir_layer_counts[6][32];
+    uint dir_prefix[6];
+    uint dir_layer_pfx[6][33];
 };
+
+/// Size in bytes of the QuadRange struct (before prefix sums are
+/// computed, the count pass writes raw counts into a smaller region
+/// starting at offset 32).
+static const uint QUAD_RANGE_BYTES = 824;
+
+/// Byte offset into QuadRange where the count pass writes raw
+/// dir_layer_counts (6 directions x 32 layers x 4 bytes = 768 B).
+/// These are overwritten by the alloc pass with prefix sums.
+static const uint QUAD_RANGE_COUNTS_OFFSET = 32;
 
 /// Camera uniform.
 struct Camera {

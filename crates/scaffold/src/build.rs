@@ -231,9 +231,13 @@ impl BuildCountPipeline {
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct AllocPush {
     /// Number of chunks in this build batch.
-    pub batch_size : u32,
+    pub batch_size             : u32,
     /// Total quad buffer capacity in quads.
-    pub capacity   : u32,
+    pub quad_capacity          : u32,
+    /// Total material capacity in sub-block units across all segments.
+    pub material_capacity      : u32,
+    /// Sub-block units per material segment (power of two).
+    pub material_segment_units : u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +334,71 @@ impl BuildAllocPipeline {
                         },
                         count : None,
                     },
+                    // binding 4: quad_free_list_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 4,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 5: material_range_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 5,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 6: material_bump_state_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 6,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 7: material_free_list_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 7,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 8: material_dispatch_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 8,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
                 ],
             },
         );
@@ -338,7 +407,7 @@ impl BuildAllocPipeline {
             &PipelineLayoutDescriptor {
                 label              : Some("build_alloc_pl"),
                 bind_group_layouts : &[Some(&bg_layout)],
-                immediate_size     : 8,
+                immediate_size     : 16,
             },
         );
 
@@ -360,18 +429,28 @@ impl BuildAllocPipeline {
     ///
     /// # Arguments
     ///
-    /// * `device`          - The GPU device.
-    /// * `bump_state_buf`  - GPU-side bump pointer (read-write).
-    /// * `build_batch_buf` - Batch slot indices (read-only).
-    /// * `chunk_meta_buf`  - Per-chunk metadata (read-write, for overflow flag).
-    /// * `quad_range_buf`  - Per-chunk quad range data (read-write).
+    /// * `device`                 - The GPU device.
+    /// * `bump_state_buf`         - GPU-side quad bump pointer (read-write).
+    /// * `build_batch_buf`        - Batch slot indices (read-only).
+    /// * `chunk_meta_buf`         - Per-chunk metadata (read-write).
+    /// * `quad_range_buf`         - Per-chunk quad range data (read-write).
+    /// * `quad_free_list_buf`     - Quad free list (read-write).
+    /// * `material_range_buf`     - Per-chunk material range (read-write).
+    /// * `material_bump_state_buf`- Material bump pointer (read-write).
+    /// * `material_free_list_buf` - Material free list (read-write).
+    /// * `material_dispatch_buf`  - Indirect dispatch args for material pack (read-write).
     pub fn create_bind_group(
         &self,
-        device          : &Device,
-        bump_state_buf  : &Buffer,
-        build_batch_buf : &Buffer,
-        chunk_meta_buf  : &Buffer,
-        quad_range_buf  : &Buffer,
+        device                  : &Device,
+        bump_state_buf          : &Buffer,
+        build_batch_buf         : &Buffer,
+        chunk_meta_buf          : &Buffer,
+        quad_range_buf          : &Buffer,
+        quad_free_list_buf      : &Buffer,
+        material_range_buf      : &Buffer,
+        material_bump_state_buf : &Buffer,
+        material_free_list_buf  : &Buffer,
+        material_dispatch_buf   : &Buffer,
     ) -> BindGroup
     {
         device.create_bind_group(&BindGroupDescriptor {
@@ -393,6 +472,26 @@ impl BuildAllocPipeline {
                 BindGroupEntry {
                     binding  : 3,
                     resource : quad_range_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 4,
+                    resource : quad_free_list_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 5,
+                    resource : material_range_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 6,
+                    resource : material_bump_state_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 7,
+                    resource : material_free_list_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 8,
+                    resource : material_dispatch_buf.as_entire_binding(),
                 },
             ],
         })

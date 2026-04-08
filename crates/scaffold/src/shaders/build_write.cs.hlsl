@@ -54,31 +54,27 @@ void main(uint3 lid : SV_GroupThreadID,
 
     // Thread 0 runs the merge and writes quads.
     if (row == 0) {
-        // Compute the write offset for this (direction, layer) bucket.
-        // The CPU has prefix-summed dir_layer_counts and stored the
-        // result in base_offset. We need the offset within the chunk's
-        // range for this specific (dir, layer).
-        //
-        // QuadRange layout: buffer_index(4) + base_offset(4) +
-        //   dir_layer_counts[6][32].
-        // We sum counts for all prior (dir, layer) pairs.
-        uint range_base = push.slot_index * 776 + 8;
+        // Look up the write offset from precomputed prefix sums.
+        // dir_layer_pfx[d][l] = exclusive prefix (quads before layer l
+        // in direction d). dir_prefix[d] = total quads for direction d.
+        // The overall prefix for (dir, layer) is:
+        //   sum(dir_prefix[0..dir]) + dir_layer_pfx[dir][layer]
+        uint qr_base = push.slot_index * QUAD_RANGE_BYTES;
+
+        // Sum dir_prefix for all directions before this one.
+        uint dir_pfx_base = qr_base + 8;
         uint prefix = 0;
 
-        // Sum all directions before this one.
         for (uint d = 0; d < dir; d++) {
-            for (uint l = 0; l < 32; l++) {
-                prefix += quad_range_buf.Load(range_base + d * 128 + l * 4);
-            }
+            prefix += quad_range_buf.Load(dir_pfx_base + d * 4);
         }
 
-        // Sum all layers before this one within the current direction.
-        for (uint l = 0; l < layer; l++) {
-            prefix += quad_range_buf.Load(range_base + dir * 128 + l * 4);
-        }
+        // Add the layer prefix within this direction.
+        uint layer_pfx_base = qr_base + QUAD_RANGE_COUNTS_OFFSET
+                            + dir * 132;
+        prefix += quad_range_buf.Load(layer_pfx_base + layer * 4);
 
-        // The alloc pass wrote base_offset into quad_range_buf.
-        uint base = quad_range_buf.Load(push.slot_index * 776 + 4);
+        uint base = quad_range_buf.Load(qr_base + 4);
         uint write_offset = base + prefix;
 
         greedy_merge(layer, dir, quad_buf, write_offset);

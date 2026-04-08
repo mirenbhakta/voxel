@@ -1,9 +1,8 @@
 //! GPU world manager for chunk lifecycle and rendering.
 //!
-//! Manages shared slot-indexed GPU buffers, a contiguous quad allocator,
-//! and per-chunk state. Handles occupancy upload, build dispatch, quad
-//! count readback, allocation management, frustum culling, and draw call
-//! emission.
+//! Manages shared slot-indexed GPU buffers and per-chunk state. Handles
+//! occupancy upload, build dispatch, quad count readback, allocation
+//! management, frustum culling, and draw call emission.
 //!
 //! The buffer layout uses a single set of shared buffers indexed by slot
 //! rather than per-chunk GPU resources. The build shader reads occupancy
@@ -53,8 +52,8 @@ const OCC_WORDS_PER_SLOT: u32 = 1024;
 const BOUNDARY_WORDS_PER_SLOT: u32 = 192;
 
 /// Bytes per quad range entry. Layout: buffer_index (4) + base_offset (4)
-/// + dir_layer_counts (6 x 32 x 4 = 768) = 776 bytes.
-const QUAD_RANGE_BYTES: u32 = 776;
+/// + dir_prefix (6 x 4 = 24) + dir_layer_pfx (6 x 33 x 4 = 792) = 824.
+const QUAD_RANGE_BYTES: u32 = 824;
 
 /// Bytes per chunk metadata entry (quad_count, flags, reserved, reserved).
 const CHUNK_META_BYTES: u32 = 16;
@@ -65,6 +64,21 @@ const DRAW_DATA_BYTES: u32 = 8;
 /// Maximum output draws from the cull shader. Each chunk can produce up
 /// to 6 MDI entries (one per front-facing direction).
 const MAX_DRAWS: u32 = MAX_CHUNKS * 6;
+
+/// Maximum entries in the quad free list. One entry per chunk is
+/// sufficient since each chunk produces at most one contiguous range.
+const QUAD_FREE_LIST_MAX: u32 = MAX_CHUNKS;
+
+/// Bytes for the quad free list buffer. Layout: count(4) + entries,
+/// where each entry is (offset: u32, size: u32) = 8 bytes.
+const QUAD_FREE_LIST_BYTES: u64 = 4 + (QUAD_FREE_LIST_MAX as u64) * 8;
+
+/// Maximum entries in the material free list.
+const MATERIAL_FREE_LIST_MAX: u32 = MAX_CHUNKS;
+
+/// Bytes for the material free list buffer.
+const MATERIAL_FREE_LIST_BYTES: u64 =
+    4 + (MATERIAL_FREE_LIST_MAX as u64) * 8;
 
 /// Conservative upper bound on quads per chunk. Used for capacity
 /// estimation when throttling chunk loads. Derived from the worst-case
@@ -97,14 +111,14 @@ const DIR_NEG_Z: usize = 5 * SLICE_WORDS;
 
 /// Maximum number of chunk builds that can be in flight at once.
 ///
-/// Determines the size of the async build staging buffer. The staging
-/// buffer holds one full `ChunkMeta` (16 bytes: quad count + flags +
-/// sub_mask) per in-flight build.
+/// Determines the size of the async build staging buffer. Each entry
+/// holds a ChunkMeta (16 bytes), base_offset (4 bytes), and
+/// material_range (16 bytes) per in-flight build.
 const MAX_BUILDS_IN_FLIGHT: u32 = 64;
 
-/// Bytes per entry in the build staging buffer. One full ChunkMeta:
-/// quad_count(4) + flags(4) + sub_mask_lo(4) + sub_mask_hi(4).
-const BUILD_STAGING_ENTRY_BYTES: u32 = 16;
+/// Bytes per entry in the build staging buffer. Layout:
+/// ChunkMeta(16) + base_offset(4) + material_range(16) = 36.
+const BUILD_STAGING_ENTRY_BYTES: u32 = 36;
 
 /// Bytes per entry in material_range_buf.
 const MATERIAL_RANGE_BYTES: u32 = 16;
@@ -202,183 +216,6 @@ pub fn build_material_tables(
 }
 
 // ---------------------------------------------------------------------------
-// ContiguousAllocator
-// ---------------------------------------------------------------------------
-
-/// Contiguous range allocator for the quad buffer.
-///
-/// Manages a single buffer as a bump allocator with a coalescing free
-/// list. New allocations advance the bump pointer when the free list
-/// cannot satisfy the request. Freed ranges go to the free list and
-/// are reused first-fit, coalescing with adjacent free ranges to reduce
-/// fragmentation.
-struct ContiguousAllocator {
-    /// High-water mark in the quad buffer (next bump allocation offset).
-    bump_offset : u32,
-    /// Free ranges sorted by offset for coalescing. Each entry is
-    /// (offset, size) in quads.
-    free_list   : Vec<(u32, u32)>,
-    /// Total capacity in quads.
-    capacity    : u32,
-}
-
-// --- ContiguousAllocator ---
-
-impl ContiguousAllocator {
-    /// Create a new allocator with the given capacity.
-    fn new(capacity: u32) -> Self {
-        ContiguousAllocator {
-            bump_offset : 0,
-            free_list   : Vec::new(),
-            capacity    : capacity,
-        }
-    }
-
-    /// Allocate a contiguous range of `size` quads.
-    ///
-    /// Returns the offset into the quad buffer on success, or `None` if
-    /// the allocator cannot satisfy the request. Tries the free list
-    /// first (first-fit), then falls back to the bump pointer.
-    fn alloc(&mut self, size: u32) -> Option<u32> {
-        if size == 0 {
-            return Some(0);
-        }
-
-        // First-fit search through free list.
-        for i in 0..self.free_list.len() {
-            let (offset, free_size) = self.free_list[i];
-
-            if free_size >= size {
-                if free_size == size {
-                    self.free_list.remove(i);
-                }
-                else {
-                    // Shrink the free range from the front.
-                    self.free_list[i] = (offset + size, free_size - size);
-                }
-
-                return Some(offset);
-            }
-        }
-
-        // Bump allocation.
-        let remaining = self.capacity - self.bump_offset;
-
-        if remaining >= size {
-            let offset = self.bump_offset;
-            self.bump_offset += size;
-            return Some(offset);
-        }
-
-        None
-    }
-
-    /// Free a contiguous range starting at `offset` with the given `size`.
-    ///
-    /// Coalesces with adjacent free ranges to prevent fragmentation.
-    /// If the freed range is at the bump pointer, the pointer is
-    /// retracted instead of adding to the free list.
-    fn free(&mut self, offset: u32, size: u32) {
-        if size == 0 {
-            return;
-        }
-
-        let end = offset + size;
-
-        // If this range is at the top of the bump region, retract.
-        if end == self.bump_offset {
-            self.bump_offset = offset;
-
-            // Check if any free list entry now abuts the new bump pointer.
-            self.coalesce_bump();
-            return;
-        }
-
-        // Insert into the free list maintaining sort order by offset,
-        // then coalesce with neighbors.
-        let insert_pos = self.free_list
-            .partition_point(|&(o, _)| o < offset);
-
-        self.free_list.insert(insert_pos, (offset, size));
-        self.coalesce_at(insert_pos);
-    }
-
-    /// Returns the current bump pointer offset.
-    fn bump_offset(&self) -> u32 {
-        self.bump_offset
-    }
-
-    /// Set the bump pointer offset directly for GPU synchronization.
-    ///
-    /// Called after `process_build_feedback` reconstructs the post-alloc
-    /// bump value from the GPU-side allocation results.
-    fn set_bump_offset(&mut self, offset: u32) {
-        self.bump_offset = offset;
-    }
-
-    /// Returns the number of free units available (free list + remaining
-    /// bump space).
-    fn free_quads(&self) -> u32 {
-        let free_list_total: u32 = self.free_list
-            .iter()
-            .map(|&(_, size)| size)
-            .sum();
-
-        free_list_total + (self.capacity - self.bump_offset)
-    }
-
-    /// Returns the total capacity in allocation units.
-    fn capacity(&self) -> u32 {
-        self.capacity
-    }
-
-    /// Extend the capacity by `extra` units. The new units are available
-    /// at the end of the bump region.
-    fn grow(&mut self, extra: u32) {
-        self.capacity += extra;
-    }
-
-    /// Coalesce the free list entry at `idx` with its neighbors.
-    fn coalesce_at(&mut self, idx: usize) {
-        // Merge with the entry after idx, if adjacent.
-        if idx + 1 < self.free_list.len() {
-            let (off_a, size_a) = self.free_list[idx];
-            let (off_b, size_b) = self.free_list[idx + 1];
-
-            if off_a + size_a == off_b {
-                self.free_list[idx] = (off_a, size_a + size_b);
-                self.free_list.remove(idx + 1);
-            }
-        }
-
-        // Merge with the entry before idx, if adjacent.
-        if idx > 0 {
-            let (off_prev, size_prev) = self.free_list[idx - 1];
-            let (off_cur, size_cur)   = self.free_list[idx];
-
-            if off_prev + size_prev == off_cur {
-                self.free_list[idx - 1] = (off_prev, size_prev + size_cur);
-                self.free_list.remove(idx);
-            }
-        }
-    }
-
-    /// Retract the bump pointer by absorbing any free list entry that
-    /// now abuts it from below.
-    fn coalesce_bump(&mut self) {
-        while let Some(&(offset, size)) = self.free_list.last() {
-            if offset + size == self.bump_offset {
-                self.bump_offset = offset;
-                self.free_list.pop();
-            }
-            else {
-                break;
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // GpuChunk
 // ---------------------------------------------------------------------------
 
@@ -417,7 +254,7 @@ struct PendingBuild {
     pos           : ChunkPos,
     /// Slot index in the shared buffers.
     slot          : u32,
-    /// Index into the build staging buffer (read at offset * 4).
+    /// Index into the build staging buffer.
     staging_index : u32,
 }
 
@@ -467,7 +304,7 @@ pub struct RenderStats {
 
 /// Manages GPU resources for all loaded chunks.
 ///
-/// Owns shared slot-indexed buffers and a contiguous quad allocator.
+/// Owns shared slot-indexed buffers with GPU-side bump allocation.
 /// The build and cull compute pipelines are created externally (in
 /// `build.rs` and `cull.rs`) and referenced here for dispatching.
 ///
@@ -506,6 +343,17 @@ pub struct GpuWorld {
     bump_state_buf       : Buffer,
     /// Slot indices for the current build batch.
     build_batch_buf      : Buffer,
+    /// GPU-visible free list for quad range reuse. Layout: count(4) +
+    /// (offset, size) pairs. CPU pushes freed ranges before dispatch;
+    /// the alloc pass scans first-fit before bump fallback.
+    quad_free_list_buf   : Buffer,
+    /// GPU-side persistent material bump pointer (single u32).
+    material_bump_state_buf : Buffer,
+    /// GPU-visible free list for material sub-block reuse.
+    material_free_list_buf  : Buffer,
+    /// Indirect dispatch args for material pack, written by the alloc
+    /// pass. Layout: (x, y, z) per batch entry, 12 bytes each.
+    material_dispatch_buf   : Buffer,
 
     // -- Cull/draw buffers --
 
@@ -565,10 +413,8 @@ pub struct GpuWorld {
     /// The texture sampler.
     tex_sampler          : wgpu::Sampler,
 
-    // -- Allocator and chunk state --
+    // -- Chunk state --
 
-    /// Contiguous quad buffer allocator.
-    allocator            : ContiguousAllocator,
     /// Cached material buffer generation for bind group rebuild detection.
     material_gen         : u64,
     /// Free slot indices (LIFO stack).
@@ -580,7 +426,7 @@ pub struct GpuWorld {
 
     // -- Build synchronization (async) --
 
-    /// Staging buffer for async readback of quad counts after count passes.
+    /// Staging buffer for async readback of alloc results after build passes.
     build_staging        : Buffer,
     /// Whether an async build staging map is in flight.
     build_pending        : bool,
@@ -588,10 +434,13 @@ pub struct GpuWorld {
     build_ready          : Arc<AtomicBool>,
     /// Chunks awaiting feedback processing (build in flight).
     pending_builds       : Vec<PendingBuild>,
-    /// Bump offset before the last dispatch_build call. Used by
-    /// process_build_feedback to reconstruct per-chunk base offsets
-    /// from the prefix sum of returned quad counts.
-    pre_dispatch_bump    : u32,
+    /// CPU-side accumulator for freed quad ranges. Pushed to
+    /// `quad_free_list_buf` at the start of each `dispatch_build`.
+    /// Flat layout: [offset0, size0, offset1, size1, ...].
+    quad_free_list       : Vec<u32>,
+    /// CPU-side accumulator for freed material sub-block ranges.
+    /// Same flat layout as `quad_free_list`.
+    material_free_list   : Vec<u32>,
 
     // -- Visible count async readback --
 
@@ -712,6 +561,7 @@ impl GpuWorld {
             size               : u64::from(MAX_CHUNKS)
                                * u64::from(MATERIAL_RANGE_BYTES),
             usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_SRC
                                | BufferUsages::COPY_DST,
             mapped_at_creation : false,
         });
@@ -972,6 +822,7 @@ impl GpuWorld {
         //   binding 1: build_batch_buf    (read-only storage)
         //   binding 2: chunk_meta_buf     (read-write storage)
         //   binding 3: quad_range_buf     (read-write storage)
+        //   binding 4: quad_free_list_buf (read-write storage)
 
         let bump_state_buf = device.create_buffer(&BufferDescriptor {
             label              : Some("bump_state_buf"),
@@ -989,6 +840,40 @@ impl GpuWorld {
             mapped_at_creation : false,
         });
 
+        let quad_free_list_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("quad_free_list_buf"),
+            size               : QUAD_FREE_LIST_BYTES,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let material_bump_state_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("material_bump_state_buf"),
+            size               : 4,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let material_free_list_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("material_free_list_buf"),
+            size               : MATERIAL_FREE_LIST_BYTES,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        // Indirect dispatch args for material pack: (x, y, z) per
+        // batch entry, 12 bytes each.
+        let material_dispatch_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("material_dispatch_buf"),
+            size               : u64::from(MAX_BUILDS_IN_FLIGHT) * 12,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::INDIRECT,
+            mapped_at_creation : false,
+        });
+
         let build_alloc_pipeline = BuildAllocPipeline::new(device);
 
         let build_alloc_bg = build_alloc_pipeline.create_bind_group(
@@ -997,6 +882,11 @@ impl GpuWorld {
             &build_batch_buf,
             &chunk_meta_buf,
             &quad_range_buf,
+            &quad_free_list_buf,
+            &material_range_buf,
+            &material_bump_state_buf,
+            &material_free_list_buf,
+            &material_dispatch_buf,
         );
 
         // -- Build write pipeline + bind group (pass 3) --
@@ -1078,6 +968,10 @@ impl GpuWorld {
             material_staging_buf   : material_staging_buf,
             bump_state_buf         : bump_state_buf,
             build_batch_buf        : build_batch_buf,
+            quad_free_list_buf     : quad_free_list_buf,
+            material_bump_state_buf : material_bump_state_buf,
+            material_free_list_buf  : material_free_list_buf,
+            material_dispatch_buf   : material_dispatch_buf,
             dst_indirect_buf       : dst_indirect_buf,
             draw_data_buf          : draw_data_buf,
             draw_count_buf         : draw_count_buf,
@@ -1102,7 +996,6 @@ impl GpuWorld {
             face_texture_buf       : face_texture_buf,
             texture_view           : texture_view,
             tex_sampler            : tex_sampler,
-            allocator              : ContiguousAllocator::new(QUAD_BUF_QUADS),
             material_gen           : material_gen,
             free_slots             : free_slots,
             chunks                 : HashMap::new(),
@@ -1111,7 +1004,8 @@ impl GpuWorld {
             build_pending          : false,
             build_ready            : Arc::new(AtomicBool::new(false)),
             pending_builds         : Vec::new(),
-            pre_dispatch_bump      : 0,
+            quad_free_list         : Vec::new(),
+            material_free_list     : Vec::new(),
             count_staging          : count_staging,
             count_ready            : Arc::new(AtomicBool::new(false)),
             count_pending          : false,
@@ -1177,18 +1071,19 @@ impl GpuWorld {
 
     /// Remove a chunk and release its GPU resources.
     ///
-    /// Frees the slot and quad allocation. Zeros the chunk metadata so
-    /// the cull shader stops processing this slot.
+    /// Frees the slot and pushes quad and material ranges to the GPU
+    /// free lists. Zeros the chunk metadata so the cull shader stops
+    /// processing this slot.
     pub fn remove(&mut self, queue: &Queue, pos: ChunkPos) {
         if let Some(chunk) = self.chunks.remove(&pos) {
             if chunk.quad_alloc > 0 {
-                self.allocator.free(chunk.quad_offset, chunk.quad_alloc);
+                self.quad_free_list.push(chunk.quad_offset);
+                self.quad_free_list.push(chunk.quad_alloc);
             }
 
             if chunk.material_alloc > 0 {
-                self.material_bufs.free(
-                    chunk.material_offset, chunk.material_alloc,
-                );
+                self.material_free_list.push(chunk.material_offset);
+                self.material_free_list.push(chunk.material_alloc);
             }
 
             self.free_slot(chunk.slot);
@@ -1257,9 +1152,17 @@ impl GpuWorld {
         self.free_slots.len() as u32
     }
 
-    /// Returns the number of free quads in the allocator.
+    /// Returns the number of free quads in the quad buffer.
+    ///
+    /// Derived from the sum of per-chunk allocations. The GPU-side
+    /// allocator tracks the actual bump pointer and free list, so this
+    /// is an approximation sufficient for load throttling.
     pub fn free_quads(&self) -> u32 {
-        self.allocator.free_quads()
+        let used: u32 = self.chunks.values()
+            .map(|c| c.quad_alloc)
+            .sum();
+
+        QUAD_BUF_QUADS.saturating_sub(used)
     }
 
     /// Dispatch count, alloc, and write passes for a batch of dirty chunks.
@@ -1321,14 +1224,60 @@ impl GpuWorld {
             bytemuck::cast_slice(&slots),
         );
 
-        // Sync GPU bump pointer with CPU allocator state. This
-        // accounts for any frees (chunk unloads) since the last build.
-        self.pre_dispatch_bump = self.allocator.bump_offset();
-        queue.write_buffer(
-            &self.bump_state_buf,
-            0,
-            bytemuck::bytes_of(&self.pre_dispatch_bump),
-        );
+        // Upload accumulated quad free list to the GPU buffer.
+        // Layout: [count(4), entries...] where each entry is
+        // (offset: u32, size: u32) = 8 bytes. The CPU-side vec
+        // stores these flat: [off0, sz0, off1, sz1, ...].
+        {
+            let entry_count = (self.quad_free_list.len() / 2)
+                .min(QUAD_FREE_LIST_MAX as usize) as u32;
+
+            queue.write_buffer(
+                &self.quad_free_list_buf,
+                0,
+                bytemuck::bytes_of(&entry_count),
+            );
+
+            if entry_count > 0 {
+                let word_count = entry_count as usize * 2;
+
+                queue.write_buffer(
+                    &self.quad_free_list_buf,
+                    4,
+                    bytemuck::cast_slice(
+                        &self.quad_free_list[..word_count],
+                    ),
+                );
+            }
+
+            self.quad_free_list.clear();
+        }
+
+        // Upload accumulated material free list to the GPU buffer.
+        {
+            let entry_count = (self.material_free_list.len() / 2)
+                .min(MATERIAL_FREE_LIST_MAX as usize) as u32;
+
+            queue.write_buffer(
+                &self.material_free_list_buf,
+                0,
+                bytemuck::bytes_of(&entry_count),
+            );
+
+            if entry_count > 0 {
+                let word_count = entry_count as usize * 2;
+
+                queue.write_buffer(
+                    &self.material_free_list_buf,
+                    4,
+                    bytemuck::cast_slice(
+                        &self.material_free_list[..word_count],
+                    ),
+                );
+            }
+
+            self.material_free_list.clear();
+        }
 
         // Upload neighbor boundary slices for chunks being built.
         for &pos in &to_build {
@@ -1418,8 +1367,10 @@ impl GpuWorld {
             pass.set_bind_group(0, &self.build_alloc_bg, &[]);
 
             let push = AllocPush {
-                batch_size : batch_size as u32,
-                capacity   : self.allocator.capacity(),
+                batch_size             : batch_size as u32,
+                quad_capacity          : QUAD_BUF_QUADS,
+                material_capacity      : self.material_bufs.capacity(),
+                material_segment_units : MATERIAL_SEGMENT_UNITS,
             };
             pass.set_immediates(
                 0, bytemuck::bytes_of(&push),
@@ -1428,16 +1379,39 @@ impl GpuWorld {
             pass.dispatch_workgroups(1, 1, 1);
         }
 
-        // Copy metadata to staging (captures quad_count + flags +
-        // sub_mask written by count, and flags potentially set by alloc).
+        // Copy alloc results to staging for CPU readback:
+        //   [0..16)  ChunkMeta  (quad_count + flags + sub_mask)
+        //   [16..20) base_offset from quad_range_buf
+        //   [20..36) material_range from material_range_buf
         for pb in &self.pending_builds {
+            let staging_base = u64::from(pb.staging_index)
+                             * u64::from(BUILD_STAGING_ENTRY_BYTES);
+
+            // ChunkMeta (16 bytes).
             encoder.copy_buffer_to_buffer(
                 &self.chunk_meta_buf,
                 u64::from(pb.slot) * u64::from(CHUNK_META_BYTES),
                 &self.build_staging,
-                u64::from(pb.staging_index)
-                    * u64::from(BUILD_STAGING_ENTRY_BYTES),
-                u64::from(BUILD_STAGING_ENTRY_BYTES),
+                staging_base,
+                u64::from(CHUNK_META_BYTES),
+            );
+
+            // base_offset (4 bytes at offset 4 within quad_range entry).
+            encoder.copy_buffer_to_buffer(
+                &self.quad_range_buf,
+                u64::from(pb.slot) * u64::from(QUAD_RANGE_BYTES) + 4,
+                &self.build_staging,
+                staging_base + 16,
+                4,
+            );
+
+            // material_range (16 bytes).
+            encoder.copy_buffer_to_buffer(
+                &self.material_range_buf,
+                u64::from(pb.slot) * u64::from(MATERIAL_RANGE_BYTES),
+                &self.build_staging,
+                staging_base + 20,
+                u64::from(MATERIAL_RANGE_BYTES),
             );
         }
 
@@ -1464,30 +1438,34 @@ impl GpuWorld {
             pass.dispatch_workgroups(32, 6, 1);
         }
 
-        queue.submit(Some(encoder.finish()));
+        // -- Pass 4: material pack (per chunk, indirect dispatch) --
 
-        // The build passes wrote new quad_count and base_offset into
-        // GPU buffers. The cull shader runs later this frame and must
-        // see the old values until process_build_feedback commits the
-        // new ones next frame.
-        //   - New chunks (quad_count = 0): cull shader skips them.
-        //   - Existing chunks: render the old quads one more frame.
-        for pb in &self.pending_builds {
-            let (qc, bo) = self.chunks.get(&pb.pos)
-                .map_or((0u32, 0u32), |c| (c.quad_count, c.quad_offset));
-
-            queue.write_buffer(
-                &self.chunk_meta_buf,
-                u64::from(pb.slot) * u64::from(CHUNK_META_BYTES),
-                bytemuck::bytes_of(&qc),
+        for (i, pb) in self.pending_builds.iter().enumerate() {
+            let mut pass = encoder.begin_compute_pass(
+                &ComputePassDescriptor {
+                    label            : Some("material_pack"),
+                    timestamp_writes : None,
+                },
             );
 
-            queue.write_buffer(
-                &self.quad_range_buf,
-                u64::from(pb.slot) * u64::from(QUAD_RANGE_BYTES) + 4,
-                bytemuck::bytes_of(&bo),
+            pass.set_pipeline(
+                self.material_pack_pipeline.pipeline(),
+            );
+            pass.set_bind_group(0, &self.material_pack_bg, &[]);
+            pass.set_bind_group(1, &self.material_array_rw_bg, &[]);
+
+            let push = [i as u32, pb.slot];
+            pass.set_immediates(
+                0, bytemuck::cast_slice(&push),
+            );
+
+            pass.dispatch_workgroups_indirect(
+                &self.material_dispatch_buf,
+                (i as u64) * 12,
             );
         }
+
+        queue.submit(Some(encoder.finish()));
 
         // Mark built chunks: clear dirty, set in-flight.
         for pb in &self.pending_builds {
@@ -1516,22 +1494,21 @@ impl GpuWorld {
         });
     }
 
-    /// Harvest async build results and commit chunk visibility.
+    /// Harvest async build results and update CPU-side chunk bookkeeping.
     ///
-    /// Reads quad counts, flags, and sub-block masks from the staging
-    /// buffer mapped by the previous frame's
-    /// [`dispatch_build`](Self::dispatch_build). The GPU already
-    /// allocated quad ranges and wrote quad descriptors; this method
-    /// reconstructs base offsets (prefix sum of quad counts from the
-    /// known pre-dispatch bump value), handles material allocation,
-    /// and writes final metadata to GPU buffers so the cull shader
-    /// sees the new chunks.
+    /// Reads alloc results (quad count, flags, sub-block mask, base
+    /// offset, and material range) from the staging buffer mapped by
+    /// the previous frame's [`dispatch_build`](Self::dispatch_build).
+    /// The GPU already allocated ranges, wrote quad descriptors, packed
+    /// materials, and updated all metadata buffers. This method only
+    /// updates CPU-side [`GpuChunk`] state so future removals can push
+    /// correct free list entries.
     ///
     /// Call at the start of the frame, before `dispatch_build`.
     pub fn process_build_feedback(
         &mut self,
         device : &Device,
-        queue  : &Queue,
+        _queue : &Queue,
     )
     {
         if !self.build_pending {
@@ -1545,15 +1522,20 @@ impl GpuWorld {
             return;
         }
 
-        // Read quad counts, flags, and sub-block masks from the mapped
-        // staging buffer. Each entry is a full ChunkMeta (16 bytes).
+        // Read alloc results from the mapped staging buffer. Each 36-byte
+        // entry contains: ChunkMeta(16) + base_offset(4) + material_range(16).
         let pending = std::mem::take(&mut self.pending_builds);
 
         struct BuildResult {
-            quad_count  : u32,
-            flags       : u32,
-            sub_mask_lo : u32,
-            sub_mask_hi : u32,
+            quad_count    : u32,
+            flags         : u32,
+            sub_mask_lo   : u32,
+            sub_mask_hi   : u32,
+            base_offset   : u32,
+            mat_buf_idx   : u32,
+            mat_base_off  : u32,
+            mat_mask_lo   : u32,
+            mat_mask_hi   : u32,
         }
 
         let results: Vec<BuildResult>;
@@ -1567,21 +1549,41 @@ impl GpuWorld {
                         * BUILD_STAGING_ENTRY_BYTES as usize;
 
                 BuildResult {
-                    quad_count  : u32::from_le_bytes([
+                    quad_count   : u32::from_le_bytes([
                         data[off],     data[off + 1],
                         data[off + 2], data[off + 3],
                     ]),
-                    flags       : u32::from_le_bytes([
+                    flags        : u32::from_le_bytes([
                         data[off + 4], data[off + 5],
                         data[off + 6], data[off + 7],
                     ]),
-                    sub_mask_lo : u32::from_le_bytes([
+                    sub_mask_lo  : u32::from_le_bytes([
                         data[off + 8],  data[off + 9],
                         data[off + 10], data[off + 11],
                     ]),
-                    sub_mask_hi : u32::from_le_bytes([
+                    sub_mask_hi  : u32::from_le_bytes([
                         data[off + 12], data[off + 13],
                         data[off + 14], data[off + 15],
+                    ]),
+                    base_offset  : u32::from_le_bytes([
+                        data[off + 16], data[off + 17],
+                        data[off + 18], data[off + 19],
+                    ]),
+                    mat_buf_idx  : u32::from_le_bytes([
+                        data[off + 20], data[off + 21],
+                        data[off + 22], data[off + 23],
+                    ]),
+                    mat_base_off : u32::from_le_bytes([
+                        data[off + 24], data[off + 25],
+                        data[off + 26], data[off + 27],
+                    ]),
+                    mat_mask_lo  : u32::from_le_bytes([
+                        data[off + 28], data[off + 29],
+                        data[off + 30], data[off + 31],
+                    ]),
+                    mat_mask_hi  : u32::from_le_bytes([
+                        data[off + 32], data[off + 33],
+                        data[off + 34], data[off + 35],
                     ]),
                 }
             }).collect();
@@ -1593,48 +1595,8 @@ impl GpuWorld {
         self.build_pending = false;
         self.build_ready.store(false, Ordering::Release);
 
-        // Reconstruct base offsets from the prefix sum of quad counts.
-        // The GPU alloc shader processed chunks in batch order, so the
-        // CPU can replay the same logic: skip 0-count and overflowed
-        // entries, advance a running bump pointer for the rest.
-        struct CommitJob {
-            pos           : ChunkPos,
-            slot          : u32,
-            base_offset   : u32,
-            quad_count    : u32,
-            staging_index : u32,
-            popcount      : u32,
-        }
-
-        let mut commit_jobs: Vec<CommitJob> =
-            Vec::with_capacity(pending.len());
-
-        // Advance the bump pointer to its final value before freeing
-        // old allocations. free() retracts bump_offset when a freed
-        // range abuts it, but the subsequent set_bump_offset would
-        // jump the pointer forward, stranding the retracted range
-        // below the bump with no free-list entry -- a silent leak.
-        // Setting the final value first ensures old allocations
-        // (which end at or below pre_dispatch_bump) can never trigger
-        // retraction into the GPU-allocated region.
-        let final_bump = {
-            let mut b = self.pre_dispatch_bump;
-
-            for br in results.iter() {
-                if br.flags == 0 && br.quad_count > 0 {
-                    b += br.quad_count;
-                }
-            }
-
-            b
-        };
-
-        self.allocator.set_bump_offset(final_bump);
-
-        let mut running_bump = self.pre_dispatch_bump;
-
         for (pb, br) in pending.iter().zip(results.iter()) {
-            // Overflow: the alloc shader set flags = 1. Re-mark dirty.
+            // Overflow: the alloc shader set flags != 0. Re-mark dirty.
             if br.flags != 0 {
                 if let Some(chunk) = self.chunks.get_mut(&pb.pos) {
                     chunk.quad_count      = 0;
@@ -1646,167 +1608,44 @@ impl GpuWorld {
                 continue;
             }
 
-            // Mirror the alloc shader: skip 0-count chunks.
             if br.quad_count == 0 {
                 continue;
             }
 
-            let base_offset = running_bump;
-            running_bump   += br.quad_count;
-
             let popcount = br.sub_mask_lo.count_ones()
                          + br.sub_mask_hi.count_ones();
 
-            // Free the old quad allocation. The GPU always bump-
-            // allocated a new range, so the old one is dead.
+            // Push old ranges to the free lists so future builds can
+            // reuse them. The GPU alloc pass always allocates fresh
+            // ranges, so the old ones are dead.
             let Some(chunk) = self.chunks.get_mut(&pb.pos)
             else {
                 continue;
             };
 
             if chunk.quad_alloc > 0 {
-                self.allocator.free(
-                    chunk.quad_offset, chunk.quad_alloc,
-                );
+                self.quad_free_list.push(chunk.quad_offset);
+                self.quad_free_list.push(chunk.quad_alloc);
             }
 
-            chunk.quad_offset = base_offset;
+            if chunk.material_alloc > 0 {
+                self.material_free_list.push(chunk.material_offset);
+                self.material_free_list.push(chunk.material_alloc);
+            }
+
+            // Update bookkeeping from staging readback.
+            chunk.quad_offset = br.base_offset;
             chunk.quad_alloc  = br.quad_count;
             chunk.quad_count  = br.quad_count;
             chunk.sub_mask    = u64::from(br.sub_mask_lo)
                               | (u64::from(br.sub_mask_hi) << 32);
 
-            // Free old material allocation if the new count is larger.
-            let needs_mat_alloc = if popcount > chunk.material_alloc {
-                if chunk.material_alloc > 0 {
-                    self.material_bufs.free(
-                        chunk.material_offset, chunk.material_alloc,
-                    );
-
-                    chunk.material_offset = 0;
-                    chunk.material_alloc  = 0;
-                }
-
-                popcount > 0
-            }
-            else {
-                false
-            };
-
-            // Material allocation (auto-grows on exhaustion).
-            if needs_mat_alloc {
-                let offset = self.material_bufs.alloc(device, popcount);
-                let chunk  = self.chunks.get_mut(&pb.pos).unwrap();
-                chunk.material_offset = offset;
-                chunk.material_alloc  = popcount;
-            }
-
-            commit_jobs.push(CommitJob {
-                pos           : pb.pos,
-                slot          : pb.slot,
-                base_offset   : base_offset,
-                quad_count    : br.quad_count,
-                staging_index : pb.staging_index,
-                popcount      : popcount,
-            });
-        }
-
-        // Rebuild material bind groups if the buffer grew during
-        // allocation above, before encoding any dispatches that use them.
-        if self.material_bufs.generation() != self.material_gen {
-            self.material_gen = self.material_bufs.generation();
-            self.material_array_ro_bg = Self::create_material_array_bg(
-                device,
-                &self.material_array_bgl,
-                self.material_bufs.buffers(),
-            );
-
-            self.material_array_rw_bg =
-                self.material_pack_pipeline.create_array_bind_group(
-                    device,
-                    self.material_bufs.buffers(),
-                );
-        }
-
-        // Write GPU metadata for committed chunks.
-        for job in &commit_jobs {
-            // The alloc pass already wrote base_offset to quad_range_buf,
-            // but dispatch_build restored the old value for the cull
-            // shader. Re-write the GPU-allocated offset now.
-            queue.write_buffer(
-                &self.quad_range_buf,
-                u64::from(job.slot) * u64::from(QUAD_RANGE_BYTES) + 4,
-                bytemuck::bytes_of(&job.base_offset),
-            );
-
-            // Write material range so the vertex shader can read it.
-            let chunk = self.chunks.get(&job.pos).unwrap();
-            let (seg_idx, local_bytes) =
-                self.material_bufs.resolve(chunk.material_offset);
-            let mat_range: [u32; 4] = [
-                seg_idx,
-                local_bytes,
-                (chunk.sub_mask & 0xFFFF_FFFF) as u32,
-                (chunk.sub_mask >> 32) as u32,
-            ];
-
-            queue.write_buffer(
-                &self.material_range_buf,
-                u64::from(job.slot) * u64::from(MATERIAL_RANGE_BYTES),
-                bytemuck::cast_slice(&mat_range),
-            );
-        }
-
-        // Dispatch material pack passes for chunks with populated
-        // sub-blocks.
-        let has_mat_work = commit_jobs.iter().any(|j| j.popcount > 0);
-
-        if has_mat_work {
-            let mut encoder = device.create_command_encoder(
-                &CommandEncoderDescriptor::default(),
-            );
-
-            for job in &commit_jobs {
-                if job.popcount == 0 {
-                    continue;
-                }
-
-                let mut pass = encoder.begin_compute_pass(
-                    &ComputePassDescriptor {
-                        label            : Some("material_pack"),
-                        timestamp_writes : None,
-                    },
-                );
-
-                pass.set_pipeline(
-                    self.material_pack_pipeline.pipeline(),
-                );
-                pass.set_bind_group(0, &self.material_pack_bg, &[]);
-                pass.set_bind_group(1, &self.material_array_rw_bg, &[]);
-
-                let push = [
-                    job.staging_index,
-                    job.slot,
-                ];
-                pass.set_immediates(
-                    0, bytemuck::cast_slice(&push),
-                );
-
-                pass.dispatch_workgroups(job.popcount, 1, 1);
-            }
-
-            queue.submit(Some(encoder.finish()));
-        }
-
-        // Write quad_count to chunk_meta_buf so the cull shader can
-        // read it. Staged here, flushed at the next queue.submit
-        // (the main frame encoder with cull + render).
-        for job in &commit_jobs {
-            queue.write_buffer(
-                &self.chunk_meta_buf,
-                u64::from(job.slot) * u64::from(CHUNK_META_BYTES),
-                bytemuck::bytes_of(&job.quad_count),
-            );
+            // Reconstruct the flat material offset from the segment
+            // index and local byte offset read back from the GPU.
+            let mat_local_units = br.mat_base_off / MATERIAL_SUB_BLOCK;
+            chunk.material_offset = br.mat_buf_idx * MATERIAL_SEGMENT_UNITS
+                                  + mat_local_units;
+            chunk.material_alloc  = popcount;
         }
 
         // Clear in-flight flags for all pending chunks.
@@ -1864,14 +1703,15 @@ impl GpuWorld {
             .sum();
 
         let quad_buf_used = u64::from(
-            QUAD_BUF_QUADS - self.allocator.free_quads()
+            QUAD_BUF_QUADS - self.free_quads()
         ) * 4;
 
-        let mat_cap = self.material_bufs.capacity();
+        let mat_alloc_used: u32 = self.chunks.values()
+            .map(|c| c.material_alloc)
+            .sum();
 
-        let material_buf_used = u64::from(
-            mat_cap - self.material_bufs.free_units()
-        ) * u64::from(MATERIAL_SUB_BLOCK);
+        let material_buf_used = u64::from(mat_alloc_used)
+                              * u64::from(MATERIAL_SUB_BLOCK);
 
         let material_buf_total = self.material_bufs.segment_byte_size()
             * u64::from(self.material_bufs.segment_count());
