@@ -12,8 +12,10 @@
 
 // Bindings (material pack pass).
 ByteAddressBuffer   material_staging   : register(t0, space0);
-RWByteAddressBuffer material_buf       : register(u1, space0);
-ByteAddressBuffer   material_range_buf : register(t2, space0);
+ByteAddressBuffer   material_range_buf : register(t1, space0);
+
+// Material buffer segments (set 1, binding array).
+RWByteAddressBuffer material_bufs[]    : register(u0, space1);
 
 // Push constants (8 bytes -- device limit).
 struct MaterialPackPush {
@@ -33,6 +35,7 @@ void main(uint3 lid : SV_GroupThreadID,
     // MaterialRange: [buffer_index(4), base_offset(4),
     //   sub_mask_lo(4), sub_mask_hi(4)].
     uint mr_offset = push.slot * 16;
+    uint buf_idx   = material_range_buf.Load(mr_offset + 0);
     uint dst_base  = material_range_buf.Load(mr_offset + 4);
     uint2 mask     = uint2(
         material_range_buf.Load(mr_offset + 8),
@@ -92,5 +95,5 @@ void main(uint3 lid : SV_GroupThreadID,
     uint dst_byte  = dst_base + sub_rank * SUB_BLOCK_BYTES + dst_local;
 
     uint value = material_staging.Load(src_byte);
-    material_buf.Store(dst_byte, value);
+    material_bufs[buf_idx].Store(dst_byte, value);
 }

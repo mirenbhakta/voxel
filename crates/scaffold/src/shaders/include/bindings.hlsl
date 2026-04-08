@@ -30,11 +30,17 @@
 //     set 0, binding 2 : chunk_offsets         (read-only storage)
 //     set 0, binding 3 : draw_data_buf         (read-only storage)
 //     set 0, binding 4 : material_range_buf    (read-only storage)
-//     set 0, binding 5 : material_buf          (read-only storage)
+//     set 0, binding 5 : (reserved)
 //     set 0, binding 6 : material_table        (read-only storage)
 //     set 0, binding 7 : face_textures         (read-only storage)
 //     set 0, binding 8 : block_textures        (Texture2DArray)
 //     set 0, binding 9 : tex_sampler           (SamplerState)
+//     set 1, binding 0 : material_bufs[]       (read-only storage array)
+//
+//   Material pack:
+//     set 0, binding 0 : material_staging      (read-only storage)
+//     set 0, binding 1 : material_range_buf    (read-only storage)
+//     set 1, binding 0 : material_bufs[]       (read-write storage array)
 
 #ifndef BINDINGS_HLSL
 #define BINDINGS_HLSL
@@ -91,8 +97,8 @@ struct Camera {
 /// sub_mask is a 64-bit bitmask: bit i set means sub-block i (4x4x4
 /// grid of 8x8x8 blocks, index = bz*16 + by*4 + bx) is populated.
 struct MaterialRange {
-    uint buffer_index;   // segment index (always 0 for now)
-    uint base_offset;    // byte offset into packed material_buf
+    uint buffer_index;   // segment index into material_bufs[]
+    uint base_offset;    // byte offset within the segment
     uint sub_mask_lo;    // bits 0-31 of sub-block visibility mask
     uint sub_mask_hi;    // bits 32-63
 };

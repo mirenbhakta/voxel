@@ -8,6 +8,7 @@ mod build;
 mod camera;
 mod chunk_manager;
 mod cull;
+mod multi_buffer;
 mod timestamp;
 mod world;
 mod worldgen;
@@ -261,9 +262,13 @@ impl ApplicationHandler for App {
                                   | Features::INDIRECT_FIRST_INSTANCE
                                   | Features::MULTI_DRAW_INDIRECT_COUNT
                                   | Features::TIMESTAMP_QUERY
-                                  | Features::PASSTHROUGH_SHADERS,
+                                  | Features::PASSTHROUGH_SHADERS
+                                  | Features::BUFFER_BINDING_ARRAY
+                                  | Features::STORAGE_RESOURCE_BINDING_ARRAY
+                                  | Features::PARTIALLY_BOUND_BINDING_ARRAY,
                 required_limits   : Limits {
-                    max_immediate_size : 8,
+                    max_immediate_size                          : 8,
+                    max_binding_array_elements_per_shader_stage : 16,
                     ..Limits::default()
                 },
                 ..Default::default()
@@ -442,6 +447,31 @@ impl ApplicationHandler for App {
             },
         );
 
+        // Bind group layout for the material buffer array (set 1, read-only).
+        let material_array_bgl = device.create_bind_group_layout(
+            &BindGroupLayoutDescriptor {
+                label   : Some("material_array_bgl"),
+                entries : &[
+                    BindGroupLayoutEntry {
+                        binding    : 0,
+                        visibility : ShaderStages::FRAGMENT,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : Some(
+                            std::num::NonZero::new(
+                                world::MAX_MATERIAL_SEGMENTS,
+                            ).unwrap(),
+                        ),
+                    },
+                ],
+            },
+        );
+
         // Load SPIR-V shaders compiled from HLSL by DXC.
         // Safety: SPIR-V is compiled from trusted HLSL by DXC at build
         // time. Passthrough bypasses naga entirely, sending SPIR-V
@@ -479,7 +509,10 @@ impl ApplicationHandler for App {
         let pipeline_layout = device.create_pipeline_layout(
             &PipelineLayoutDescriptor {
                 label              : Some("main_pl"),
-                bind_group_layouts : &[Some(&bind_group_layout)],
+                bind_group_layouts : &[
+                    Some(&bind_group_layout),
+                    Some(&material_array_bgl),
+                ],
                 immediate_size     : 0,
             },
         );
@@ -535,6 +568,7 @@ impl ApplicationHandler for App {
             &device,
             &queue,
             bind_group_layout,
+            material_array_bgl,
             camera_buf.clone(),
             &materials,
             &face_tex,

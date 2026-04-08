@@ -31,6 +31,7 @@ struct VS_Output {
     nointerpolation uint   mat_base   : TEXCOORD5;
     nointerpolation uint   sub_mask_lo: TEXCOORD6;
     nointerpolation uint   sub_mask_hi: TEXCOORD7;
+    nointerpolation uint   mat_buf_idx: TEXCOORD8;
 };
 
 VS_Output main(uint vertex_id   : SV_VertexID,
@@ -83,6 +84,7 @@ VS_Output main(uint vertex_id   : SV_VertexID,
     o.slot        = slot;
     o.quad_uv     = corner;
     o.quad_size   = float2(q.width, q.height);
+    o.mat_buf_idx = material_range_buf.Load(mr_offset + 0);
     o.mat_base    = material_range_buf.Load(mr_offset + 4);
     o.sub_mask_lo = material_range_buf.Load(mr_offset + 8);
     o.sub_mask_hi = material_range_buf.Load(mr_offset + 12);

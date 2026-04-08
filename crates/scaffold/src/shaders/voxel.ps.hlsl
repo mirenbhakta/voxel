@@ -15,11 +15,13 @@ cbuffer CameraCB : register(b0, space0) {
 };
 
 ByteAddressBuffer  material_range_buf : register(t4, space0);
-ByteAddressBuffer  material_buf       : register(t5, space0);
 ByteAddressBuffer  material_table     : register(t6, space0);
 ByteAddressBuffer  face_textures      : register(t7, space0);
 Texture2DArray     block_textures     : register(t8, space0);
 SamplerState       tex_sampler        : register(s9, space0);
+
+// Material buffer segments (set 1, binding array).
+ByteAddressBuffer  material_bufs[]    : register(t0, space1);
 
 // Input from vertex shader.
 struct PS_Input {
@@ -32,6 +34,7 @@ struct PS_Input {
     nointerpolation uint   mat_base   : TEXCOORD5;
     nointerpolation uint   sub_mask_lo: TEXCOORD6;
     nointerpolation uint   sub_mask_hi: TEXCOORD7;
+    nointerpolation uint   mat_buf_idx: TEXCOORD8;
 };
 
 float4 main(PS_Input input) : SV_Target {
@@ -49,7 +52,7 @@ float4 main(PS_Input input) : SV_Target {
 
     // Read block ID from the sparse packed material buffer.
     uint block_id = resolve_block_id(
-        material_buf, input.mat_base,
+        material_bufs[input.mat_buf_idx], input.mat_base,
         uint2(input.sub_mask_lo, input.sub_mask_hi),
         vx, vy, vz
     );

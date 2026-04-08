@@ -17,11 +17,13 @@
 use bytemuck::{Pod, Zeroable};
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingType, Buffer, BufferBindingType,
-    ComputePipeline, ComputePipelineDescriptor, Device,
+    BindGroupLayoutEntry, BindingResource, BindingType, Buffer,
+    BufferBindingType, ComputePipeline, ComputePipelineDescriptor, Device,
     PipelineCompilationOptions, PipelineLayoutDescriptor,
     ShaderModuleDescriptorPassthrough, ShaderStages,
 };
+
+use crate::world::MAX_MATERIAL_SEGMENTS;
 
 // ---------------------------------------------------------------------------
 // BuildPush
@@ -396,9 +398,11 @@ impl BuildWritePipeline {
 /// with visible faces (indicated by the sub_mask bitmask) are copied.
 pub struct MaterialPackPipeline {
     /// The compiled compute pipeline.
-    pipeline  : ComputePipeline,
-    /// The bind group layout for material pack dispatches.
-    bg_layout : wgpu::BindGroupLayout,
+    pipeline     : ComputePipeline,
+    /// The bind group layout for material pack dispatches (set 0).
+    bg_layout    : wgpu::BindGroupLayout,
+    /// The bind group layout for the material buffer array (set 1).
+    array_layout : wgpu::BindGroupLayout,
 }
 
 impl MaterialPackPipeline {
@@ -436,22 +440,9 @@ impl MaterialPackPipeline {
                         },
                         count : None,
                     },
-                    // binding 1: material_buf (read-write storage)
+                    // binding 1: material_range_buf (read-only storage)
                     BindGroupLayoutEntry {
                         binding    : 1,
-                        visibility : ShaderStages::COMPUTE,
-                        ty         : BindingType::Buffer {
-                            ty                 : BufferBindingType::Storage {
-                                read_only : false,
-                            },
-                            has_dynamic_offset : false,
-                            min_binding_size   : None,
-                        },
-                        count : None,
-                    },
-                    // binding 2: material_range_buf (read-only storage)
-                    BindGroupLayoutEntry {
-                        binding    : 2,
                         visibility : ShaderStages::COMPUTE,
                         ty         : BindingType::Buffer {
                             ty                 : BufferBindingType::Storage {
@@ -466,11 +457,38 @@ impl MaterialPackPipeline {
             },
         );
 
+        let array_layout = device.create_bind_group_layout(
+            &BindGroupLayoutDescriptor {
+                label   : Some("material_pack_array_bgl"),
+                entries : &[
+                    // binding 0: material_bufs[] (read-write storage array)
+                    BindGroupLayoutEntry {
+                        binding    : 0,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : Some(
+                            std::num::NonZero::new(MAX_MATERIAL_SEGMENTS)
+                                .unwrap(),
+                        ),
+                    },
+                ],
+            },
+        );
+
         let pipeline_layout = device.create_pipeline_layout(
             &PipelineLayoutDescriptor {
                 label              : Some("material_pack_pl"),
-                bind_group_layouts : &[Some(&bg_layout)],
-                immediate_size     : 8,  // 2 x u32 push constants
+                bind_group_layouts : &[
+                    Some(&bg_layout),
+                    Some(&array_layout),
+                ],
+                immediate_size     : 8,
             },
         );
 
@@ -485,22 +503,20 @@ impl MaterialPackPipeline {
             },
         );
 
-        MaterialPackPipeline { pipeline, bg_layout }
+        MaterialPackPipeline { pipeline, bg_layout, array_layout }
     }
 
-    /// Create a bind group for the material pack pass.
+    /// Create a bind group for the material pack pass (set 0).
     ///
     /// # Arguments
     ///
     /// * `device`               - The GPU device.
     /// * `material_staging_buf` - Transient staging buffer (read-only).
-    /// * `material_buf`         - Packed material buffer (read-write).
     /// * `material_range_buf`   - Per-slot material range metadata (read-only).
     pub fn create_bind_group(
         &self,
         device               : &Device,
         material_staging_buf : &Buffer,
-        material_buf         : &Buffer,
         material_range_buf   : &Buffer,
     ) -> BindGroup
     {
@@ -514,11 +530,37 @@ impl MaterialPackPipeline {
                 },
                 BindGroupEntry {
                     binding  : 1,
-                    resource : material_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding  : 2,
                     resource : material_range_buf.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Create the buffer array bind group (set 1) for material pack.
+    ///
+    /// Rebuild this whenever the multi-buffer grows.
+    pub fn create_array_bind_group(
+        &self,
+        device  : &Device,
+        buffers : &[Buffer],
+    ) -> BindGroup
+    {
+        let bindings: Vec<wgpu::BufferBinding> = buffers
+            .iter()
+            .map(|b| wgpu::BufferBinding {
+                buffer : b,
+                offset : 0,
+                size   : None,
+            })
+            .collect();
+
+        device.create_bind_group(&BindGroupDescriptor {
+            label   : Some("material_pack_array_bg"),
+            layout  : &self.array_layout,
+            entries : &[
+                BindGroupEntry {
+                    binding  : 0,
+                    resource : BindingResource::BufferArray(&bindings),
                 },
             ],
         })
