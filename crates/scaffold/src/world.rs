@@ -1529,6 +1529,23 @@ impl GpuWorld {
             });
         }
 
+        // Rebuild material bind groups if the buffer grew during
+        // allocation above, before encoding any dispatches that use them.
+        if self.material_bufs.generation() != self.material_gen {
+            self.material_gen = self.material_bufs.generation();
+            self.material_array_ro_bg = Self::create_material_array_bg(
+                device,
+                &self.material_array_bgl,
+                self.material_bufs.buffers(),
+            );
+
+            self.material_array_rw_bg =
+                self.material_pack_pipeline.create_array_bind_group(
+                    device,
+                    self.material_bufs.buffers(),
+                );
+        }
+
         // Batch all write and material pack passes into one encoder.
         let has_work = write_jobs.iter()
             .any(|j| j.quad_count > 0 || j.popcount > 0);
@@ -1595,22 +1612,6 @@ impl GpuWorld {
             }
 
             queue.submit(Some(encoder.finish()));
-        }
-
-        // Rebuild material bind groups if the buffer grew.
-        if self.material_bufs.generation() != self.material_gen {
-            self.material_gen = self.material_bufs.generation();
-            self.material_array_ro_bg = Self::create_material_array_bg(
-                device,
-                &self.material_array_bgl,
-                self.material_bufs.buffers(),
-            );
-
-            self.material_array_rw_bg =
-                self.material_pack_pipeline.create_array_bind_group(
-                    device,
-                    self.material_bufs.buffers(),
-                );
         }
 
         // Write quad_count to chunk_meta_buf so the cull shader can
