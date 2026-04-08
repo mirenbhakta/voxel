@@ -26,7 +26,7 @@ use wgpu::{
     BufferBindingType, BufferUsages, Color, ColorTargetState, ColorWrites,
     CommandEncoderDescriptor, CompareFunction, CurrentSurfaceTexture,
     DepthBiasState, DepthStencilState, Device, DeviceDescriptor, Extent3d,
-    Face, Features, FragmentState, FrontFace, Instance, InstanceDescriptor,
+    Features, FragmentState, FrontFace, Instance, InstanceDescriptor,
     Limits, LoadOp, MultisampleState, Operations,
     PipelineCompilationOptions, PipelineLayoutDescriptor, PolygonMode,
     PrimitiveState, PrimitiveTopology, Queue, RenderPassColorAttachment,
@@ -538,9 +538,9 @@ impl ApplicationHandler for App {
                 compilation_options : PipelineCompilationOptions::default(),
             }),
             primitive : PrimitiveState {
-                topology   : PrimitiveTopology::TriangleStrip,
-                front_face : FrontFace::Ccw,
-                cull_mode  : Some(Face::Back),
+                topology     : PrimitiveTopology::TriangleStrip,
+                front_face   : FrontFace::Ccw,
+                cull_mode    : None,
                 polygon_mode : PolygonMode::Fill,
                 ..Default::default()
             },
@@ -897,6 +897,7 @@ impl ApplicationHandler for App {
                     &mut encoder,
                     &gpu.queue,
                     &frustum_planes,
+                    self.camera.position.to_array(),
                 );
 
                 // Copy the GPU-written visible count to the staging buffer.
@@ -1101,15 +1102,29 @@ fn draw_stats_ui(
                     ui.end_row();
 
                     ui.label("Quads");
-                    ui.label(format!("{}", stats.total_quads));
+                    ui.label(format!(
+                        "{} total, {} visible",
+                        stats.total_quads, stats.visible_quads,
+                    ));
                     ui.end_row();
 
-                    ui.label("Vertices");
-                    ui.label(format!("{}", stats.total_quads * 4));
+                    ui.label("Backface culled");
+                    let bf_pct = if stats.visible_quads > 0 {
+                        100.0 * stats.backface_quads as f64
+                             / stats.visible_quads as f64
+                    }
+                    else { 0.0 };
+                    ui.label(format!(
+                        "{} ({:.0}%)", stats.backface_quads, bf_pct,
+                    ));
                     ui.end_row();
 
-                    ui.label("Triangles");
-                    ui.label(format!("{}", stats.total_quads * 2));
+                    ui.label("Drawn");
+                    ui.label(format!(
+                        "{} quads, {} tris",
+                        stats.visible_quads - stats.backface_quads,
+                        (stats.visible_quads - stats.backface_quads) * 2,
+                    ));
                     ui.end_row();
                 });
 
@@ -1156,10 +1171,16 @@ fn draw_stats_ui(
                     ui.end_row();
 
                     ui.label("Material buffer");
+                    let saved_pct = if stats.material_naive > 0 {
+                        100.0 * (1.0 - stats.material_buf_used as f64
+                                     / stats.material_naive as f64)
+                    }
+                    else { 0.0 };
                     ui.label(format!(
-                        "{:.1} / {:.0} MB",
+                        "{:.1} / {:.0} MB ({:.0}% saved)",
                         stats.material_buf_used as f64 / (1024.0 * 1024.0),
                         stats.material_buf_total as f64 / (1024.0 * 1024.0),
+                        saved_pct,
                     ));
                     ui.end_row();
 

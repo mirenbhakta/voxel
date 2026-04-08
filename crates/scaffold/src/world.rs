@@ -36,8 +36,8 @@ use crate::multi_buffer::MultiBuffer;
 /// Maximum concurrent loaded chunks (slot count).
 const MAX_CHUNKS: u32 = 4096;
 
-/// Total quad buffer size in bytes (64 MB).
-const QUAD_BUF_SIZE: u64 = 64 * 1024 * 1024;
+/// Total quad buffer size in bytes (16 MB).
+const QUAD_BUF_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Total quad buffer capacity in quads (one quad = 4 bytes).
 const QUAD_BUF_QUADS: u32 = (QUAD_BUF_SIZE / 4) as u32;
@@ -58,6 +58,10 @@ const CHUNK_META_BYTES: u32 = 16;
 
 /// Bytes per draw data entry (slot, direction).
 const DRAW_DATA_BYTES: u32 = 8;
+
+/// Maximum output draws from the cull shader. Each chunk can produce up
+/// to 6 MDI entries (one per front-facing direction).
+const MAX_DRAWS: u32 = MAX_CHUNKS * 6;
 
 /// Conservative upper bound on quads per chunk. Used for capacity
 /// estimation when throttling chunk loads. Derived from the worst-case
@@ -102,8 +106,8 @@ const BUILD_STAGING_ENTRY_BYTES: u32 = 16;
 /// Bytes per entry in material_range_buf.
 const MATERIAL_RANGE_BYTES: u32 = 16;
 
-/// Initial packed material buffer size in bytes (16 MB).
-const MATERIAL_BUF_INITIAL: u64 = 16 * 1024 * 1024;
+/// Initial packed material buffer size in bytes (64 MB).
+const MATERIAL_BUF_INITIAL: u64 = 64 * 1024 * 1024;
 
 /// Bytes per material sub-block (8x8x8 voxels, u16 each).
 const MATERIAL_SUB_BLOCK: u32 = 1024;
@@ -111,7 +115,7 @@ const MATERIAL_SUB_BLOCK: u32 = 1024;
 /// Maximum number of material buffer segments in the binding array.
 pub(crate) const MAX_MATERIAL_SEGMENTS: u32 = 16;
 
-/// Material segment capacity in sub-block units (16 MB / 1024 B = 16384).
+/// Material segment capacity in sub-block units (64 MB / 1024 B = 65536).
 const MATERIAL_SEGMENT_UNITS: u32 =
     (MATERIAL_BUF_INITIAL / MATERIAL_SUB_BLOCK as u64) as u32;
 
@@ -416,6 +420,10 @@ pub struct RenderStats {
     pub chunks_visible : u32,
     /// Total quads across all chunks.
     pub total_quads    : u32,
+    /// Quads in frustum-visible chunks (one frame latency).
+    pub visible_quads  : u32,
+    /// Quads on entirely back-facing directions (one frame latency).
+    pub backface_quads : u32,
     /// Quad buffer bytes currently allocated.
     pub quad_buf_used  : u64,
     /// Quad buffer total capacity in bytes.
@@ -424,6 +432,9 @@ pub struct RenderStats {
     pub material_buf_used  : u64,
     /// Material buffer total capacity in bytes.
     pub material_buf_total : u64,
+    /// Bytes that naive flat storage (u16 per voxel, full 32^3 per chunk)
+    /// would require for all currently loaded chunks.
+    pub material_naive     : u64,
     /// Total bytes used by fixed per-slot buffers (occupancy, boundary
     /// cache, chunk meta, quad range, chunk offsets, material range,
     /// indirect draws, draw data).
@@ -480,9 +491,9 @@ pub struct GpuWorld {
     dst_indirect_buf     : Buffer,
     /// Per-draw metadata: {slot, direction} written by cull shader.
     draw_data_buf        : Buffer,
-    /// GPU-side atomic draw count for `multi_draw_indirect_count`.
+    /// GPU-side stat counters: [draw_count, visible_quads, backface_quads].
     draw_count_buf       : Buffer,
-    /// Frustum plane uniform buffer (6 x vec4<f32>).
+    /// Cull uniform buffer: 6 frustum planes + camera position (112 bytes).
     frustum_buf          : Buffer,
 
     // -- Pipelines and bind groups --
@@ -562,6 +573,10 @@ pub struct GpuWorld {
     count_pending        : bool,
     /// Last known visible chunk count (one frame latency).
     visible_count        : u32,
+    /// Last known visible quad count (one frame latency).
+    visible_quads        : u32,
+    /// Last known back-face culled quad count (one frame latency).
+    backface_quads       : u32,
 
     // -- Draw state --
 
@@ -688,7 +703,7 @@ impl GpuWorld {
 
         let dst_indirect_buf = device.create_buffer(&BufferDescriptor {
             label              : Some("dst_indirect_buf"),
-            size               : u64::from(MAX_CHUNKS) * 16,
+            size               : u64::from(MAX_DRAWS) * 16,
             usage              : BufferUsages::STORAGE
                                | BufferUsages::INDIRECT,
             mapped_at_creation : false,
@@ -696,15 +711,17 @@ impl GpuWorld {
 
         let draw_data_buf = device.create_buffer(&BufferDescriptor {
             label              : Some("draw_data_buf"),
-            size               : u64::from(MAX_CHUNKS)
+            size               : u64::from(MAX_DRAWS)
                                * u64::from(DRAW_DATA_BYTES),
             usage              : BufferUsages::STORAGE,
             mapped_at_creation : false,
         });
 
+        // Layout: [draw_count(4), visible_quads(4), backface_quads(4),
+        //          visible_chunks(4)].
         let draw_count_buf = device.create_buffer(&BufferDescriptor {
             label              : Some("draw_count_buf"),
-            size               : 4,
+            size               : 16,
             usage              : BufferUsages::STORAGE
                                | BufferUsages::INDIRECT
                                | BufferUsages::COPY_SRC
@@ -712,9 +729,10 @@ impl GpuWorld {
             mapped_at_creation : false,
         });
 
+        // Layout: [frustum_planes(96), camera_pos(16)] = 112 bytes.
         let frustum_buf = device.create_buffer(&BufferDescriptor {
             label              : Some("frustum_buf"),
-            size               : 96,
+            size               : 112,
             usage              : BufferUsages::UNIFORM
                                | BufferUsages::COPY_DST,
             mapped_at_creation : false,
@@ -735,7 +753,7 @@ impl GpuWorld {
 
         let count_staging = device.create_buffer(&BufferDescriptor {
             label              : Some("cull_count_staging"),
-            size               : 4,
+            size               : 16,
             usage              : BufferUsages::COPY_DST
                                | BufferUsages::MAP_READ,
             mapped_at_creation : false,
@@ -1027,6 +1045,8 @@ impl GpuWorld {
             count_ready            : Arc::new(AtomicBool::new(false)),
             count_pending          : false,
             visible_count          : 0,
+            visible_quads          : 0,
+            backface_quads         : 0,
             active_slot_count      : 0,
         }
     }
@@ -1700,24 +1720,30 @@ impl GpuWorld {
           + u64::from(MAX_CHUNKS) * u64::from(QUAD_RANGE_BYTES)            // quad range
           + u64::from(MAX_CHUNKS) * 16                                     // chunk offsets
           + u64::from(MAX_CHUNKS) * u64::from(MATERIAL_RANGE_BYTES)        // material range
-          + u64::from(MAX_CHUNKS) * 16                                     // dst indirect
-          + u64::from(MAX_CHUNKS) * u64::from(DRAW_DATA_BYTES);           // draw data
+          + u64::from(MAX_DRAWS) * 16                                      // dst indirect
+          + u64::from(MAX_DRAWS) * u64::from(DRAW_DATA_BYTES);            // draw data
 
-        // Small constant buffers (frustum, staging, counters).
-        let small_bufs = 96 + 4 + 16 + 4;
+        // Small constant buffers (frustum+cam, staging, counters).
+        let small_bufs = 112 + 16 + 16 + 4;
 
         // Variable-size buffers (packed material + material staging).
         let material_bufs = material_buf_total
             + u64::from(MAX_BUILDS_IN_FLIGHT) * 65536;
 
+        // Naive flat storage: u16 per voxel, full 32^3 per loaded chunk.
+        let material_naive = self.chunks.len() as u64 * 32 * 32 * 32 * 2;
+
         RenderStats {
             chunks_loaded      : self.chunks.len() as u32,
             chunks_visible     : self.visible_count,
             total_quads        : total_quads,
+            visible_quads      : self.visible_quads,
+            backface_quads     : self.backface_quads,
             quad_buf_used      : quad_buf_used,
             quad_buf_total     : QUAD_BUF_SIZE,
             material_buf_used  : material_buf_used,
             material_buf_total : material_buf_total,
+            material_naive     : material_naive,
             slot_buf_total     : slot_buf_total,
             gpu_mem_total      : QUAD_BUF_SIZE + slot_buf_total
                                + material_bufs + small_bufs,
@@ -1726,34 +1752,45 @@ impl GpuWorld {
 
     /// Record the frustum cull compute pass.
     ///
-    /// Clears the draw count buffer, uploads frustum planes, and
-    /// dispatches the cull compute shader. The cull shader iterates all
-    /// slots directly, reading chunk_meta_buf to skip empty slots.
+    /// Clears the draw count / stats buffer, uploads frustum planes and
+    /// camera position, and dispatches the cull compute shader. The cull
+    /// shader iterates all slots directly, reading chunk_meta_buf to
+    /// skip empty slots.
     ///
     /// # Arguments
     ///
-    /// * `encoder` - The command encoder to record into.
-    /// * `queue`   - The queue for frustum plane upload.
-    /// * `planes`  - The six frustum planes from the camera.
+    /// * `encoder`    - The command encoder to record into.
+    /// * `queue`      - The queue for uniform upload.
+    /// * `planes`     - The six frustum planes from the camera.
+    /// * `camera_pos` - World-space camera position for back-face stats.
     pub fn dispatch_cull(
         &self,
-        encoder : &mut CommandEncoder,
-        queue   : &Queue,
-        planes  : &[[f32; 4]; 6],
+        encoder    : &mut CommandEncoder,
+        queue      : &Queue,
+        planes     : &[[f32; 4]; 6],
+        camera_pos : [f32; 3],
     )
     {
         if self.active_slot_count == 0 {
             return;
         }
 
-        // Upload frustum planes.
+        // Upload frustum planes + camera position.
         queue.write_buffer(
             &self.frustum_buf,
             0,
             bytemuck::cast_slice(planes.as_slice()),
         );
+        let cam_padded: [f32; 4] = [
+            camera_pos[0], camera_pos[1], camera_pos[2], 0.0,
+        ];
+        queue.write_buffer(
+            &self.frustum_buf,
+            96,
+            bytemuck::cast_slice(&cam_padded),
+        );
 
-        // Clear the atomic draw count to zero.
+        // Clear all three stat counters to zero.
         encoder.clear_buffer(&self.draw_count_buf, 0, None);
 
         // Frustum cull compute pass: iterate all slots, skip empty.
@@ -1805,7 +1842,7 @@ impl GpuWorld {
         encoder.copy_buffer_to_buffer(
             &self.draw_count_buf, 0,
             &self.count_staging,  0,
-            4,
+            16,
         );
     }
 
@@ -1865,7 +1902,7 @@ impl GpuWorld {
             0,
             &self.draw_count_buf,
             0,
-            MAX_CHUNKS,
+            MAX_DRAWS,
         );
     }
 
@@ -1997,14 +2034,21 @@ impl GpuWorld {
     fn consume_count_readback(&mut self) {
         let slice = self.count_staging.slice(..);
         let data  = slice.get_mapped_range();
-        let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+
+        let _draws  = u32::from_le_bytes([data[0],  data[1],  data[2],  data[3]]);
+        let quads   = u32::from_le_bytes([data[4],  data[5],  data[6],  data[7]]);
+        let backf   = u32::from_le_bytes([data[8],  data[9],  data[10], data[11]]);
+        let chunks  = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+
         drop(data);
 
         self.count_staging.unmap();
 
-        self.count_pending = false;
+        self.count_pending  = false;
         self.count_ready.store(false, Ordering::Release);
-        self.visible_count = count;
+        self.visible_count  = chunks;
+        self.visible_quads  = quads;
+        self.backface_quads = backf;
     }
 
     // -----------------------------------------------------------------------

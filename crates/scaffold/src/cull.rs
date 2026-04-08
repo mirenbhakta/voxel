@@ -175,7 +175,7 @@ impl CullPipeline {
     /// # Arguments
     ///
     /// * `device`         - The wgpu device.
-    /// * `frustum_buf`    - Uniform buffer with 6 frustum planes (96 bytes).
+    /// * `frustum_buf`    - Uniform buffer: 6 frustum planes + camera pos (112 bytes).
     /// * `offsets_buf`    - Chunk offset buffer (read-only storage).
     /// * `chunk_meta_buf` - Per-chunk metadata buffer (read-only storage).
     /// * `quad_range_buf` - Per-chunk quad range buffer (read-only storage).
