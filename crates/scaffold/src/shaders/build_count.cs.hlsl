@@ -35,6 +35,11 @@ groupshared uint g_shared_face[32];
 // Per-direction layer count accumulator (one per workgroup).
 groupshared uint layer_quad_count;
 
+// Per-workgroup sub-block visibility mask accumulator.
+// Two u32s encoding a 64-bit mask over a 4x4x4 grid of 8x8x8
+// sub-blocks. Set bits indicate sub-blocks containing visible faces.
+groupshared uint g_sub_mask[2];
+
 [numthreads(32, 1, 1)]
 void main(uint3 lid : SV_GroupThreadID,
           uint3 gid : SV_GroupID) {
@@ -54,11 +59,53 @@ void main(uint3 lid : SV_GroupThreadID,
 
     // Store to shared for greedy merge.
     g_shared_face[row] = face_word;
-    GroupMemoryBarrierWithGroupSync();
 
-    // Initialize the layer count accumulator.
+    // Initialize accumulators.
     if (row == 0) {
         layer_quad_count = 0;
+        g_sub_mask[0]    = 0;
+        g_sub_mask[1]    = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    // Mark sub-blocks that contain visible faces. Each thread checks
+    // its face word and marks the sub-blocks at (col/8, row/8, layer/8)
+    // in chunk-local coordinates.
+    if (face_word != 0) {
+        uint sub_row   = row / 8;
+        uint sub_layer = layer / 8;
+
+        // Which 8-column sub-ranges have at least one face?
+        uint col_mask = 0;
+        if (face_word & 0x000000FFu) col_mask |= 1u;
+        if (face_word & 0x0000FF00u) col_mask |= 2u;
+        if (face_word & 0x00FF0000u) col_mask |= 4u;
+        if (face_word & 0xFF000000u) col_mask |= 8u;
+
+        for (uint sc = 0; sc < 4; sc++) {
+            if (!(col_mask & (1u << sc))) continue;
+
+            // Map canonical (col, row, layer) to chunk (x, y, z).
+            uint bx, by, bz;
+            if (dir < 2) {
+                // X faces: layer=x, col=y, row=z
+                bx = sub_layer; by = sc; bz = sub_row;
+            }
+            else if (dir < 4) {
+                // Y faces: layer=y, col=z, row=x
+                bx = sub_row; by = sub_layer; bz = sc;
+            }
+            else {
+                // Z faces: layer=z, col=x, row=y
+                bx = sc; by = sub_row; bz = sub_layer;
+            }
+
+            uint sub_idx = bz * 16 + by * 4 + bx;
+            uint word    = sub_idx < 32 ? 0 : 1;
+            uint bit     = sub_idx < 32 ? sub_idx : sub_idx - 32;
+            uint dummy;
+            InterlockedOr(g_sub_mask[word], 1u << bit, dummy);
+        }
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -68,7 +115,7 @@ void main(uint3 lid : SV_GroupThreadID,
     }
     GroupMemoryBarrierWithGroupSync();
 
-    // Thread 0 writes the layer count to quad_range_buf.
+    // Thread 0 writes the layer count and sub-mask contributions.
     if (row == 0) {
         // QuadRange layout: buffer_index(4) + base_offset(4) +
         // dir_layer_counts[6][32] (768 bytes).
@@ -79,9 +126,16 @@ void main(uint3 lid : SV_GroupThreadID,
         quad_range_buf.Store(range_offset, layer_quad_count);
 
         // Atomically accumulate the total quad count in chunk_meta.
-        // ChunkMeta layout: quad_count(4) + flags(4) + reserved(8).
+        // ChunkMeta layout: quad_count(4) + flags(4) + sub_mask(8).
         uint meta_offset = push.slot_index * 16;
         uint dummy;
         chunk_meta_buf.InterlockedAdd(meta_offset, layer_quad_count, dummy);
+
+        // Merge workgroup sub_mask into per-slot mask.
+        if (g_sub_mask[0])
+            chunk_meta_buf.InterlockedOr(meta_offset + 8, g_sub_mask[0], dummy);
+
+        if (g_sub_mask[1])
+            chunk_meta_buf.InterlockedOr(meta_offset + 12, g_sub_mask[1], dummy);
     }
 }

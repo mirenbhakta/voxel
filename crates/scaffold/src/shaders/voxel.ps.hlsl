@@ -14,20 +14,24 @@ cbuffer CameraCB : register(b0, space0) {
     Camera camera;
 };
 
-ByteAddressBuffer  material_volume : register(t4, space0);
-ByteAddressBuffer  material_table  : register(t5, space0);
-ByteAddressBuffer  face_textures   : register(t6, space0);
-Texture2DArray     block_textures  : register(t7, space0);
-SamplerState       tex_sampler     : register(s8, space0);
+ByteAddressBuffer  material_range_buf : register(t4, space0);
+ByteAddressBuffer  material_buf       : register(t5, space0);
+ByteAddressBuffer  material_table     : register(t6, space0);
+ByteAddressBuffer  face_textures      : register(t7, space0);
+Texture2DArray     block_textures     : register(t8, space0);
+SamplerState       tex_sampler        : register(s9, space0);
 
 // Input from vertex shader.
 struct PS_Input {
     float4 clip_pos    : SV_Position;
     float3 world_pos   : TEXCOORD0;
-    nointerpolation uint direction : TEXCOORD1;
-    nointerpolation uint slot      : TEXCOORD2;
+    nointerpolation uint   direction  : TEXCOORD1;
+    nointerpolation uint   slot       : TEXCOORD2;
     float2 quad_uv     : TEXCOORD3;
-    nointerpolation float2 quad_size : TEXCOORD4;
+    nointerpolation float2 quad_size  : TEXCOORD4;
+    nointerpolation uint   mat_base   : TEXCOORD5;
+    nointerpolation uint   sub_mask_lo: TEXCOORD6;
+    nointerpolation uint   sub_mask_hi: TEXCOORD7;
 };
 
 float4 main(PS_Input input) : SV_Target {
@@ -43,8 +47,12 @@ float4 main(PS_Input input) : SV_Target {
     uint vy = uint(int(voxel_f.y) & 31);
     uint vz = uint(int(voxel_f.z) & 31);
 
-    // Read block ID from the volumetric material array.
-    uint block_id = resolve_block_id(material_volume, input.slot, vx, vy, vz);
+    // Read block ID from the sparse packed material buffer.
+    uint block_id = resolve_block_id(
+        material_buf, input.mat_base,
+        uint2(input.sub_mask_lo, input.sub_mask_hi),
+        vx, vy, vz
+    );
 
     // Look up material properties.
     float4 color = material_color(material_table, block_id);

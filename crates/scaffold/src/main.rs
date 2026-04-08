@@ -318,7 +318,8 @@ impl ApplicationHandler for App {
         let texture_layers = 5u32;
 
         // Bind group layout: camera, quad_buf, chunk_offsets, draw_data,
-        // material_volume, material_table, face_textures, textures, sampler.
+        // material_range, material_buf, material_table, face_textures,
+        // textures, sampler.
         let bind_group_layout = device.create_bind_group_layout(
             &BindGroupLayoutDescriptor {
                 label   : Some("main_bgl"),
@@ -371,7 +372,7 @@ impl ApplicationHandler for App {
                     },
                     BindGroupLayoutEntry {
                         binding    : 4,
-                        visibility : ShaderStages::FRAGMENT,
+                        visibility : ShaderStages::VERTEX_FRAGMENT,
                         ty         : BindingType::Buffer {
                             ty                 : BufferBindingType::Storage {
                                 read_only : true,
@@ -408,6 +409,18 @@ impl ApplicationHandler for App {
                     BindGroupLayoutEntry {
                         binding    : 7,
                         visibility : ShaderStages::FRAGMENT,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    BindGroupLayoutEntry {
+                        binding    : 8,
+                        visibility : ShaderStages::FRAGMENT,
                         ty         : BindingType::Texture {
                             sample_type    : TextureSampleType::Float {
                                 filterable : true,
@@ -418,7 +431,7 @@ impl ApplicationHandler for App {
                         count : None,
                     },
                     BindGroupLayoutEntry {
-                        binding    : 8,
+                        binding    : 9,
                         visibility : ShaderStages::FRAGMENT,
                         ty         : BindingType::Sampler(
                             SamplerBindingType::Filtering,
@@ -1105,6 +1118,14 @@ fn draw_stats_ui(
                         "{:.1} / {:.0} MB",
                         stats.quad_buf_used as f64 / (1024.0 * 1024.0),
                         stats.quad_buf_total as f64 / (1024.0 * 1024.0),
+                    ));
+                    ui.end_row();
+
+                    ui.label("Material buffer");
+                    ui.label(format!(
+                        "{:.1} / {:.0} MB",
+                        stats.material_buf_used as f64 / (1024.0 * 1024.0),
+                        stats.material_buf_total as f64 / (1024.0 * 1024.0),
                     ));
                     ui.end_row();
 

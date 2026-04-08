@@ -15,18 +15,22 @@ cbuffer CameraCB : register(b0, space0) {
     Camera camera;
 };
 
-ByteAddressBuffer quad_buf      : register(t1, space0);
-ByteAddressBuffer chunk_offsets : register(t2, space0);
-ByteAddressBuffer draw_data_buf : register(t3, space0);
+ByteAddressBuffer quad_buf           : register(t1, space0);
+ByteAddressBuffer chunk_offsets      : register(t2, space0);
+ByteAddressBuffer draw_data_buf      : register(t3, space0);
+ByteAddressBuffer material_range_buf : register(t4, space0);
 
 // Vertex output to the pixel shader.
 struct VS_Output {
     float4 clip_pos    : SV_Position;
     float3 world_pos   : TEXCOORD0;
-    nointerpolation uint direction : TEXCOORD1;
-    nointerpolation uint slot      : TEXCOORD2;
+    nointerpolation uint   direction  : TEXCOORD1;
+    nointerpolation uint   slot       : TEXCOORD2;
     float2 quad_uv     : TEXCOORD3;
-    nointerpolation float2 quad_size : TEXCOORD4;
+    nointerpolation float2 quad_size  : TEXCOORD4;
+    nointerpolation uint   mat_base   : TEXCOORD5;
+    nointerpolation uint   sub_mask_lo: TEXCOORD6;
+    nointerpolation uint   sub_mask_hi: TEXCOORD7;
 };
 
 VS_Output main(uint vertex_id   : SV_VertexID,
@@ -67,12 +71,20 @@ VS_Output main(uint vertex_id   : SV_VertexID,
 
     float3 world_pos = local_pos + float3(offset);
 
+    // Read material range for sparse sub-block lookup.
+    // MaterialRange: [buffer_index(4), base_offset(4), sub_mask_lo(4),
+    // sub_mask_hi(4)].
+    uint mr_offset = slot * 16;
+
     VS_Output o;
-    o.clip_pos  = mul(camera.view_proj, float4(world_pos, 1.0));
-    o.world_pos = world_pos;
-    o.direction = direction;
-    o.slot      = slot;
-    o.quad_uv   = corner;
-    o.quad_size  = float2(q.width, q.height);
+    o.clip_pos    = mul(camera.view_proj, float4(world_pos, 1.0));
+    o.world_pos   = world_pos;
+    o.direction   = direction;
+    o.slot        = slot;
+    o.quad_uv     = corner;
+    o.quad_size   = float2(q.width, q.height);
+    o.mat_base    = material_range_buf.Load(mr_offset + 4);
+    o.sub_mask_lo = material_range_buf.Load(mr_offset + 8);
+    o.sub_mask_hi = material_range_buf.Load(mr_offset + 12);
     return o;
 }

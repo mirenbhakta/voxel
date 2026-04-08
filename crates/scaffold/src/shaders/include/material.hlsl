@@ -1,24 +1,51 @@
-// Material sampling from the volumetric material buffer.
+// Material sampling from the sparse packed material buffer.
 //
-// Phase 1: flat 128 MB volume, same lookup as the WGSL shader.
-// Phase 2: replaces internals with countbits + packed sub-blocks.
+// Each chunk's visible sub-blocks (8x8x8 regions) are packed
+// contiguously. The sub_mask bitmask indicates which of the 64
+// sub-blocks are present. Resolution uses countbits to compute the
+// packed offset -- one ALU instruction plus one direct buffer read.
 
 #ifndef MATERIAL_HLSL
 #define MATERIAL_HLSL
 
 #include "include/bindings.hlsl"
 
-/// Resolve the block ID at a voxel position within a chunk slot.
+/// Resolve the block ID at a voxel position within a chunk.
 ///
-/// The material volume stores one byte per voxel, packed 4 to a u32.
-/// Layout: slot * 8192 words + (z * 1024 + y * 32 + x) / 4.
-uint resolve_block_id(ByteAddressBuffer material_volume, uint slot,
+/// The material buffer stores packed sub-blocks of u16 block IDs.
+/// Only sub-blocks with visible faces are present, indexed via
+/// popcount on the sub_mask bitmask.
+///
+/// # Arguments
+///
+/// * `material_buf` - Packed sparse material buffer.
+/// * `mat_base`     - Byte offset of this chunk's first sub-block.
+/// * `sub_mask`     - 64-bit sub-block visibility mask (lo, hi).
+/// * `vx, vy, vz`   - Chunk-local voxel coordinates (0..31).
+uint resolve_block_id(ByteAddressBuffer material_buf,
+                      uint mat_base, uint2 sub_mask,
                       uint vx, uint vy, uint vz) {
-    uint voxel_idx = vz * 1024 + vy * 32 + vx;
-    uint word_idx  = slot * 8192 + voxel_idx / 4;
-    uint byte_off  = (voxel_idx % 4) * 8;
-    uint word      = material_volume.Load(word_idx * 4);
-    return (word >> byte_off) & 0xFF;
+    uint bx = vx >> 3;  uint by = vy >> 3;  uint bz = vz >> 3;
+    uint lx = vx & 7;   uint ly = vy & 7;   uint lz = vz & 7;
+
+    uint sub_idx = bz * 16 + by * 4 + bx;
+
+    // Count populated sub-blocks before this one.
+    uint offset;
+    if (sub_idx < 32)
+        offset = countbits(sub_mask.x & ((1u << sub_idx) - 1u));
+    else
+        offset = countbits(sub_mask.x)
+               + countbits(sub_mask.y & ((1u << (sub_idx - 32)) - 1u));
+
+    // Linear index within the 8x8x8 sub-block.
+    uint local_idx = lz * 64 + ly * 8 + lx;
+    uint byte_addr = mat_base + offset * SUB_BLOCK_BYTES
+                   + local_idx * 2;
+
+    // Load u16 from ByteAddressBuffer (aligned u32 load + extract).
+    uint word = material_buf.Load(byte_addr & ~3u);
+    return (byte_addr & 2u) ? (word >> 16) : (word & 0xFFFF);
 }
 
 /// Look up material color from the material table.

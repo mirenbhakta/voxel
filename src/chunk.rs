@@ -183,13 +183,13 @@ impl Chunk {
 
     /// Build a per-voxel block ID array for GPU upload.
     ///
-    /// Each byte contains the raw [`BlockId`] value for the voxel at
+    /// Each element contains the raw [`BlockId`] value for the voxel at
     /// that position, resolved through the local palette. Unoccupied
     /// voxels are zero (air). Layout: `data[z * 1024 + y * 32 + x]`.
-    pub fn material_block_ids(&self) -> [u8; 32768] {
+    pub fn material_block_ids(&self) -> [u16; 32768] {
         let palette_data = self.material.as_slice();
         let occ_data     = self.occupancy.as_raw();
-        let mut out      = [0u8; 32768];
+        let mut out      = [0u16; 32768];
 
         for z in 0..32usize {
             for y in 0..32usize {
@@ -202,7 +202,7 @@ impl Chunk {
                 for x in 0..32usize {
                     if word & (1 << x) != 0 {
                         let idx = palette_data[row_base + x] as usize;
-                        out[row_base + x] = self.palette[idx].raw() as u8;
+                        out[row_base + x] = self.palette[idx].raw();
                     }
                 }
             }
@@ -340,8 +340,8 @@ mod tests {
         let ids = chunk.material_block_ids();
 
         // The array should contain raw BlockId values, not palette indices.
-        assert_eq!(ids[0], stone.raw() as u8);
-        assert_eq!(ids[1], dirt.raw() as u8);
+        assert_eq!(ids[0], stone.raw());
+        assert_eq!(ids[1], dirt.raw());
 
         // Unoccupied voxel should be 0 (air).
         assert_eq!(ids[2], 0);

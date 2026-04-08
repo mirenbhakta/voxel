@@ -384,3 +384,148 @@ impl BuildWritePipeline {
         &self.pipeline
     }
 }
+
+// ---------------------------------------------------------------------------
+// MaterialPackPipeline
+// ---------------------------------------------------------------------------
+
+/// The compute pipeline for material sub-block packing.
+///
+/// Copies populated 8x8x8 sub-blocks from a transient staging buffer
+/// to contiguous positions in the packed material buffer. Only sub-blocks
+/// with visible faces (indicated by the sub_mask bitmask) are copied.
+pub struct MaterialPackPipeline {
+    /// The compiled compute pipeline.
+    pipeline  : ComputePipeline,
+    /// The bind group layout for material pack dispatches.
+    bg_layout : wgpu::BindGroupLayout,
+}
+
+impl MaterialPackPipeline {
+    /// Create the material pack compute pipeline.
+    pub fn new(device: &Device) -> Self {
+        let pack_spv = include_bytes!(
+            concat!(env!("OUT_DIR"), "/material_pack.cs.spv")
+        );
+
+        // Safety: SPIR-V compiled from trusted HLSL by DXC at build time.
+        let shader = unsafe {
+            device.create_shader_module_passthrough(
+                ShaderModuleDescriptorPassthrough {
+                    label : Some("material_pack_shader"),
+                    spirv : Some(wgpu::util::make_spirv_raw(pack_spv)),
+                    ..Default::default()
+                },
+            )
+        };
+
+        let bg_layout = device.create_bind_group_layout(
+            &BindGroupLayoutDescriptor {
+                label   : Some("material_pack_bgl"),
+                entries : &[
+                    // binding 0: material_staging_buf (read-only storage)
+                    BindGroupLayoutEntry {
+                        binding    : 0,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 1: material_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 1,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 2: material_range_buf (read-only storage)
+                    BindGroupLayoutEntry {
+                        binding    : 2,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                ],
+            },
+        );
+
+        let pipeline_layout = device.create_pipeline_layout(
+            &PipelineLayoutDescriptor {
+                label              : Some("material_pack_pl"),
+                bind_group_layouts : &[Some(&bg_layout)],
+                immediate_size     : 8,  // 2 x u32 push constants
+            },
+        );
+
+        let pipeline = device.create_compute_pipeline(
+            &ComputePipelineDescriptor {
+                label               : Some("material_pack_pipeline"),
+                layout              : Some(&pipeline_layout),
+                module              : &shader,
+                entry_point         : Some("main"),
+                compilation_options : PipelineCompilationOptions::default(),
+                cache               : None,
+            },
+        );
+
+        MaterialPackPipeline { pipeline, bg_layout }
+    }
+
+    /// Create a bind group for the material pack pass.
+    ///
+    /// # Arguments
+    ///
+    /// * `device`               - The GPU device.
+    /// * `material_staging_buf` - Transient staging buffer (read-only).
+    /// * `material_buf`         - Packed material buffer (read-write).
+    /// * `material_range_buf`   - Per-slot material range metadata (read-only).
+    pub fn create_bind_group(
+        &self,
+        device               : &Device,
+        material_staging_buf : &Buffer,
+        material_buf         : &Buffer,
+        material_range_buf   : &Buffer,
+    ) -> BindGroup
+    {
+        device.create_bind_group(&BindGroupDescriptor {
+            label   : Some("material_pack_bg"),
+            layout  : &self.bg_layout,
+            entries : &[
+                BindGroupEntry {
+                    binding  : 0,
+                    resource : material_staging_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 1,
+                    resource : material_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 2,
+                    resource : material_range_buf.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Returns a reference to the compute pipeline.
+    pub fn pipeline(&self) -> &ComputePipeline {
+        &self.pipeline
+    }
+}

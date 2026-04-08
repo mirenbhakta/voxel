@@ -29,11 +29,12 @@
 //     set 0, binding 1 : quad_buf             (read-only storage)
 //     set 0, binding 2 : chunk_offsets         (read-only storage)
 //     set 0, binding 3 : draw_data_buf         (read-only storage)
-//     set 0, binding 4 : material_volume       (read-only storage)
-//     set 0, binding 5 : material_table        (read-only storage)
-//     set 0, binding 6 : face_textures         (read-only storage)
-//     set 0, binding 7 : block_textures        (Texture2DArray)
-//     set 0, binding 8 : tex_sampler           (SamplerState)
+//     set 0, binding 4 : material_range_buf    (read-only storage)
+//     set 0, binding 5 : material_buf          (read-only storage)
+//     set 0, binding 6 : material_table        (read-only storage)
+//     set 0, binding 7 : face_textures         (read-only storage)
+//     set 0, binding 8 : block_textures        (Texture2DArray)
+//     set 0, binding 9 : tex_sampler           (SamplerState)
 
 #ifndef BINDINGS_HLSL
 #define BINDINGS_HLSL
@@ -62,8 +63,8 @@ struct DrawData {
 struct ChunkMeta {
     uint quad_count;
     uint flags;
-    uint _reserved0;
-    uint _reserved1;
+    uint sub_mask_lo;   // bits 0-31 of 64-bit sub-block visibility mask
+    uint sub_mask_hi;   // bits 32-63
 };
 
 /// Per-chunk quad range metadata.
@@ -85,6 +86,20 @@ struct Camera {
     uint     _pad1;
     uint     _pad2;
 };
+
+/// Per-chunk material range metadata for sparse sub-block packing.
+/// sub_mask is a 64-bit bitmask: bit i set means sub-block i (4x4x4
+/// grid of 8x8x8 blocks, index = bz*16 + by*4 + bx) is populated.
+struct MaterialRange {
+    uint buffer_index;   // segment index (always 0 for now)
+    uint base_offset;    // byte offset into packed material_buf
+    uint sub_mask_lo;    // bits 0-31 of sub-block visibility mask
+    uint sub_mask_hi;    // bits 32-63
+};
+
+/// Size of one material sub-block in bytes (8x8x8 voxels x 2 bytes).
+static const uint SUB_BLOCK_SIZE   = 8;
+static const uint SUB_BLOCK_BYTES  = 1024;  // 8*8*8 * 2 (u16 per voxel)
 
 /// GPU material entry (16 bytes, matches GpuMaterial in Rust).
 struct MaterialEntry {

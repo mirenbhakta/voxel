@@ -365,10 +365,9 @@ impl ChunkManager {
             match outcome {
                 GenOutcome::Generated(pos, chunk) => {
                     let occ = chunk.occupancy_words();
-                    let mat = chunk.material_block_ids();
 
                     self.world.insert_chunk(pos, chunk);
-                    gpu.insert(device, queue, pos, &occ, &mat);
+                    gpu.insert(device, queue, pos, &occ);
                 }
 
                 GenOutcome::Rejected(pos) => {
@@ -384,8 +383,9 @@ impl ChunkManager {
 
     /// Sync voxel edits from the CPU world to the GPU.
     ///
-    /// Drains the world's dirty list and re-uploads occupancy and
-    /// material data for each modified chunk.
+    /// Drains the world's dirty list and re-uploads occupancy data for
+    /// each modified chunk. Material data is staged during the build
+    /// dispatch rather than uploaded eagerly.
     fn sync_dirty_to_gpu(
         &mut self,
         gpu   : &mut GpuWorld,
@@ -407,10 +407,8 @@ impl ChunkManager {
             };
 
             let occ = chunk.occupancy_words();
-            let mat = chunk.material_block_ids();
 
             gpu.update_occupancy(queue, pos, &occ);
-            gpu.update_material(queue, pos, &mat);
         }
     }
 
@@ -443,6 +441,10 @@ impl ChunkManager {
 
         prioritized.truncate(self.builds_per_frame);
 
-        gpu.dispatch_counts(device, queue, &prioritized, &self.rejected);
+        let world = &self.world;
+        gpu.dispatch_counts(
+            device, queue, &prioritized, &self.rejected,
+            |pos| world.chunk(pos).map(|c| c.material_block_ids()),
+        );
     }
 }
