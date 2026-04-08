@@ -79,7 +79,7 @@ uint greedy_merge(uint layer, uint dir
             g_shared_face[r] = bits;
 
 #ifdef MERGE_MODE_WRITE
-            uint packed = pack_quad(col, r, layer, width, height, dir);
+            uint packed = pack_quad(col, r, layer, width, height);
             quad_buf.Store((write_offset + count) * 4, packed);
 #endif
 

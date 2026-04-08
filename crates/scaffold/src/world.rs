@@ -423,7 +423,9 @@ pub struct RenderStats {
     /// Quads in frustum-visible chunks (one frame latency).
     pub visible_quads  : u32,
     /// Quads on entirely back-facing directions (one frame latency).
-    pub backface_quads : u32,
+    pub backface_quads      : u32,
+    /// Quads outside the frustum-visible layer range (one frame latency).
+    pub layer_culled_quads  : u32,
     /// Quad buffer bytes currently allocated.
     pub quad_buf_used  : u64,
     /// Quad buffer total capacity in bytes.
@@ -577,6 +579,8 @@ pub struct GpuWorld {
     visible_quads        : u32,
     /// Last known back-face culled quad count (one frame latency).
     backface_quads       : u32,
+    /// Last known layer-culled quad count (one frame latency).
+    layer_culled_quads   : u32,
 
     // -- Draw state --
 
@@ -718,10 +722,10 @@ impl GpuWorld {
         });
 
         // Layout: [draw_count(4), visible_quads(4), backface_quads(4),
-        //          visible_chunks(4)].
+        //          visible_chunks(4), layer_culled_quads(4)].
         let draw_count_buf = device.create_buffer(&BufferDescriptor {
             label              : Some("draw_count_buf"),
-            size               : 16,
+            size               : 20,
             usage              : BufferUsages::STORAGE
                                | BufferUsages::INDIRECT
                                | BufferUsages::COPY_SRC
@@ -753,7 +757,7 @@ impl GpuWorld {
 
         let count_staging = device.create_buffer(&BufferDescriptor {
             label              : Some("cull_count_staging"),
-            size               : 16,
+            size               : 20,
             usage              : BufferUsages::COPY_DST
                                | BufferUsages::MAP_READ,
             mapped_at_creation : false,
@@ -1047,6 +1051,7 @@ impl GpuWorld {
             visible_count          : 0,
             visible_quads          : 0,
             backface_quads         : 0,
+            layer_culled_quads     : 0,
             active_slot_count      : 0,
         }
     }
@@ -1739,6 +1744,7 @@ impl GpuWorld {
             total_quads        : total_quads,
             visible_quads      : self.visible_quads,
             backface_quads     : self.backface_quads,
+            layer_culled_quads : self.layer_culled_quads,
             quad_buf_used      : quad_buf_used,
             quad_buf_total     : QUAD_BUF_SIZE,
             material_buf_used  : material_buf_used,
@@ -1842,7 +1848,7 @@ impl GpuWorld {
         encoder.copy_buffer_to_buffer(
             &self.draw_count_buf, 0,
             &self.count_staging,  0,
-            16,
+            20,
         );
     }
 
@@ -2039,16 +2045,18 @@ impl GpuWorld {
         let quads   = u32::from_le_bytes([data[4],  data[5],  data[6],  data[7]]);
         let backf   = u32::from_le_bytes([data[8],  data[9],  data[10], data[11]]);
         let chunks  = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
+        let lcull   = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
 
         drop(data);
 
         self.count_staging.unmap();
 
-        self.count_pending  = false;
+        self.count_pending      = false;
         self.count_ready.store(false, Ordering::Release);
-        self.visible_count  = chunks;
-        self.visible_quads  = quads;
-        self.backface_quads = backf;
+        self.visible_count      = chunks;
+        self.visible_quads      = quads;
+        self.backface_quads     = backf;
+        self.layer_culled_quads = lcull;
     }
 
     // -----------------------------------------------------------------------

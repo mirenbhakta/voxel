@@ -49,14 +49,6 @@ VS_Output main(uint vertex_id   : SV_VertexID,
     // Unpack quad fields.
     QuadFields q = unpack_quad(packed);
 
-    // If direction is 0xFFFFFFFF (Phase 1: all-directions mode),
-    // read it from the packed descriptor's high bits. In Phase 1 the
-    // build shader still writes direction in bits 25-27 for backward
-    // compatibility. In Phase 2+ this field is implicit.
-    if (direction == 0xFFFFFFFF) {
-        direction = (packed >> 25) & 0x7;
-    }
-
     // Pick the quad corner for this vertex.
     float2 corner = quad_corner(vertex_id, direction);
 

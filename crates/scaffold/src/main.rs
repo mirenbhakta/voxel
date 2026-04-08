@@ -1119,11 +1119,23 @@ fn draw_stats_ui(
                     ));
                     ui.end_row();
 
-                    ui.label("Drawn");
+                    ui.label("Layer culled");
+                    let lc_pct = if stats.visible_quads > 0 {
+                        100.0 * stats.layer_culled_quads as f64
+                             / stats.visible_quads as f64
+                    }
+                    else { 0.0 };
                     ui.label(format!(
-                        "{} quads, {} tris",
-                        stats.visible_quads - stats.backface_quads,
-                        (stats.visible_quads - stats.backface_quads) * 2,
+                        "{} ({:.0}%)", stats.layer_culled_quads, lc_pct,
+                    ));
+                    ui.end_row();
+
+                    ui.label("Drawn");
+                    let drawn = stats.visible_quads
+                        .saturating_sub(stats.backface_quads)
+                        .saturating_sub(stats.layer_culled_quads);
+                    ui.label(format!(
+                        "{} quads, {} tris", drawn, drawn * 2,
                     ));
                     ui.end_row();
                 });

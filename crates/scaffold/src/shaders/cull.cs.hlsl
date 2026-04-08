@@ -7,8 +7,7 @@
 //
 // Dispatch: ceil(total_slots / 64) workgroups of 64 threads.
 //
-// Phase 1: one MDI entry per visible chunk (all directions combined).
-// Phase 3 extends to per-(chunk, direction) entries with layer culling.
+// Phase 3: per-(chunk, direction) entries with frustum layer-range culling.
 
 #include "include/bindings.hlsl"
 #include "include/culling.hlsl"
@@ -31,6 +30,7 @@ RWByteAddressBuffer draw_count     : register(u6, space0);
 //   [ 4]: total visible quads (sum of quad_count for frustum-visible chunks)
 //   [ 8]: back-face culled quads (quads on entirely back-facing directions)
 //   [12]: visible chunk count (chunks that passed frustum test)
+//   [16]: layer-culled quads (quads outside the frustum-visible layer range)
 
 // Push constants.
 struct CullPush {
@@ -48,6 +48,31 @@ uint sum_direction_quads(uint slot, uint dir) {
         total += quad_range_buf.Load(base + l * 4);
     }
 
+    return total;
+}
+
+/// Sum layer counts in [l_min, l_max] and return the prefix to l_min.
+///
+/// Reads all 32 layer entries (sequential, cache-friendly) and
+/// partitions them into the prefix before l_min and the visible range.
+uint sum_layer_range(uint slot, uint dir, uint l_min, uint l_max,
+                     out uint prefix_to_lmin) {
+    uint base   = slot * 776 + 8 + dir * 128;
+    uint total  = 0;
+    uint prefix = 0;
+
+    for (uint l = 0; l < 32; l++) {
+        uint count = quad_range_buf.Load(base + l * 4);
+
+        if (l < l_min) {
+            prefix += count;
+        }
+        else if (l <= l_max) {
+            total += count;
+        }
+    }
+
+    prefix_to_lmin = prefix;
     return total;
 }
 
@@ -109,8 +134,9 @@ void main(uint3 gid : SV_DispatchThreadID) {
     float3 origin = float3(offset_raw);
     uint dir_count[6];
     uint dir_prefix[6];
-    uint running       = 0;
-    uint backface_total = 0;
+    uint running         = 0;
+    uint backface_total  = 0;
+    uint layercull_total = 0;
 
     for (uint d = 0; d < 6; d++) {
         dir_prefix[d] = running;
@@ -122,7 +148,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
     draw_count.InterlockedAdd(4, quad_count);
     draw_count.InterlockedAdd(12, 1);
 
-    // Emit one MDI entry per front-facing direction that has quads.
+    // Emit one MDI entry per front-facing direction that has quads,
+    // narrowed to the frustum-visible layer range.
     for (uint d = 0; d < 6; d++) {
         if (dir_count[d] == 0) {
             continue;
@@ -133,16 +160,41 @@ void main(uint3 gid : SV_DispatchThreadID) {
             continue;
         }
 
+        // Compute the visible layer range for this direction.
+        uint2 lr    = compute_layer_range(planes, origin, d);
+        uint  l_min = lr.x;
+        uint  l_max = lr.y;
+
+        // If the range is empty, the entire direction is layer-culled.
+        if (l_min > l_max) {
+            layercull_total += dir_count[d];
+            continue;
+        }
+
+        // Sum only the visible layers and get the prefix offset.
+        uint prefix_to_lmin;
+        uint visible_count = sum_layer_range(
+            slot, d, l_min, l_max, prefix_to_lmin
+        );
+
+        if (visible_count == 0) {
+            continue;
+        }
+
+        // Track layer-culled quads (outside the visible range).
+        layercull_total += dir_count[d] - visible_count;
+
         // Atomically append a visible draw.
         uint draw_index;
         draw_count.InterlockedAdd(0, 1, draw_index);
 
-        // Write the MDI entry.
+        // Write the MDI entry with the narrowed range.
         uint mdi_offset = draw_index * 16;
-        dst_draws.Store(mdi_offset +  0, 4);                              // vertex_count
-        dst_draws.Store(mdi_offset +  4, dir_count[d]);                   // instance_count
-        dst_draws.Store(mdi_offset +  8, 0);                              // first_vertex
-        dst_draws.Store(mdi_offset + 12, base_offset + dir_prefix[d]);    // first_instance
+        dst_draws.Store(mdi_offset +  0, 4);              // vertex_count
+        dst_draws.Store(mdi_offset +  4, visible_count);   // instance_count
+        dst_draws.Store(mdi_offset +  8, 0);               // first_vertex
+        dst_draws.Store(mdi_offset + 12,                    // first_instance
+            base_offset + dir_prefix[d] + prefix_to_lmin);
 
         // Write per-draw metadata with the actual direction.
         uint dd_offset = draw_index * 8;
@@ -150,8 +202,12 @@ void main(uint3 gid : SV_DispatchThreadID) {
         draw_data_buf.Store(dd_offset + 4, d);
     }
 
-    // Accumulate back-face culled quad count.
+    // Accumulate culled quad counts.
     if (backface_total > 0) {
         draw_count.InterlockedAdd(8, backface_total);
+    }
+
+    if (layercull_total > 0) {
+        draw_count.InterlockedAdd(16, layercull_total);
     }
 }

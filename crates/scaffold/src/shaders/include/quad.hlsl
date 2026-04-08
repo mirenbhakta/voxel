@@ -16,16 +16,12 @@
 #define QUAD_HLSL
 
 /// Pack quad fields into a single u32 descriptor.
-/// Direction is packed into bits 25-27 for Phase 1 backward compatibility
-/// (the vertex shader reads it when DrawData.direction == 0xFFFFFFFF).
-uint pack_quad(uint col, uint row, uint layer, uint width, uint height,
-               uint dir) {
+uint pack_quad(uint col, uint row, uint layer, uint width, uint height) {
     return col
         | (row       << 5)
         | (layer     << 10)
         | ((width  - 1) << 15)
-        | ((height - 1) << 20)
-        | (dir       << 25);
+        | ((height - 1) << 20);
 }
 
 /// Unpacked quad fields.
