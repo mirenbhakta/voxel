@@ -1,18 +1,24 @@
-//! GPU compute build pipelines for two-pass chunk quad generation.
+//! GPU compute build pipelines for three-pass chunk quad generation.
 //!
-//! The build stage runs in two passes over slot-indexed shared buffers:
+//! The build stage runs in three passes over slot-indexed shared buffers:
 //!
 //! 1. **Count pass** -- derives face bitmasks from occupancy and neighbor
 //!    boundaries, runs greedy merge, and writes per-(direction, layer)
 //!    quad counts to `quad_range_buf` and totals to `chunk_meta_buf`.
 //!
-//! 2. **Write pass** -- re-derives faces and merge, then writes packed
-//!    quad descriptors to contiguous ranges in `quad_buf` at prefix-summed
-//!    offsets computed from the count pass output.
+//! 2. **Alloc pass** -- reads quad counts from `chunk_meta_buf`, advances
+//!    a GPU-side bump pointer, and writes `base_offset` into
+//!    `quad_range_buf` for each chunk in the batch.
 //!
-//! Both passes use push constants (`BuildPush`) to select the chunk slot
-//! and base offset. All buffers are shared across chunks; no per-chunk GPU
-//! resources exist.
+//! 3. **Write pass** -- re-derives faces and merge, then writes packed
+//!    quad descriptors to contiguous ranges in `quad_buf` at prefix-summed
+//!    offsets computed from the count pass output and the base offset
+//!    written by the alloc pass.
+//!
+//! Count and write passes use push constants (`BuildPush`) to select the
+//! chunk slot. The alloc pass uses `AllocPush` with batch size and
+//! capacity. All three passes execute in a single command encoder
+//! submission.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::{
@@ -195,6 +201,190 @@ impl BuildCountPipeline {
                 BindGroupEntry {
                     binding  : 1,
                     resource : boundary_cache_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 2,
+                    resource : chunk_meta_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 3,
+                    resource : quad_range_buf.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Returns a reference to the compute pipeline.
+    pub fn pipeline(&self) -> &ComputePipeline {
+        &self.pipeline
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AllocPush
+// ---------------------------------------------------------------------------
+
+/// Push constants for the build alloc shader.
+///
+/// Passed via immediates at offset 0.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct AllocPush {
+    /// Number of chunks in this build batch.
+    pub batch_size : u32,
+    /// Total quad buffer capacity in quads.
+    pub capacity   : u32,
+}
+
+// ---------------------------------------------------------------------------
+// BuildAllocPipeline
+// ---------------------------------------------------------------------------
+
+/// The compute pipeline for the build alloc pass (pass 2).
+///
+/// Runs as a single-threaded (1,1,1) dispatch between the count and write
+/// passes. Reads quad counts from `chunk_meta_buf`, advances the GPU-side
+/// bump pointer in `bump_state_buf`, and writes `base_offset` into
+/// `quad_range_buf` for each chunk in the batch.
+pub struct BuildAllocPipeline {
+    /// The compiled compute pipeline.
+    pipeline  : ComputePipeline,
+    /// The bind group layout for alloc pass dispatches.
+    bg_layout : wgpu::BindGroupLayout,
+}
+
+impl BuildAllocPipeline {
+    /// Create the build alloc compute pipeline.
+    ///
+    /// Load the pre-compiled SPIR-V for `build_alloc.cs.hlsl` and build
+    /// the pipeline with the alloc pass bind group layout.
+    pub fn new(device: &Device) -> Self {
+        let alloc_spv = include_bytes!(
+            concat!(env!("OUT_DIR"), "/build_alloc.cs.spv")
+        );
+
+        // Safety: SPIR-V compiled from trusted HLSL by DXC at build time.
+        let shader = unsafe {
+            device.create_shader_module_passthrough(
+                ShaderModuleDescriptorPassthrough {
+                    label : Some("build_alloc_shader"),
+                    spirv : Some(wgpu::util::make_spirv_raw(alloc_spv)),
+                    ..Default::default()
+                },
+            )
+        };
+
+        let bg_layout = device.create_bind_group_layout(
+            &BindGroupLayoutDescriptor {
+                label   : Some("build_alloc_bgl"),
+                entries : &[
+                    // binding 0: bump_state_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 0,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 1: build_batch_buf (read-only storage)
+                    BindGroupLayoutEntry {
+                        binding    : 1,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : true,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 2: chunk_meta_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 2,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                    // binding 3: quad_range_buf (read-write storage)
+                    BindGroupLayoutEntry {
+                        binding    : 3,
+                        visibility : ShaderStages::COMPUTE,
+                        ty         : BindingType::Buffer {
+                            ty                 : BufferBindingType::Storage {
+                                read_only : false,
+                            },
+                            has_dynamic_offset : false,
+                            min_binding_size   : None,
+                        },
+                        count : None,
+                    },
+                ],
+            },
+        );
+
+        let pipeline_layout = device.create_pipeline_layout(
+            &PipelineLayoutDescriptor {
+                label              : Some("build_alloc_pl"),
+                bind_group_layouts : &[Some(&bg_layout)],
+                immediate_size     : 8,
+            },
+        );
+
+        let pipeline = device.create_compute_pipeline(
+            &ComputePipelineDescriptor {
+                label               : Some("build_alloc_pipeline"),
+                layout              : Some(&pipeline_layout),
+                module              : &shader,
+                entry_point         : Some("main"),
+                compilation_options : PipelineCompilationOptions::default(),
+                cache               : None,
+            },
+        );
+
+        BuildAllocPipeline { pipeline, bg_layout }
+    }
+
+    /// Create a bind group for the alloc pass.
+    ///
+    /// # Arguments
+    ///
+    /// * `device`          - The GPU device.
+    /// * `bump_state_buf`  - GPU-side bump pointer (read-write).
+    /// * `build_batch_buf` - Batch slot indices (read-only).
+    /// * `chunk_meta_buf`  - Per-chunk metadata (read-write, for overflow flag).
+    /// * `quad_range_buf`  - Per-chunk quad range data (read-write).
+    pub fn create_bind_group(
+        &self,
+        device          : &Device,
+        bump_state_buf  : &Buffer,
+        build_batch_buf : &Buffer,
+        chunk_meta_buf  : &Buffer,
+        quad_range_buf  : &Buffer,
+    ) -> BindGroup
+    {
+        device.create_bind_group(&BindGroupDescriptor {
+            label   : Some("build_alloc_bg"),
+            layout  : &self.bg_layout,
+            entries : &[
+                BindGroupEntry {
+                    binding  : 0,
+                    resource : bump_state_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding  : 1,
+                    resource : build_batch_buf.as_entire_binding(),
                 },
                 BindGroupEntry {
                     binding  : 2,

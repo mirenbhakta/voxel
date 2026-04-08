@@ -25,7 +25,10 @@ use wgpu::{
     TextureView, TextureViewDescriptor, TextureViewDimension,
 };
 
-use crate::build::{BuildCountPipeline, BuildWritePipeline, MaterialPackPipeline};
+use crate::build::{
+    AllocPush, BuildAllocPipeline, BuildCountPipeline, BuildWritePipeline,
+    MaterialPackPipeline,
+};
 use crate::cull::CullPipeline;
 use crate::multi_buffer::MultiBuffer;
 
@@ -300,6 +303,19 @@ impl ContiguousAllocator {
         self.coalesce_at(insert_pos);
     }
 
+    /// Returns the current bump pointer offset.
+    fn bump_offset(&self) -> u32 {
+        self.bump_offset
+    }
+
+    /// Set the bump pointer offset directly for GPU synchronization.
+    ///
+    /// Called after `process_build_feedback` reconstructs the post-alloc
+    /// bump value from the GPU-side allocation results.
+    fn set_bump_offset(&mut self, offset: u32) {
+        self.bump_offset = offset;
+    }
+
     /// Returns the number of free units available (free list + remaining
     /// bump space).
     fn free_quads(&self) -> u32 {
@@ -460,8 +476,8 @@ pub struct RenderStats {
 /// 1. Call [`process_build_feedback`](Self::process_build_feedback) to
 ///    harvest results from the previous frame's count passes.
 /// 2. Modify chunks via [`update_occupancy`](Self::update_occupancy).
-/// 3. Call [`dispatch_counts`](Self::dispatch_counts) or
-///    [`rebuild`](Self::rebuild) to dispatch count passes.
+/// 3. Call [`dispatch_build`](Self::dispatch_build) or
+///    [`rebuild`](Self::rebuild) to dispatch build passes.
 /// 4. Call [`dispatch_cull`](Self::dispatch_cull) to run frustum culling.
 /// 5. In the render pass, call [`draw`](Self::draw) to issue draw calls.
 pub struct GpuWorld {
@@ -486,6 +502,10 @@ pub struct GpuWorld {
     material_bufs        : MultiBuffer,
     /// Transient staging buffer for CPU material upload during builds.
     material_staging_buf : Buffer,
+    /// GPU-side bump pointer for the quad allocator (single u32).
+    bump_state_buf       : Buffer,
+    /// Slot indices for the current build batch.
+    build_batch_buf      : Buffer,
 
     // -- Cull/draw buffers --
 
@@ -504,7 +524,11 @@ pub struct GpuWorld {
     build_count_pipeline : BuildCountPipeline,
     /// Bind group for build count dispatches (shared buffers).
     build_count_bg       : BindGroup,
-    /// The build write compute pipeline (pass 2, created in build.rs).
+    /// The build alloc compute pipeline (pass 2, GPU bump allocation).
+    build_alloc_pipeline : BuildAllocPipeline,
+    /// Bind group for build alloc dispatches.
+    build_alloc_bg       : BindGroup,
+    /// The build write compute pipeline (pass 3, created in build.rs).
     build_write_pipeline : BuildWritePipeline,
     /// Bind group for build write dispatches (shared buffers).
     build_write_bg       : BindGroup,
@@ -562,8 +586,12 @@ pub struct GpuWorld {
     build_pending        : bool,
     /// Set by the map callback when the build staging data is ready.
     build_ready          : Arc<AtomicBool>,
-    /// Chunks awaiting write pass dispatch (count in flight).
+    /// Chunks awaiting feedback processing (build in flight).
     pending_builds       : Vec<PendingBuild>,
+    /// Bump offset before the last dispatch_build call. Used by
+    /// process_build_feedback to reconstruct per-chunk base offsets
+    /// from the prefix sum of returned quad counts.
+    pre_dispatch_bump    : u32,
 
     // -- Visible count async readback --
 
@@ -937,7 +965,40 @@ impl GpuWorld {
             &quad_range_buf,
         );
 
-        // -- Build write pipeline + bind group (pass 2) --
+        // -- Build alloc pipeline + bind group (pass 2) --
+        //
+        //   binding 0: bump_state_buf     (read-write storage)
+        //   binding 1: build_batch_buf    (read-only storage)
+        //   binding 2: chunk_meta_buf     (read-write storage)
+        //   binding 3: quad_range_buf     (read-write storage)
+
+        let bump_state_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("bump_state_buf"),
+            size               : 4,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let build_batch_buf = device.create_buffer(&BufferDescriptor {
+            label              : Some("build_batch_buf"),
+            size               : u64::from(MAX_BUILDS_IN_FLIGHT) * 4,
+            usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_DST,
+            mapped_at_creation : false,
+        });
+
+        let build_alloc_pipeline = BuildAllocPipeline::new(device);
+
+        let build_alloc_bg = build_alloc_pipeline.create_bind_group(
+            device,
+            &bump_state_buf,
+            &build_batch_buf,
+            &chunk_meta_buf,
+            &quad_range_buf,
+        );
+
+        // -- Build write pipeline + bind group (pass 3) --
         //
         //   binding 0: occupancy_buf       (read-only storage)
         //   binding 1: boundary_cache_buf  (read-only storage)
@@ -1014,12 +1075,16 @@ impl GpuWorld {
             material_range_buf     : material_range_buf,
             material_bufs          : material_bufs,
             material_staging_buf   : material_staging_buf,
+            bump_state_buf         : bump_state_buf,
+            build_batch_buf        : build_batch_buf,
             dst_indirect_buf       : dst_indirect_buf,
             draw_data_buf          : draw_data_buf,
             draw_count_buf         : draw_count_buf,
             frustum_buf            : frustum_buf,
             build_count_pipeline   : build_count_pipeline,
             build_count_bg         : build_count_bg,
+            build_alloc_pipeline   : build_alloc_pipeline,
+            build_alloc_bg         : build_alloc_bg,
             build_write_pipeline   : build_write_pipeline,
             build_write_bg         : build_write_bg,
             cull_pipeline          : cull_pipeline,
@@ -1045,6 +1110,7 @@ impl GpuWorld {
             build_pending          : false,
             build_ready            : Arc::new(AtomicBool::new(false)),
             pending_builds         : Vec::new(),
+            pre_dispatch_bump      : 0,
             count_staging          : count_staging,
             count_ready            : Arc::new(AtomicBool::new(false)),
             count_pending          : false,
@@ -1153,7 +1219,7 @@ impl GpuWorld {
     ///
     /// The occupancy buffer is written immediately via the queue. The
     /// build shader is not dispatched until
-    /// [`rebuild`](Self::rebuild) or [`dispatch_counts`](Self::dispatch_counts).
+    /// [`rebuild`](Self::rebuild) or [`dispatch_build`](Self::dispatch_build).
     pub fn update_occupancy(
         &mut self,
         queue : &Queue,
@@ -1195,16 +1261,20 @@ impl GpuWorld {
         self.allocator.free_quads()
     }
 
-    /// Dispatch count passes for a batch of dirty chunks.
+    /// Dispatch count, alloc, and write passes for a batch of dirty chunks.
     ///
-    /// Uploads neighbor boundary slices, dispatches the build count
-    /// compute shader for each chunk, copies quad counts to a staging
-    /// buffer, and starts an async map. Results are harvested next frame
-    /// by [`process_build_feedback`](Self::process_build_feedback).
+    /// Encodes all three build passes in a single command encoder:
+    /// 1. Count pass (per chunk) -- derives face counts.
+    /// 2. Alloc pass (single dispatch) -- GPU bump-allocates quad ranges.
+    /// 3. Write pass (per chunk) -- writes packed quad descriptors.
+    ///
+    /// After submission, copies metadata to a staging buffer and starts
+    /// an async map. Results are harvested next frame by
+    /// [`process_build_feedback`](Self::process_build_feedback).
     ///
     /// If a previous batch is still in flight (`build_pending`), this
     /// method returns immediately and the chunks remain dirty.
-    pub fn dispatch_counts(
+    pub fn dispatch_build(
         &mut self,
         device       : &Device,
         queue        : &Queue,
@@ -1232,7 +1302,34 @@ impl GpuWorld {
             return;
         }
 
-        // Upload neighbor boundary slices for chunks being counted.
+        // Collect slot indices for the batch buffer upload.
+        let slots: Vec<u32> = to_build.iter()
+            .filter_map(|pos| {
+                self.chunks.get(pos).map(|c| c.slot)
+            })
+            .collect();
+
+        debug_assert_eq!(slots.len(), to_build.len());
+        let batch_size = slots.len();
+
+        // Upload batch slot indices so the alloc shader knows which
+        // chunk_meta entries to read.
+        queue.write_buffer(
+            &self.build_batch_buf,
+            0,
+            bytemuck::cast_slice(&slots),
+        );
+
+        // Sync GPU bump pointer with CPU allocator state. This
+        // accounts for any frees (chunk unloads) since the last build.
+        self.pre_dispatch_bump = self.allocator.bump_offset();
+        queue.write_buffer(
+            &self.bump_state_buf,
+            0,
+            bytemuck::bytes_of(&self.pre_dispatch_bump),
+        );
+
+        // Upload neighbor boundary slices for chunks being built.
         for &pos in &to_build {
             let slices = build_neighbor_slices(
                 &self.chunks, pos, rejected,
@@ -1243,13 +1340,8 @@ impl GpuWorld {
             }
         }
 
-        // Batch all count passes into one encoder.
-        let mut encoder = device.create_command_encoder(
-            &CommandEncoderDescriptor::default(),
-        );
-
+        // Upload material volumes to staging.
         for (i, &pos) in to_build.iter().enumerate() {
-            // Stage material for this chunk.
             if let Some(mat) = material_for(pos) {
                 queue.write_buffer(
                     &self.material_staging_buf,
@@ -1257,7 +1349,16 @@ impl GpuWorld {
                     bytemuck::cast_slice(&mat),
                 );
             }
+        }
 
+        // Encode count + alloc + write in a single encoder.
+        let mut encoder = device.create_command_encoder(
+            &CommandEncoderDescriptor::default(),
+        );
+
+        // -- Pass 1: count (per chunk) --
+
+        for (i, &pos) in to_build.iter().enumerate() {
             let Some(chunk) = self.chunks.get(&pos)
             else {
                 continue;
@@ -1272,7 +1373,6 @@ impl GpuWorld {
                 Some(u64::from(CHUNK_META_BYTES)),
             );
 
-            // Dispatch the build count pass.
             {
                 let mut pass = encoder.begin_compute_pass(
                     &ComputePassDescriptor {
@@ -1294,16 +1394,6 @@ impl GpuWorld {
                 pass.dispatch_workgroups(32, 6, 1);
             }
 
-            // Copy the full ChunkMeta (quad_count + flags + sub_mask)
-            // to the staging buffer at this chunk's index position.
-            encoder.copy_buffer_to_buffer(
-                &self.chunk_meta_buf,
-                u64::from(slot) * u64::from(CHUNK_META_BYTES),
-                &self.build_staging,
-                u64::from(i as u32) * u64::from(BUILD_STAGING_ENTRY_BYTES),
-                u64::from(BUILD_STAGING_ENTRY_BYTES),
-            );
-
             self.pending_builds.push(PendingBuild {
                 pos           : pos,
                 slot          : slot,
@@ -1311,31 +1401,94 @@ impl GpuWorld {
             });
         }
 
+        // -- Pass 2: alloc (single dispatch) --
+
+        {
+            let mut pass = encoder.begin_compute_pass(
+                &ComputePassDescriptor {
+                    label            : Some("build_alloc"),
+                    timestamp_writes : None,
+                },
+            );
+
+            pass.set_pipeline(
+                self.build_alloc_pipeline.pipeline(),
+            );
+            pass.set_bind_group(0, &self.build_alloc_bg, &[]);
+
+            let push = AllocPush {
+                batch_size : batch_size as u32,
+                capacity   : self.allocator.capacity(),
+            };
+            pass.set_immediates(
+                0, bytemuck::bytes_of(&push),
+            );
+
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+
+        // Copy metadata to staging (captures quad_count + flags +
+        // sub_mask written by count, and flags potentially set by alloc).
+        for pb in &self.pending_builds {
+            encoder.copy_buffer_to_buffer(
+                &self.chunk_meta_buf,
+                u64::from(pb.slot) * u64::from(CHUNK_META_BYTES),
+                &self.build_staging,
+                u64::from(pb.staging_index)
+                    * u64::from(BUILD_STAGING_ENTRY_BYTES),
+                u64::from(BUILD_STAGING_ENTRY_BYTES),
+            );
+        }
+
+        // -- Pass 3: write (per chunk) --
+
+        for pb in &self.pending_builds {
+            let mut pass = encoder.begin_compute_pass(
+                &ComputePassDescriptor {
+                    label            : Some("build_write"),
+                    timestamp_writes : None,
+                },
+            );
+
+            pass.set_pipeline(
+                self.build_write_pipeline.pipeline(),
+            );
+            pass.set_bind_group(0, &self.build_write_bg, &[]);
+
+            let push = [pb.slot, 0u32];
+            pass.set_immediates(
+                0, bytemuck::cast_slice(&push),
+            );
+
+            pass.dispatch_workgroups(32, 6, 1);
+        }
+
         queue.submit(Some(encoder.finish()));
 
-        // The count pass just wrote a new quad_count into chunk_meta_buf
-        // on the GPU. The cull shader runs later this frame and would
-        // read that count before the write pass has allocated quads or
-        // set base_offset, producing garbage draws. Restore each
-        // chunk's current CPU-side quad_count so:
+        // The build passes wrote new quad_count and base_offset into
+        // GPU buffers. The cull shader runs later this frame and must
+        // see the old values until process_build_feedback commits the
+        // new ones next frame.
         //   - New chunks (quad_count = 0): cull shader skips them.
-        //   - Existing chunks (quad_count > 0): cull shader renders
-        //     the old quads at the old base_offset for one more frame.
-        // The staged writes are flushed at the next queue.submit (the
-        // main frame encoder). process_build_feedback sets the correct
-        // values next frame after the write pass.
+        //   - Existing chunks: render the old quads one more frame.
         for pb in &self.pending_builds {
-            let qc = self.chunks.get(&pb.pos)
-                .map_or(0u32, |c| c.quad_count);
+            let (qc, bo) = self.chunks.get(&pb.pos)
+                .map_or((0u32, 0u32), |c| (c.quad_count, c.quad_offset));
 
             queue.write_buffer(
                 &self.chunk_meta_buf,
                 u64::from(pb.slot) * u64::from(CHUNK_META_BYTES),
                 bytemuck::bytes_of(&qc),
             );
+
+            queue.write_buffer(
+                &self.quad_range_buf,
+                u64::from(pb.slot) * u64::from(QUAD_RANGE_BYTES) + 4,
+                bytemuck::bytes_of(&bo),
+            );
         }
 
-        // Mark counted chunks: clear dirty, set in-flight.
+        // Mark built chunks: clear dirty, set in-flight.
         for pb in &self.pending_builds {
             if let Some(chunk) = self.chunks.get_mut(&pb.pos) {
                 chunk.dirty           = false;
@@ -1362,16 +1515,18 @@ impl GpuWorld {
         });
     }
 
-    /// Harvest async build count results and dispatch write passes.
+    /// Harvest async build results and commit chunk visibility.
     ///
-    /// Reads quad counts from the staging buffer mapped by the previous
-    /// frame's [`dispatch_counts`](Self::dispatch_counts), allocates or
-    /// resizes quad ranges, and dispatches the build write compute
-    /// shader for each chunk. Updates `chunk_meta_buf` and
-    /// `quad_range_buf` so the cull shader sees the new data.
+    /// Reads quad counts, flags, and sub-block masks from the staging
+    /// buffer mapped by the previous frame's
+    /// [`dispatch_build`](Self::dispatch_build). The GPU already
+    /// allocated quad ranges and wrote quad descriptors; this method
+    /// reconstructs base offsets (prefix sum of quad counts from the
+    /// known pre-dispatch bump value), handles material allocation,
+    /// and writes final metadata to GPU buffers so the cull shader
+    /// sees the new chunks.
     ///
-    /// Call at the start of the frame, before `sync_dirty_to_gpu` and
-    /// `dispatch_counts`.
+    /// Call at the start of the frame, before `dispatch_build`.
     pub fn process_build_feedback(
         &mut self,
         device : &Device,
@@ -1389,12 +1544,13 @@ impl GpuWorld {
             return;
         }
 
-        // Read quad counts and sub-block masks from the mapped staging
-        // buffer. Each entry is a full ChunkMeta (16 bytes).
+        // Read quad counts, flags, and sub-block masks from the mapped
+        // staging buffer. Each entry is a full ChunkMeta (16 bytes).
         let pending = std::mem::take(&mut self.pending_builds);
 
         struct BuildResult {
             quad_count  : u32,
+            flags       : u32,
             sub_mask_lo : u32,
             sub_mask_hi : u32,
         }
@@ -1414,7 +1570,10 @@ impl GpuWorld {
                         data[off],     data[off + 1],
                         data[off + 2], data[off + 3],
                     ]),
-                    // Skip flags at offset+4..+8.
+                    flags       : u32::from_le_bytes([
+                        data[off + 4], data[off + 5],
+                        data[off + 6], data[off + 7],
+                    ]),
                     sub_mask_lo : u32::from_le_bytes([
                         data[off + 8],  data[off + 9],
                         data[off + 10], data[off + 11],
@@ -1433,11 +1592,12 @@ impl GpuWorld {
         self.build_pending = false;
         self.build_ready.store(false, Ordering::Release);
 
-        // Allocate or resize quad ranges for each pending chunk.
-        //
-        // Collect (slot, base_offset, quad_count) for the write pass
-        // dispatch that follows.
-        struct WriteJob {
+        // Reconstruct base offsets from the prefix sum of quad counts.
+        // The GPU alloc shader processed chunks in batch order, so the
+        // CPU can replay the same logic: skip 0-count and overflowed
+        // entries, advance a running bump pointer for the rest.
+        struct CommitJob {
+            pos           : ChunkPos,
             slot          : u32,
             base_offset   : u32,
             quad_count    : u32,
@@ -1445,52 +1605,55 @@ impl GpuWorld {
             popcount      : u32,
         }
 
-        let mut write_jobs: Vec<WriteJob> = Vec::with_capacity(pending.len());
+        let mut commit_jobs: Vec<CommitJob> =
+            Vec::with_capacity(pending.len());
+
+        let mut running_bump = self.pre_dispatch_bump;
 
         for (pb, br) in pending.iter().zip(results.iter()) {
-            let quad_count = br.quad_count;
-            let popcount   = br.sub_mask_lo.count_ones()
-                           + br.sub_mask_hi.count_ones();
+            // Overflow: the alloc shader set flags = 1. Re-mark dirty.
+            if br.flags != 0 {
+                if let Some(chunk) = self.chunks.get_mut(&pb.pos) {
+                    chunk.quad_count      = 0;
+                    chunk.count_in_flight = false;
+                    chunk.dirty           = true;
+                    self.dirty.push(pb.pos);
+                }
 
-            // Phase 1: quad allocation and material free.
+                continue;
+            }
+
+            // Mirror the alloc shader: skip 0-count chunks.
+            if br.quad_count == 0 {
+                continue;
+            }
+
+            let base_offset = running_bump;
+            running_bump   += br.quad_count;
+
+            let popcount = br.sub_mask_lo.count_ones()
+                         + br.sub_mask_hi.count_ones();
+
+            // Free the old quad allocation. The GPU always bump-
+            // allocated a new range, so the old one is dead.
             let Some(chunk) = self.chunks.get_mut(&pb.pos)
             else {
                 continue;
             };
 
-            // Free old quad allocation if the new count doesn't fit.
-            if quad_count > chunk.quad_alloc {
-                if chunk.quad_alloc > 0 {
-                    self.allocator.free(
-                        chunk.quad_offset, chunk.quad_alloc,
-                    );
-
-                    chunk.quad_offset = 0;
-                    chunk.quad_alloc  = 0;
-                }
-
-                if let Some(offset) = self.allocator.alloc(quad_count) {
-                    chunk.quad_offset = offset;
-                    chunk.quad_alloc  = quad_count;
-                }
-                else {
-                    // Allocator exhausted. Re-mark dirty for retry.
-                    chunk.quad_count      = 0;
-                    chunk.count_in_flight = false;
-
-                    if !chunk.dirty {
-                        chunk.dirty = true;
-                        self.dirty.push(pb.pos);
-                    }
-
-                    continue;
-                }
+            if chunk.quad_alloc > 0 {
+                self.allocator.free(
+                    chunk.quad_offset, chunk.quad_alloc,
+                );
             }
 
-            chunk.quad_count = quad_count;
-            let base_offset  = chunk.quad_offset;
+            chunk.quad_offset = base_offset;
+            chunk.quad_alloc  = br.quad_count;
+            chunk.quad_count  = br.quad_count;
+            chunk.sub_mask    = u64::from(br.sub_mask_lo)
+                              | (u64::from(br.sub_mask_hi) << 32);
 
-            // Free old material allocation if needed.
+            // Free old material allocation if the new count is larger.
             let needs_mat_alloc = if popcount > chunk.material_alloc {
                 if chunk.material_alloc > 0 {
                     self.material_bufs.free(
@@ -1507,7 +1670,7 @@ impl GpuWorld {
                 false
             };
 
-            // Phase 2: material allocation (auto-grows on exhaustion).
+            // Material allocation (auto-grows on exhaustion).
             if needs_mat_alloc {
                 let offset = self.material_bufs.alloc(device, popcount);
                 let chunk  = self.chunks.get_mut(&pb.pos).unwrap();
@@ -1515,44 +1678,18 @@ impl GpuWorld {
                 chunk.material_alloc  = popcount;
             }
 
-            // Phase 3: write GPU metadata and collect write jobs.
-            let chunk = self.chunks.get_mut(&pb.pos).unwrap();
-
-            chunk.sub_mask = u64::from(br.sub_mask_lo)
-                           | (u64::from(br.sub_mask_hi) << 32);
-
-            // Write base_offset into quad_range_buf so the cull shader
-            // can read it when constructing MDI entries.
-            queue.write_buffer(
-                &self.quad_range_buf,
-                u64::from(pb.slot) * u64::from(QUAD_RANGE_BYTES) + 4,
-                bytemuck::bytes_of(&base_offset),
-            );
-
-            // Write material range so the vertex shader can read it.
-            let (seg_idx, local_bytes) =
-                self.material_bufs.resolve(chunk.material_offset);
-            let mat_range: [u32; 4] = [
-                seg_idx,
-                local_bytes,
-                br.sub_mask_lo,
-                br.sub_mask_hi,
-            ];
-
-            queue.write_buffer(
-                &self.material_range_buf,
-                u64::from(pb.slot) * u64::from(MATERIAL_RANGE_BYTES),
-                bytemuck::cast_slice(&mat_range),
-            );
-
-            write_jobs.push(WriteJob {
+            commit_jobs.push(CommitJob {
+                pos           : pb.pos,
                 slot          : pb.slot,
                 base_offset   : base_offset,
-                quad_count    : quad_count,
+                quad_count    : br.quad_count,
                 staging_index : pb.staging_index,
                 popcount      : popcount,
             });
         }
+
+        // Sync CPU allocator bump pointer with GPU state.
+        self.allocator.set_bump_offset(running_bump);
 
         // Rebuild material bind groups if the buffer grew during
         // allocation above, before encoding any dispatches that use them.
@@ -1571,43 +1708,45 @@ impl GpuWorld {
                 );
         }
 
-        // Batch all write and material pack passes into one encoder.
-        let has_work = write_jobs.iter()
-            .any(|j| j.quad_count > 0 || j.popcount > 0);
+        // Write GPU metadata for committed chunks.
+        for job in &commit_jobs {
+            // The alloc pass already wrote base_offset to quad_range_buf,
+            // but dispatch_build restored the old value for the cull
+            // shader. Re-write the GPU-allocated offset now.
+            queue.write_buffer(
+                &self.quad_range_buf,
+                u64::from(job.slot) * u64::from(QUAD_RANGE_BYTES) + 4,
+                bytemuck::bytes_of(&job.base_offset),
+            );
 
-        if has_work {
+            // Write material range so the vertex shader can read it.
+            let chunk = self.chunks.get(&job.pos).unwrap();
+            let (seg_idx, local_bytes) =
+                self.material_bufs.resolve(chunk.material_offset);
+            let mat_range: [u32; 4] = [
+                seg_idx,
+                local_bytes,
+                (chunk.sub_mask & 0xFFFF_FFFF) as u32,
+                (chunk.sub_mask >> 32) as u32,
+            ];
+
+            queue.write_buffer(
+                &self.material_range_buf,
+                u64::from(job.slot) * u64::from(MATERIAL_RANGE_BYTES),
+                bytemuck::cast_slice(&mat_range),
+            );
+        }
+
+        // Dispatch material pack passes for chunks with populated
+        // sub-blocks.
+        let has_mat_work = commit_jobs.iter().any(|j| j.popcount > 0);
+
+        if has_mat_work {
             let mut encoder = device.create_command_encoder(
                 &CommandEncoderDescriptor::default(),
             );
 
-            for job in &write_jobs {
-                if job.quad_count == 0 {
-                    continue;
-                }
-
-                let mut pass = encoder.begin_compute_pass(
-                    &ComputePassDescriptor {
-                        label            : Some("build_write"),
-                        timestamp_writes : None,
-                    },
-                );
-
-                pass.set_pipeline(
-                    self.build_write_pipeline.pipeline(),
-                );
-                pass.set_bind_group(0, &self.build_write_bg, &[]);
-
-                let push = [job.slot, job.base_offset];
-                pass.set_immediates(
-                    0, bytemuck::cast_slice(&push),
-                );
-
-                pass.dispatch_workgroups(32, 6, 1);
-            }
-
-            // Dispatch material pack passes for chunks with populated
-            // sub-blocks.
-            for job in &write_jobs {
+            for job in &commit_jobs {
                 if job.popcount == 0 {
                     continue;
                 }
@@ -1642,7 +1781,7 @@ impl GpuWorld {
         // Write quad_count to chunk_meta_buf so the cull shader can
         // read it. Staged here, flushed at the next queue.submit
         // (the main frame encoder with cull + render).
-        for job in &write_jobs {
+        for job in &commit_jobs {
             queue.write_buffer(
                 &self.chunk_meta_buf,
                 u64::from(job.slot) * u64::from(CHUNK_META_BYTES),
@@ -1666,7 +1805,7 @@ impl GpuWorld {
 
     /// Dispatch the build shader for all dirty chunks.
     ///
-    /// Convenience wrapper around [`dispatch_counts`](Self::dispatch_counts)
+    /// Convenience wrapper around [`dispatch_build`](Self::dispatch_build)
     /// that processes every dirty chunk.
     pub fn rebuild(
         &mut self,
@@ -1676,7 +1815,7 @@ impl GpuWorld {
     )
     {
         let all_dirty: Vec<ChunkPos> = self.dirty.clone();
-        self.dispatch_counts(
+        self.dispatch_build(
             device, queue, &all_dirty, rejected,
             |_| None,
         );

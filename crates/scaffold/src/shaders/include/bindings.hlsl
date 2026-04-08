@@ -6,12 +6,25 @@
 //
 // Binding layout per pipeline:
 //
-//   Build (count + write):
+//   Build count:
 //     set 0, binding 0 : occupancy_buf      (read-only storage)
 //     set 0, binding 1 : boundary_cache_buf  (read-only storage)
 //     set 0, binding 2 : chunk_meta_buf      (read-write storage)
 //     set 0, binding 3 : quad_range_buf      (read-write storage)
-//     set 0, binding 4 : quad_buf            (read-write storage, write pass only)
+//     push constants    : BuildPush { slot_index, base_offset }
+//
+//   Build alloc:
+//     set 0, binding 0 : bump_state_buf     (read-write storage)
+//     set 0, binding 1 : build_batch_buf    (read-only storage)
+//     set 0, binding 2 : chunk_meta_buf     (read-write storage)
+//     set 0, binding 3 : quad_range_buf     (read-write storage)
+//     push constants    : AllocPush { batch_size, capacity }
+//
+//   Build write:
+//     set 0, binding 0 : occupancy_buf      (read-only storage)
+//     set 0, binding 1 : boundary_cache_buf  (read-only storage)
+//     set 0, binding 2 : quad_range_buf      (read-only storage)
+//     set 0, binding 3 : quad_buf            (read-write storage)
 //     push constants    : BuildPush { slot_index, base_offset }
 //
 //   Cull:

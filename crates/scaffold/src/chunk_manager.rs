@@ -442,7 +442,7 @@ impl ChunkManager {
         prioritized.truncate(self.builds_per_frame);
 
         let world = &self.world;
-        gpu.dispatch_counts(
+        gpu.dispatch_build(
             device, queue, &prioritized, &self.rejected,
             |pos| world.chunk(pos).map(|c| c.material_block_ids()),
         );

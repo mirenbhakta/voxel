@@ -77,7 +77,9 @@ void main(uint3 lid : SV_GroupThreadID,
             prefix += quad_range_buf.Load(range_base + dir * 128 + l * 4);
         }
 
-        uint write_offset = push.base_offset + prefix;
+        // The alloc pass wrote base_offset into quad_range_buf.
+        uint base = quad_range_buf.Load(push.slot_index * 776 + 4);
+        uint write_offset = base + prefix;
 
         greedy_merge(layer, dir, quad_buf, write_offset);
     }
