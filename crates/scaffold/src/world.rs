@@ -1608,6 +1608,28 @@ impl GpuWorld {
         let mut commit_jobs: Vec<CommitJob> =
             Vec::with_capacity(pending.len());
 
+        // Advance the bump pointer to its final value before freeing
+        // old allocations. free() retracts bump_offset when a freed
+        // range abuts it, but the subsequent set_bump_offset would
+        // jump the pointer forward, stranding the retracted range
+        // below the bump with no free-list entry -- a silent leak.
+        // Setting the final value first ensures old allocations
+        // (which end at or below pre_dispatch_bump) can never trigger
+        // retraction into the GPU-allocated region.
+        let final_bump = {
+            let mut b = self.pre_dispatch_bump;
+
+            for br in results.iter() {
+                if br.flags == 0 && br.quad_count > 0 {
+                    b += br.quad_count;
+                }
+            }
+
+            b
+        };
+
+        self.allocator.set_bump_offset(final_bump);
+
         let mut running_bump = self.pre_dispatch_bump;
 
         for (pb, br) in pending.iter().zip(results.iter()) {
@@ -1687,9 +1709,6 @@ impl GpuWorld {
                 popcount      : popcount,
             });
         }
-
-        // Sync CPU allocator bump pointer with GPU state.
-        self.allocator.set_bump_offset(running_bump);
 
         // Rebuild material bind groups if the buffer grew during
         // allocation above, before encoding any dispatches that use them.
