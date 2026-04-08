@@ -144,6 +144,13 @@ void main(uint3 gid : SV_DispatchThreadID) {
         running += dir_count[d];
     }
 
+    // Guard against a 1-frame desync between restored quad_count and
+    // GPU-written dir_layer_counts during in-flight rebuilds. If the
+    // totals disagree the prefix sums are stale -- skip this chunk.
+    if (running != quad_count) {
+        return;
+    }
+
     // Accumulate chunk and quad visibility counters.
     draw_count.InterlockedAdd(4, quad_count);
     draw_count.InterlockedAdd(12, 1);

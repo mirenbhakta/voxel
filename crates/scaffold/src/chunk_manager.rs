@@ -251,8 +251,9 @@ impl ChunkManager {
 
     /// Remove chunks beyond the view distance from CPU and GPU.
     ///
-    /// Uses `view_distance + 1` as the threshold to provide hysteresis
-    /// and prevent load/unload thrashing at the boundary.
+    /// Uses `view_distance + 1` as the threshold to provide one chunk
+    /// of hysteresis between the load and unload radii, preventing
+    /// load/unload thrashing at the boundary.
     fn unload_distant_chunks(
         &mut self,
         gpu   : &mut GpuWorld,
@@ -270,7 +271,7 @@ impl ChunkManager {
                 let dx = pos.x - cx;
                 let dy = pos.y - cy;
                 let dz = pos.z - cz;
-                dx * dx + dy * dy + dz * dz > threshold
+                dx * dx + dy * dy + dz * dz >= threshold
             })
             .collect();
 
@@ -285,7 +286,7 @@ impl ChunkManager {
             let dx = pos.x - cx;
             let dy = pos.y - cy;
             let dz = pos.z - cz;
-            dx * dx + dy * dy + dz * dz <= threshold
+            dx * dx + dy * dy + dz * dz < threshold
         });
     }
 

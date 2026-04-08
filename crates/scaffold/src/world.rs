@@ -694,6 +694,7 @@ impl GpuWorld {
             size               : u64::from(MAX_CHUNKS)
                                * u64::from(QUAD_RANGE_BYTES),
             usage              : BufferUsages::STORAGE
+                               | BufferUsages::COPY_SRC
                                | BufferUsages::COPY_DST,
             mapped_at_creation : false,
         });
