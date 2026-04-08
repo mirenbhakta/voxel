@@ -29,6 +29,7 @@ use crate::build::{
     MaterialPackPipeline,
 };
 use crate::cull::CullPipeline;
+use crate::gpu_alloc::GpuAllocator;
 use crate::multi_buffer::MultiBuffer;
 
 // ---------------------------------------------------------------------------
@@ -65,20 +66,9 @@ const DRAW_DATA_BYTES: u32 = 8;
 /// to 6 MDI entries (one per front-facing direction).
 const MAX_DRAWS: u32 = MAX_CHUNKS * 6;
 
-/// Maximum entries in the quad free list. One entry per chunk is
+/// Maximum entries in each GPU free list. One entry per chunk is
 /// sufficient since each chunk produces at most one contiguous range.
-const QUAD_FREE_LIST_MAX: u32 = MAX_CHUNKS;
-
-/// Bytes for the quad free list buffer. Layout: count(4) + entries,
-/// where each entry is (offset: u32, size: u32) = 8 bytes.
-const QUAD_FREE_LIST_BYTES: u64 = 4 + (QUAD_FREE_LIST_MAX as u64) * 8;
-
-/// Maximum entries in the material free list.
-const MATERIAL_FREE_LIST_MAX: u32 = MAX_CHUNKS;
-
-/// Bytes for the material free list buffer.
-const MATERIAL_FREE_LIST_BYTES: u64 =
-    4 + (MATERIAL_FREE_LIST_MAX as u64) * 8;
+const FREE_LIST_MAX: u32 = MAX_CHUNKS;
 
 /// Conservative upper bound on quads per chunk. Used for capacity
 /// estimation when throttling chunk loads. Derived from the worst-case
@@ -339,18 +329,12 @@ pub struct GpuWorld {
     material_bufs        : MultiBuffer,
     /// Transient staging buffer for CPU material upload during builds.
     material_staging_buf : Buffer,
-    /// GPU-side bump pointer for the quad allocator (single u32).
-    bump_state_buf       : Buffer,
+    /// Quad range allocator (GPU bump + free list).
+    quad_alloc           : GpuAllocator,
     /// Slot indices for the current build batch.
     build_batch_buf      : Buffer,
-    /// GPU-visible free list for quad range reuse. Layout: count(4) +
-    /// (offset, size) pairs. CPU pushes freed ranges before dispatch;
-    /// the alloc pass scans first-fit before bump fallback.
-    quad_free_list_buf   : Buffer,
-    /// GPU-side persistent material bump pointer (single u32).
-    material_bump_state_buf : Buffer,
-    /// GPU-visible free list for material sub-block reuse.
-    material_free_list_buf  : Buffer,
+    /// Material sub-block allocator (GPU bump + free list).
+    material_alloc       : GpuAllocator,
     /// Indirect dispatch args for material pack, written by the alloc
     /// pass. Layout: (x, y, z) per batch entry, 12 bytes each.
     material_dispatch_buf   : Buffer,
@@ -434,13 +418,6 @@ pub struct GpuWorld {
     build_ready          : Arc<AtomicBool>,
     /// Chunks awaiting feedback processing (build in flight).
     pending_builds       : Vec<PendingBuild>,
-    /// CPU-side accumulator for freed quad ranges. Pushed to
-    /// `quad_free_list_buf` at the start of each `dispatch_build`.
-    /// Flat layout: [offset0, size0, offset1, size1, ...].
-    quad_free_list       : Vec<u32>,
-    /// CPU-side accumulator for freed material sub-block ranges.
-    /// Same flat layout as `quad_free_list`.
-    material_free_list   : Vec<u32>,
 
     // -- Visible count async readback --
 
@@ -817,48 +794,15 @@ impl GpuWorld {
         );
 
         // -- Build alloc pipeline + bind group (pass 2) --
-        //
-        //   binding 0: bump_state_buf     (read-write storage)
-        //   binding 1: build_batch_buf    (read-only storage)
-        //   binding 2: chunk_meta_buf     (read-write storage)
-        //   binding 3: quad_range_buf     (read-write storage)
-        //   binding 4: quad_free_list_buf (read-write storage)
 
-        let bump_state_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("bump_state_buf"),
-            size               : 4,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
+        let quad_alloc     = GpuAllocator::new(device, "quad", FREE_LIST_MAX);
+        let material_alloc = GpuAllocator::new(
+            device, "material", FREE_LIST_MAX,
+        );
 
         let build_batch_buf = device.create_buffer(&BufferDescriptor {
             label              : Some("build_batch_buf"),
             size               : u64::from(MAX_BUILDS_IN_FLIGHT) * 4,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
-
-        let quad_free_list_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("quad_free_list_buf"),
-            size               : QUAD_FREE_LIST_BYTES,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
-
-        let material_bump_state_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("material_bump_state_buf"),
-            size               : 4,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
-
-        let material_free_list_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("material_free_list_buf"),
-            size               : MATERIAL_FREE_LIST_BYTES,
             usage              : BufferUsages::STORAGE
                                | BufferUsages::COPY_DST,
             mapped_at_creation : false,
@@ -878,14 +822,14 @@ impl GpuWorld {
 
         let build_alloc_bg = build_alloc_pipeline.create_bind_group(
             device,
-            &bump_state_buf,
+            quad_alloc.bump_buf(),
             &build_batch_buf,
             &chunk_meta_buf,
             &quad_range_buf,
-            &quad_free_list_buf,
+            quad_alloc.free_list_buf(),
             &material_range_buf,
-            &material_bump_state_buf,
-            &material_free_list_buf,
+            material_alloc.bump_buf(),
+            material_alloc.free_list_buf(),
             &material_dispatch_buf,
         );
 
@@ -966,12 +910,10 @@ impl GpuWorld {
             material_range_buf     : material_range_buf,
             material_bufs          : material_bufs,
             material_staging_buf   : material_staging_buf,
-            bump_state_buf         : bump_state_buf,
+            quad_alloc             : quad_alloc,
             build_batch_buf        : build_batch_buf,
-            quad_free_list_buf     : quad_free_list_buf,
-            material_bump_state_buf : material_bump_state_buf,
-            material_free_list_buf  : material_free_list_buf,
-            material_dispatch_buf   : material_dispatch_buf,
+            material_alloc         : material_alloc,
+            material_dispatch_buf  : material_dispatch_buf,
             dst_indirect_buf       : dst_indirect_buf,
             draw_data_buf          : draw_data_buf,
             draw_count_buf         : draw_count_buf,
@@ -1004,8 +946,6 @@ impl GpuWorld {
             build_pending          : false,
             build_ready            : Arc::new(AtomicBool::new(false)),
             pending_builds         : Vec::new(),
-            quad_free_list         : Vec::new(),
-            material_free_list     : Vec::new(),
             count_staging          : count_staging,
             count_ready            : Arc::new(AtomicBool::new(false)),
             count_pending          : false,
@@ -1077,13 +1017,15 @@ impl GpuWorld {
     pub fn remove(&mut self, queue: &Queue, pos: ChunkPos) {
         if let Some(chunk) = self.chunks.remove(&pos) {
             if chunk.quad_alloc > 0 {
-                self.quad_free_list.push(chunk.quad_offset);
-                self.quad_free_list.push(chunk.quad_alloc);
+                self.quad_alloc.push_free(
+                    chunk.quad_offset, chunk.quad_alloc,
+                );
             }
 
             if chunk.material_alloc > 0 {
-                self.material_free_list.push(chunk.material_offset);
-                self.material_free_list.push(chunk.material_alloc);
+                self.material_alloc.push_free(
+                    chunk.material_offset, chunk.material_alloc,
+                );
             }
 
             self.free_slot(chunk.slot);
@@ -1224,60 +1166,9 @@ impl GpuWorld {
             bytemuck::cast_slice(&slots),
         );
 
-        // Upload accumulated quad free list to the GPU buffer.
-        // Layout: [count(4), entries...] where each entry is
-        // (offset: u32, size: u32) = 8 bytes. The CPU-side vec
-        // stores these flat: [off0, sz0, off1, sz1, ...].
-        {
-            let entry_count = (self.quad_free_list.len() / 2)
-                .min(QUAD_FREE_LIST_MAX as usize) as u32;
-
-            queue.write_buffer(
-                &self.quad_free_list_buf,
-                0,
-                bytemuck::bytes_of(&entry_count),
-            );
-
-            if entry_count > 0 {
-                let word_count = entry_count as usize * 2;
-
-                queue.write_buffer(
-                    &self.quad_free_list_buf,
-                    4,
-                    bytemuck::cast_slice(
-                        &self.quad_free_list[..word_count],
-                    ),
-                );
-            }
-
-            self.quad_free_list.clear();
-        }
-
-        // Upload accumulated material free list to the GPU buffer.
-        {
-            let entry_count = (self.material_free_list.len() / 2)
-                .min(MATERIAL_FREE_LIST_MAX as usize) as u32;
-
-            queue.write_buffer(
-                &self.material_free_list_buf,
-                0,
-                bytemuck::bytes_of(&entry_count),
-            );
-
-            if entry_count > 0 {
-                let word_count = entry_count as usize * 2;
-
-                queue.write_buffer(
-                    &self.material_free_list_buf,
-                    4,
-                    bytemuck::cast_slice(
-                        &self.material_free_list[..word_count],
-                    ),
-                );
-            }
-
-            self.material_free_list.clear();
-        }
+        // Flush accumulated free lists to the GPU.
+        self.quad_alloc.upload(queue);
+        self.material_alloc.upload(queue);
 
         // Upload neighbor boundary slices for chunks being built.
         for &pos in &to_build {
@@ -1615,22 +1506,52 @@ impl GpuWorld {
             let popcount = br.sub_mask_lo.count_ones()
                          + br.sub_mask_hi.count_ones();
 
-            // Push old ranges to the free lists so future builds can
-            // reuse them. The GPU alloc pass always allocates fresh
-            // ranges, so the old ones are dead.
+            // Mirror the GPU's free list consumption on the CPU side.
+            // The alloc shader used first-fit; the readback base_offset
+            // identifies which entry was consumed (if any). Consume
+            // must happen before push_free below to avoid matching
+            // against the wrong entry.
+            self.quad_alloc.consume(br.base_offset, br.quad_count);
+
+            if popcount > 0 {
+                let mat_local = br.mat_base_off / MATERIAL_SUB_BLOCK;
+                let mat_flat  = br.mat_buf_idx * MATERIAL_SEGMENT_UNITS
+                              + mat_local;
+                self.material_alloc.consume(mat_flat, popcount);
+            }
+
+            // Chunk was removed while build was in-flight. The GPU
+            // allocated ranges that no chunk owns. Reclaim them by
+            // pushing them back to the free lists.
             let Some(chunk) = self.chunks.get_mut(&pb.pos)
             else {
+                self.quad_alloc.push_free(
+                    br.base_offset, br.quad_count,
+                );
+
+                if popcount > 0 {
+                    let mat_local = br.mat_base_off / MATERIAL_SUB_BLOCK;
+                    let mat_flat  = br.mat_buf_idx * MATERIAL_SEGMENT_UNITS
+                                  + mat_local;
+                    self.material_alloc.push_free(mat_flat, popcount);
+                }
+
                 continue;
             };
 
+            // Push old ranges to the free lists so future builds can
+            // reuse them. The GPU alloc pass always allocates fresh
+            // ranges, so the old ones are dead.
             if chunk.quad_alloc > 0 {
-                self.quad_free_list.push(chunk.quad_offset);
-                self.quad_free_list.push(chunk.quad_alloc);
+                self.quad_alloc.push_free(
+                    chunk.quad_offset, chunk.quad_alloc,
+                );
             }
 
             if chunk.material_alloc > 0 {
-                self.material_free_list.push(chunk.material_offset);
-                self.material_free_list.push(chunk.material_alloc);
+                self.material_alloc.push_free(
+                    chunk.material_offset, chunk.material_alloc,
+                );
             }
 
             // Update bookkeeping from staging readback.
