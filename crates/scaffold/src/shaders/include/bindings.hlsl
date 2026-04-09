@@ -72,6 +72,7 @@ static const uint MAX_CHUNKS       = 4096;
 static const uint CHUNK_SIZE       = 32;
 static const uint CHUNK_VOLUME     = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 static const uint OCC_WORDS        = 1024;  // 32 * 32
+static const uint CHUNK_ALLOC_BYTES = 16;   // 4 x u32 per slot
 
 // -----------------------------------------------------------------------
 // Structures

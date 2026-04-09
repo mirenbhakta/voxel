@@ -8,6 +8,7 @@ mod build;
 mod camera;
 mod chunk_manager;
 mod cull;
+mod gpu_alloc;
 mod multi_buffer;
 mod timestamp;
 mod world;
@@ -268,7 +269,7 @@ impl ApplicationHandler for App {
                                   | Features::PARTIALLY_BOUND_BINDING_ARRAY,
                 required_limits   : Limits {
                     max_immediate_size                          : 16,
-                    max_storage_buffers_per_shader_stage        : 10,
+                    max_storage_buffers_per_shader_stage        : 16,
                     max_binding_array_elements_per_shader_stage : 16,
                     ..Limits::default()
                 },
