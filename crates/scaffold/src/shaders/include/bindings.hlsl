@@ -23,6 +23,7 @@
 //     set 0, binding 6 : material_bump_state_buf  (read-write storage)
 //     set 0, binding 7 : material_free_list_buf   (read-write storage)
 //     set 0, binding 8 : material_dispatch_buf    (read-write storage)
+//     set 0, binding 9 : chunk_alloc_buf          (read-write storage)
 //     push constants    : AllocPush { batch_size, quad_capacity,
 //                           material_capacity, material_segment_units }
 //

@@ -111,8 +111,6 @@ const BUILD_STAGING_ENTRY_BYTES: u32 = 16;
 /// Bytes per entry in chunk_alloc_buf (page table).
 const CHUNK_ALLOC_BYTES: u32 = 16;
 
-/// Size of dead_slot_buf in bytes (count + MAX_CHUNKS slot indices).
-const DEAD_SLOT_BUF_BYTES: u64 = 4 + 4 * MAX_CHUNKS as u64;
 
 /// Bytes per entry in material_range_buf.
 const MATERIAL_RANGE_BYTES: u32 = 16;
@@ -337,10 +335,8 @@ pub struct GpuWorld {
     material_dispatch_buf   : Buffer,
     /// Per-slot allocation page table (16 bytes per slot, GPU-authoritative).
     chunk_alloc_buf      : Buffer,
-    /// Dead slot indices uploaded by the CPU for GPU-side reclamation.
-    dead_slot_buf        : Buffer,
-    /// Slot indices of removed chunks, pending upload to `dead_slot_buf`.
-    dead_slots           : Vec<u32>,
+    /// Whether removed chunks have pending GPU allocations to reclaim.
+    has_pending_cleanup  : bool,
 
     // -- Cull/draw buffers --
 
@@ -830,17 +826,6 @@ impl GpuWorld {
             mapped_at_creation : false,
         });
 
-        let dead_slot_buf = device.create_buffer(&BufferDescriptor {
-            label              : Some("dead_slot_buf"),
-            size               : DEAD_SLOT_BUF_BYTES,
-            usage              : BufferUsages::STORAGE
-                               | BufferUsages::COPY_DST,
-            mapped_at_creation : false,
-        });
-
-        // Initialize dead slot count to zero.
-        queue.write_buffer(&dead_slot_buf, 0, bytemuck::bytes_of(&0u32));
-
         let build_alloc_pipeline = BuildAllocPipeline::new(device);
 
         let build_alloc_bg = build_alloc_pipeline.create_bind_group(
@@ -855,7 +840,6 @@ impl GpuWorld {
             material_alloc.free_list_buf(),
             &material_dispatch_buf,
             &chunk_alloc_buf,
-            &dead_slot_buf,
         );
 
         // -- Build write pipeline + bind group (pass 3) --
@@ -940,8 +924,7 @@ impl GpuWorld {
             material_alloc         : material_alloc,
             material_dispatch_buf  : material_dispatch_buf,
             chunk_alloc_buf        : chunk_alloc_buf,
-            dead_slot_buf          : dead_slot_buf,
-            dead_slots             : Vec::new(),
+            has_pending_cleanup    : false,
             dst_indirect_buf       : dst_indirect_buf,
             draw_data_buf          : draw_data_buf,
             draw_count_buf         : draw_count_buf,
@@ -1035,12 +1018,12 @@ impl GpuWorld {
 
     /// Remove a chunk and release its GPU resources.
     ///
-    /// Frees the slot and queues the slot index for GPU-side reclamation
-    /// via `dead_slot_buf`. Zeros the chunk metadata so the cull shader
-    /// stops processing this slot.
+    /// Frees the slot and zeros chunk metadata so the cull shader skips
+    /// this slot. The alloc shader's Phase 1 scan detects the stale
+    /// allocation in chunk_alloc_buf and reclaims it autonomously.
     pub fn remove(&mut self, queue: &Queue, pos: ChunkPos) {
         if let Some(chunk) = self.chunks.remove(&pos) {
-            self.dead_slots.push(chunk.slot);
+            self.has_pending_cleanup = true;
             self.free_slot(chunk.slot);
             self.zero_chunk_meta(queue, chunk.slot);
         }
@@ -1122,14 +1105,14 @@ impl GpuWorld {
     /// Encodes all build passes in a single command encoder:
     /// 1. Count pass (per chunk) -- derives face counts.
     /// 2. Alloc pass (single dispatch) -- GPU bump-allocates quad and
-    ///    material ranges, drains dead slots.
+    ///    material ranges, scans for dead allocations.
     /// 3. Write pass (per chunk) -- writes packed quad descriptors.
     /// 4. Material pack (per chunk, indirect) -- copies sub-blocks.
     ///
-    /// The alloc pass always runs when there are dead slots to drain,
-    /// even if no chunks need building. After submission, copies
-    /// metadata to a staging buffer and starts an async map. Results
-    /// are harvested next frame by
+    /// The alloc pass always runs when cleanup is pending (removed
+    /// chunks with stale GPU allocations), even if no chunks need
+    /// building. After submission, copies metadata to a staging buffer
+    /// and starts an async map. Results are harvested next frame by
     /// [`process_build_feedback`](Self::process_build_feedback).
     ///
     /// If a previous batch is still in flight (`build_pending`), this
@@ -1158,15 +1141,12 @@ impl GpuWorld {
             .take(MAX_BUILDS_IN_FLIGHT as usize)
             .collect();
 
-        // Process dead slots even when no builds are needed.
-        if to_build.is_empty() && self.dead_slots.is_empty() {
+        // Run the alloc pass even without builds if cleanup is pending.
+        if to_build.is_empty() && !self.has_pending_cleanup {
             return;
         }
 
         let has_builds = !to_build.is_empty();
-
-        // Upload dead slots to the GPU.
-        self.upload_dead_slots(queue);
 
         let batch_size;
 
@@ -1267,7 +1247,7 @@ impl GpuWorld {
             }
         }
 
-        // -- Pass 2: alloc (always runs -- Phase 1 drains dead slots) --
+        // -- Pass 2: alloc (always runs -- Phase 1 scans for dead allocs) --
 
         {
             let mut pass = encoder.begin_compute_pass(
@@ -1362,6 +1342,7 @@ impl GpuWorld {
         }
 
         queue.submit(Some(encoder.finish()));
+        self.has_pending_cleanup = false;
 
         if has_builds {
             // Mark built chunks: clear dirty, set in-flight.
@@ -1482,9 +1463,9 @@ impl GpuWorld {
                 continue;
             }
 
-            // Chunk removed while build was in-flight. The slot is
-            // already in dead_slots and will be reclaimed by the next
-            // alloc pass. Nothing to do here.
+            // Chunk removed while build was in-flight. The alloc pass
+            // Phase 1 scan will detect the stale allocation and reclaim
+            // it autonomously. Nothing to do here.
             let Some(chunk) = self.chunks.get_mut(&pb.pos)
             else {
                 continue;
@@ -1866,29 +1847,6 @@ impl GpuWorld {
         );
     }
 
-    /// Upload pending dead slot indices to the GPU.
-    ///
-    /// Writes the count and slot indices to `dead_slot_buf`. The alloc
-    /// shader's Phase 1 reads and drains this list. Clears the CPU-side
-    /// `dead_slots` vec after upload.
-    fn upload_dead_slots(&mut self, queue: &Queue) {
-        let count = self.dead_slots.len() as u32;
-
-        queue.write_buffer(
-            &self.dead_slot_buf,
-            0,
-            bytemuck::bytes_of(&count),
-        );
-
-        if count > 0 {
-            queue.write_buffer(
-                &self.dead_slot_buf,
-                4,
-                bytemuck::cast_slice(&self.dead_slots),
-            );
-            self.dead_slots.clear();
-        }
-    }
 
     /// Zero the chunk metadata entry for a slot.
     ///

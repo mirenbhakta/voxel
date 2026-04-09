@@ -412,19 +412,6 @@ impl BuildAllocPipeline {
                         },
                         count : None,
                     },
-                    // binding 10: dead_slot_buf (read-write storage)
-                    BindGroupLayoutEntry {
-                        binding    : 10,
-                        visibility : ShaderStages::COMPUTE,
-                        ty         : BindingType::Buffer {
-                            ty                 : BufferBindingType::Storage {
-                                read_only : false,
-                            },
-                            has_dynamic_offset : false,
-                            min_binding_size   : None,
-                        },
-                        count : None,
-                    },
                 ],
             },
         );
@@ -468,7 +455,6 @@ impl BuildAllocPipeline {
     /// * `material_free_list_buf` - Material free list (read-write).
     /// * `material_dispatch_buf`  - Indirect dispatch args for material pack (read-write).
     /// * `chunk_alloc_buf`        - Per-slot allocation page table (read-write).
-    /// * `dead_slot_buf`          - Dead slot indices from CPU (read-write).
     pub fn create_bind_group(
         &self,
         device                  : &Device,
@@ -482,7 +468,6 @@ impl BuildAllocPipeline {
         material_free_list_buf  : &Buffer,
         material_dispatch_buf   : &Buffer,
         chunk_alloc_buf         : &Buffer,
-        dead_slot_buf           : &Buffer,
     ) -> BindGroup
     {
         device.create_bind_group(&BindGroupDescriptor {
@@ -528,10 +513,6 @@ impl BuildAllocPipeline {
                 BindGroupEntry {
                     binding  : 9,
                     resource : chunk_alloc_buf.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding  : 10,
-                    resource : dead_slot_buf.as_entire_binding(),
                 },
             ],
         })

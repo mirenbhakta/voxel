@@ -425,9 +425,6 @@ impl ChunkManager {
     )
     {
         let dirty = gpu.dirty_positions();
-        if dirty.is_empty() {
-            return;
-        }
 
         // Sort dirty positions by distance to center, take the budget.
         let center = self.center;

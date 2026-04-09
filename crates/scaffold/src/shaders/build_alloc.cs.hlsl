@@ -3,9 +3,12 @@
 // Dispatch: (1, 1, 1) -- single thread.
 //
 // Two-phase structure:
-//   Phase 1: Reclaim dead slots. Reads chunk_alloc_buf for old ranges,
-//            pushes them to the GPU-owned free lists, zeros the page
-//            table entries, then drains the dead list.
+//   Phase 1: Scan all slots for dead allocations. A slot whose
+//            chunk_meta quad_count is zero but chunk_alloc_buf holds
+//            non-zero ranges is dead. The scan frees those ranges to
+//            the GPU-owned free lists and zeros the page table entry.
+//            No CPU upload required -- the GPU detects stale state
+//            autonomously.
 //   Phase 2: Allocate for builds. Frees old ranges (rebuilds), allocates
 //            new ranges via free list + bump, writes the page table.
 //
@@ -25,7 +28,6 @@ RWByteAddressBuffer material_bump_state_buf : register(u6, space0);
 RWByteAddressBuffer material_free_list_buf  : register(u7, space0);
 RWByteAddressBuffer material_dispatch_buf   : register(u8, space0);
 RWByteAddressBuffer chunk_alloc_buf         : register(u9, space0);
-RWByteAddressBuffer dead_slot_buf           : register(u10, space0);
 
 // Push constants.
 struct AllocPush {
@@ -99,21 +101,27 @@ void main() {
     uint seg_units = push.material_segment_units;
     uint seg_mask  = seg_units - 1;
 
-    // -- Phase 1: Reclaim dead slots --
+    // -- Phase 1: Scan for dead allocations --
     //
-    // The CPU appends slot indices of removed chunks to dead_slot_buf.
-    // Read the old allocation from chunk_alloc_buf, push it to the free
-    // lists, and zero the page table entry.
+    // A slot is dead when the CPU has zeroed its chunk_meta quad_count
+    // (on removal) but chunk_alloc_buf still holds a non-zero allocation.
+    // Scan all slots, free stale ranges, and zero the page table entry.
 
-    uint dead_count = dead_slot_buf.Load(0);
+    for (uint s = 0; s < MAX_CHUNKS; s++) {
+        uint meta_qc = chunk_meta_buf.Load(s * 16);
 
-    for (uint d = 0; d < dead_count; d++) {
-        uint slot = dead_slot_buf.Load(4 + d * 4);
+        if (meta_qc != 0) {
+            continue;
+        }
 
-        uint old_qoff = chunk_alloc_buf.Load(slot * CHUNK_ALLOC_BYTES);
-        uint old_qcnt = chunk_alloc_buf.Load(slot * CHUNK_ALLOC_BYTES + 4);
-        uint old_moff = chunk_alloc_buf.Load(slot * CHUNK_ALLOC_BYTES + 8);
-        uint old_mcnt = chunk_alloc_buf.Load(slot * CHUNK_ALLOC_BYTES + 12);
+        uint old_qoff = chunk_alloc_buf.Load(s * CHUNK_ALLOC_BYTES);
+        uint old_qcnt = chunk_alloc_buf.Load(s * CHUNK_ALLOC_BYTES + 4);
+        uint old_moff = chunk_alloc_buf.Load(s * CHUNK_ALLOC_BYTES + 8);
+        uint old_mcnt = chunk_alloc_buf.Load(s * CHUNK_ALLOC_BYTES + 12);
+
+        if (old_qcnt == 0 && old_mcnt == 0) {
+            continue;
+        }
 
         if (old_qcnt > 0) {
             push_to_free_list(quad_free_list_buf, old_qoff, old_qcnt);
@@ -124,11 +132,8 @@ void main() {
         }
 
         // Zero the page table entry.
-        chunk_alloc_buf.Store4(slot * CHUNK_ALLOC_BYTES, uint4(0, 0, 0, 0));
+        chunk_alloc_buf.Store4(s * CHUNK_ALLOC_BYTES, uint4(0, 0, 0, 0));
     }
-
-    // Drain the dead list so stale entries are not re-processed.
-    dead_slot_buf.Store(0, 0u);
 
     // -- Phase 2: Allocate for builds --
     //
