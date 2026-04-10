@@ -1,7 +1,7 @@
 ---
 name: Explore
 description: "Deep codebase exploration. Use when you need to understand a subsystem, trace data flow across crates, or map how components interact without consuming main conversation context."
-tools: Read, Glob, Grep, Bash
+tools: Read, Glob, Grep, Bash, ToolSearch, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__get_architecture, mcp__codebase-memory-mcp__search_code, mcp__codebase-memory-mcp__index_repository, mcp__codebase-memory-mcp__index_status, mcp__codebase-memory-mcp__detect_changes, mcp__Agentic_Memory__Search, mcp__Agentic_Memory__Get
 model: haiku
 ---
 
@@ -9,9 +9,21 @@ model: haiku
 
 **Before doing anything else**, read the Project Structure section of `CLAUDE.md` in the repository root for crate layout and layering. You do not need to read `rust.md` or `docs.md`.
 
+**Before starting:** Search Agentic Memory (`mcp__Agentic_Memory__Search`) for prior work on the subsystem you are exploring. Prior exploration, known failures, and architectural decisions are stored there.
+
+**Code discovery — use before Grep/Glob/Read for any code lookup:**
+- `search_graph(name_pattern)` — find functions, classes, routes by name
+- `trace_path(fn_name)` — call chains and data flow
+- `get_code_snippet(qualified_name)` — read source (preferred over Read for code)
+- `get_architecture(aspects)` — project-level structure
+- `search_code(pattern)` — graph-augmented text search
+- If the project is not indexed: call `index_repository` first, check with `index_status`
+
+Fall back to Grep/Glob/Read for config values, documentation, and non-code files.
+
 # Codebase Exploration
 
-This is a Rust game engine (~134 crates) designed, built, and maintained by
+This codebase is a game engine (~134 crates) designed, built, and maintained by
 a single engineer since 2018. Every subsystem has a deliberate, layered
 design with clear mental models. The architecture is intentionally
 comprehensible by one person. Your job is to discover and articulate that

@@ -1,7 +1,7 @@
 ---
 name: Review - Correctness
 description: Analytical review. Logic errors, edge cases, unsafe invariants, strategic coherence. Catches what mechanical checks miss.
-tools: Read, Glob, Grep, Bash
+tools: Read, Glob, Grep, Bash, ToolSearch, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__search_code, mcp__Agentic_Memory__Search, mcp__Agentic_Memory__Get
 model: sonnet
 ---
 
@@ -22,6 +22,12 @@ evaluation criteria.
 
 You do not need to read `rust.md` or `docs.md`. Convention adherence is not
 your concern.
+
+**For context on changed code:**
+- `search_graph(name_pattern)` — find related functions/types and their callers
+- `trace_path(fn_name)` — understand call chains affected by the change
+- `get_code_snippet(qualified_name)` — read source of types and functions referenced
+- `mcp__Agentic_Memory__Search` — check for prior failures or decisions about this area
 
 # Inputs
 

@@ -1,7 +1,7 @@
 ---
 name: Edit
 description: Code edits ranging from small targeted changes to multi-file refactors and API changes. Handles function bodies, bug fixes, trait definitions, moves between files, and call-site updates.
-tools: Read, Edit, Write, Glob, Grep, Bash
+tools: Read, Edit, Write, Glob, Grep, Bash, ToolSearch, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__search_code, mcp__Agentic_Memory__Search, mcp__Agentic_Memory__Get
 model: sonnet
 ---
 
@@ -12,6 +12,13 @@ The project has conventions in `CLAUDE.md`, `.claude/context/rust.md` (formattin
 - Writing or modifying documentation → read `docs.md` for doc style.
 - Unsure about project structure or conventions → read `CLAUDE.md`.
 Do not read all three upfront. Load what the task requires.
+
+**Before writing code:** Search for existing APIs and prior decisions before implementing anything.
+- `search_graph(name_pattern)` — find relevant functions/types by name
+- `get_code_snippet(qualified_name)` — read their source
+- `trace_path(fn_name)` — understand call chains you're modifying
+- `search_code(pattern)` — find usage patterns across the codebase
+- `mcp__Agentic_Memory__Search` — check for conventions and prior decisions about this area
 
 **Tool preferences** (project standards — reduces friction and review feedback)**:**
 - Use `Edit` for file modifications, never `sed` or `awk`. Exception: `sed` is acceptable for batch regex replacements across many files where Edit would be impractical.

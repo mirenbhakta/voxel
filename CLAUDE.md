@@ -184,63 +184,33 @@ checks, ask where the single correct enforcement point is.
 
 ## Project Structure
 
-A modular Claude Code configuration framework. Features are toggled via `setup.sh`
-and assembled into `.claude/` + `CLAUDE.md` for any project.
+A Rust library crate providing voxel world data structures and rendering pipeline primitives.
+Depends on `eden-math` from the eden-engine workspace.
 
-- **`setup.sh`** — CLI for enabling/disabling features and assembling output
-- **`features.conf`** — Enabled features, one per line (single source of truth)
-- **`features/`** — Feature sources (type detected from filesystem layout)
-  - **`sections/`** — Section sources (numbered `.md` files, assembled into CLAUDE.md)
-  - **`<name>/SKILL.md`** — Skill templates
-  - **`<name>.md`** — Context templates
-  - **`<name>/`** (domain) — Directory tree overlaid onto `.claude/`
-  - **`<name>/hooks.json`** — Hook declarations (merged into `settings.json`)
-- **`lib/`** — Framework infrastructure (version check hook, CLAUDE.md assembly)
-- **`.claude/`** — Assembled output (what Claude Code reads at runtime)
-- **`CLAUDE.md`** — Assembled output from all active sections
-
-**Feature types:**
-
-| Type | Source | Destination | Loaded |
-|------|--------|-------------|--------|
-| section | `features/sections/NN-name.md` | `CLAUDE.md` (concatenated) | Always |
-| skill | `features/<name>/SKILL.md` | `.claude/skills/<name>/SKILL.md` | On-demand via `/name` |
-| context | `features/<name>.md` | `.claude/context/<name>.md` | Always |
-| domain | `features/<name>/` | `.claude/` (tree overlay) | Depends on contents |
-
-**Workflow:** edit `features.conf` → `setup.sh assemble` (or use `enable`/`disable` commands)
+- **`src/lib.rs`** — Crate root; module declarations
+- **`src/block.rs`** — Block type definitions
+- **`src/chunk.rs`** — Chunk data structure (fixed-size voxel grid)
+- **`src/world.rs`** — World/scene management
+- **`src/index.rs`** — Voxel indexer trait and implementations
+- **`src/morton.rs`** — Morton code encoding/decoding
+- **`src/storage/`** — Chunk storage backends, parameterized by indexer
+  - **`dense.rs`** — Flat array storage; full random access
+  - **`rle.rs`** — Run-length encoded; binary-searchable run starts
+  - **`palette.rs`** — Unique-value table with per-voxel index array
+  - **`bitmask.rs`** — Bit-packed boolean storage; one bit per voxel
+- **`src/render/`** — CPU-side rendering data structures; no GPU dependencies
+  - **`direction.rs`** — Face direction enum
+  - **`face.rs`** — Face masks and neighbor tables
+  - **`quad.rs`** — Quad descriptors for mesh generation
+- **`docs/`** — Design documents and render pipeline analysis
 
 ---
 
 ## Code Style
 
-**Language:** Bash (POSIX-compatible where practical, Bash 4+ for associative arrays)
+**Language:** Rust (2024 edition)
 
-**Naming:**
-- Functions: `snake_case`, prefixed by command namespace (`cmd_list`, `cmd_enable`)
-- Variables: `UPPER_SNAKE_CASE` for globals/constants, `lower_snake_case` for locals
-- Files: `kebab-case.sh` for scripts, `kebab-case.md` for content
-
-**Formatting:**
-- Indent: 4 spaces, no tabs
-- Line length: soft limit ~100 characters
-- Use `local` for all function-scoped variables
-- Quote all variable expansions (`"$var"`, `"${arr[@]}"`)
-
-**Error handling:**
-- Scripts use `set -euo pipefail`
-- Validate inputs early, fail with a message to stderr
-- Use `return 1` or `exit 1` for errors, not silent fallthrough
-
-**Markdown content (sections, skills, contexts):**
-- ATX-style headers (`##`, `###`)
-- Numbered files for sections (`00-header.md`, `10-engineering-principles.md`)
-- `---` horizontal rules between major sections
-- Skills require YAML frontmatter with a `description` field
-- HTML comments (`<!-- -->`) for template placeholders only — remove when filling in
-
-**Dependencies:**
-- No external dependencies beyond coreutils and standard POSIX tools
+See `.claude/context/rust.md` for Rust-specific conventions — formatting, naming, file organization, and patterns. All rules there are mandatory.
 
 ---
 

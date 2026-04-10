@@ -30,6 +30,7 @@ Cargo.lock
 .claude/memory/memory.db-*
 # Claude local permissions.
 .claude/settings.local.json
+.claude/.workflow-version
 
 # Local MCP confiugurations.
 .mcp.jsonCargo.lock

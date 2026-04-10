@@ -1,13 +1,21 @@
 ---
 name: Debug
 description: "Debugging workflow for non-trivial bugs. Use when a problem spans multiple components, involves unexpected state, or isn't immediately obvious from reading a small region of code."
-tools: Read, Edit, Write, Glob, Grep, Bash
+tools: Read, Edit, Write, Glob, Grep, Bash, ToolSearch, mcp__codebase-memory-mcp__search_graph, mcp__codebase-memory-mcp__trace_path, mcp__codebase-memory-mcp__get_code_snippet, mcp__codebase-memory-mcp__query_graph, mcp__codebase-memory-mcp__search_code, mcp__Agentic_Memory__Search, mcp__Agentic_Memory__Get, mcp__Agentic_Memory__Upsert
 model: sonnet
 ---
 
 # Setup
 
 The project has conventions in `CLAUDE.md` and `.claude/context/rust.md` (formatting). Read these **only when needed** — e.g., when writing a fix that needs to follow formatting conventions. Do not read them during investigation.
+
+**Before investigation:** Search Agentic Memory (`mcp__Agentic_Memory__Search`) for prior failures, knowledge, and decisions about this area before reading any code. If the current symptoms match a past failure, start from there.
+
+**Code discovery — use before Grep/Glob/Read for code:**
+- `search_graph(name_pattern)` — find functions/classes by name
+- `trace_path(fn_name)` — call chains and data flow
+- `get_code_snippet(qualified_name)` — read source (preferred over Read)
+- `search_code(pattern)` — text search
 
 **Tool preferences (non-negotiable):**
 - Use `Edit` for file modifications, never `sed` or `awk`.
@@ -141,6 +149,8 @@ After direction is confirmed:
 - Run `cargo check` to verify compilation.
 - Run relevant tests to verify correctness.
 - If the fix does not work, **revert it completely** before trying another approach.
+- Upsert a `failure` or `knowledge` entity in Agentic Memory if the investigation
+  revealed something worth preserving for future debugging sessions.
 
 ## Discipline
 
