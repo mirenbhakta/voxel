@@ -35,10 +35,47 @@ atlases) that existed only to make the eliminated paths efficient.
 
 **Near-field cost.** At 1 voxel ≫ 1 pixel, DDA terminates within a handful of
 steps on the first opaque hit. The per-fragment cost is bounded by the
-sub-chunk diameter (~14 steps worst case for an 8³ grid) and in practice much
-less because the march stops at the first solid. Whether this is competitive
+sub-chunk diameter (~22 steps worst case for an 8³ grid — a diagonal ray
+crosses at most 3N−2 voxels for side length N) and in practice much less
+because the march stops at the first solid. Whether this is competitive
 with or cheaper than the current greedy-quad path is workload-dependent and
 must be measured — see §Prototype Milestone.
+
+### Occupancy Format
+
+Each sub-chunk stores a 10×10×10 occupancy bitmap — the inner 8×8×8 voxels
+plus a 1-voxel ghost layer on every face, edge, and corner. The ghost layer
+carries occupancy from neighboring sub-chunks, making DDA traversal and
+exposure mask computation self-contained within the sub-chunk's own data.
+
+**Why the ghost layer exists.** Without it, the DDA and mask computation need
+to resolve neighbor addresses for boundary voxels at runtime. Even with a
+boundary cache, this is scattered memory access in the middle of a fragment
+shader. With the ghost layer, a DDA march through the entire sub-chunk touches
+one contiguous 200-byte block that fits comfortably in cache.
+
+**Packing.** Each row of 10 bits is stored as a u16, giving 100 u16s = 200
+bytes per sub-chunk. Six bits per u16 are unused — the price of rows that
+don't divide evenly into standard word sizes. The alternative flat u32 packing
+avoids wasted bits but requires non-power-of-2 indexing arithmetic (z×100 +
+y×10 + x) per lookup, which is less suited to the DDA inner loop.
+
+**Storage.** 64 sub-chunks per 32³ chunk × 200 bytes = 12.8 KB per chunk,
+versus 4 KB for bare 8³ bitmaps — a 3.2× increase in occupancy storage. For
+4096 loaded chunks: ~51 MB. The cache locality benefit of self-contained
+sub-chunk data justifies this.
+
+**Ghost layer population.** The ghost layer is written at build time from
+neighboring sub-chunk data. For sub-chunks interior to a 32³ chunk all 26
+neighbors are in the same chunk's occupancy buffer. For sub-chunks at a chunk
+boundary the relevant neighbor faces come from adjacent chunks, which must be
+resident. The control plane's batched commit model (§Control Plane) ensures
+neighbor data is available before a sub-chunk is built.
+
+**Ghost layer invalidation.** When a sub-chunk is modified, the ghost layers
+of its up to 26 neighbors must also be updated. The control plane coalesces
+these into the same batch commit — the cascade is bounded by the fixed
+neighborhood size and does not compound across frames.
 
 ### Control Plane
 
@@ -104,11 +141,12 @@ adjacent sub-chunk (if drawn) paints the same or closer pixel. Hi-Z catches
 some of these through depth, but the mask rejects them before the cull pass
 even consults Hi-Z, at the cost of one byte per sub-chunk.
 
-The mask is computed by the existing build pipeline's first pass — the same
-shader that already evaluates `occupied(v) && !occupied(neighbor(v, d))` for
-face counting. Reducing per-layer per-direction counts to a per-sub-chunk
-OR-reduction is an additional ~10 lines of shader code and produces the mask
-as a byproduct. No new pass, no new readback, no new data path.
+The mask is computed as a byproduct of the sub-chunk build step. Building a
+sub-chunk's occupancy bitmap already requires traversing each voxel and
+checking neighbor occupancy — the same `occupied(v) && !occupied(neighbor(v, d))`
+evaluation that determines which bits are set in the bitmap. OR-reducing those
+per-voxel per-direction checks into a 6-bit sub-chunk mask is an additional
+~10 lines of shader code. No new pass, no new readback, no new data path.
 
 A hierarchical variant stores the same mask at chunk granularity (OR of its
 sub-chunk masks, 1 byte per chunk). The cull pass tests the chunk mask first
@@ -376,12 +414,13 @@ how large the world-space scene becomes.
 
 ## Rejected Directions
 
-**Near-field surface quads / greedy meshing.** Dropped. Sub-chunk DDA subsumes
-it. At near distance the DDA terminates in a handful of steps on the first
-opaque hit. Eliminating the dual path removes the layer storage, greedy build
-shader, cull-cascade machinery, and per-direction draw structure that existed
-to make the quad path efficient. The §Prototype Milestone verifies this is
-actually competitive on real workloads before the quad path is deleted.
+**Near-field surface quads / greedy meshing.** Not the V2 primary path. The
+quad pipeline proved itself and remains a secondary goal — a benchmark baseline
+and a compatibility target the new architecture should be able to support.
+Sub-chunk DDA subsumes it as a general primitive: at near distance the DDA
+terminates in a handful of steps on the first opaque hit and is expected to be
+competitive. The §Prototype Milestone validates this directly before any
+decisions about the quad path's long-term role.
 
 **Layer storage / OIT.** Dropped with the quad path. Transparency is handled
 inside the DDA shader in natural depth order.
@@ -417,10 +456,11 @@ occlusion feedback only serves the stationary-player case and fails on the
 fast long-distance motion that defines this project. Residency is
 distance-based (§Core/Control Plane), with no GPU feedback loop.
 
-**Isosurface as default format.** Documented as an alternative per-sub-chunk
+**Isosurface as default format.** Documented as an alternative whole-pipeline
 format in `isosurface_dda.md`. Compatible with the DDA shader via a
 compile-time branch. Not the default because binary occupancy is 8× cheaper
-to store and the representation choice can be made per sub-chunk.
+to store and affords optimizations isosurface cannot. The two are alternative
+system choices, not per-sub-chunk modes; they do not co-exist.
 
 **Global ray marching.** Rejected prior to this document. See
 `design_rejections.md`.

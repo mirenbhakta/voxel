@@ -3,6 +3,14 @@
 Design for a unified GPU memory system that resolves the ownership conflicts,
 pre-allocation waste, and sync stalls in the current rendering pipeline.
 
+> **Partial supersession (2026-04-10):** The GPU-side allocator, quad storage,
+> cull cascade, far-field rendering as a distinct path, occlusion-driven streaming,
+> LOD decimation, layered generation, and chunk lifecycle sections have been
+> superseded by `render_pipeline_v2.md` and `scaffold_rewrite_principles.md` —
+> marked **[SUPERSEDED]** below. The material storage model (§Material Storage),
+> async feedback principles, and occupancy discussion remain in effect and are
+> used directly by V2.
+
 
 ## Problem Statement
 
@@ -70,7 +78,9 @@ that contribute no visible faces cost zero storage, even if they contain
 occupied voxels.
 
 
-## Contiguous Allocation Model
+## [SUPERSEDED] Contiguous Allocation Model
+
+*GPU-side bump allocator and free list rolled back. CPU-authoritative allocation per `scaffold_rewrite_principles.md`.*
 
 Both quad and material storage use the same principle: chunks own contiguous
 ranges in shared buffers, not scattered blocks. The page table and block pool
@@ -133,7 +143,9 @@ When the CPU allocates a new segment:
 No data moves. Existing segments are untouched.
 
 
-## Quad Storage
+## [SUPERSEDED] Quad Storage
+
+*Quads replaced by sub-chunk DDA. Quad buffers, build shader passes, and the cull cascade below are no longer part of the architecture.*
 
 Each chunk owns a contiguous range in the quad buffer. Within that range, quads
 are ordered by face direction.
@@ -465,7 +477,9 @@ This is a graceful degradation path, not an error. The one-frame glitch is
 imperceptible.
 
 
-## Chunk Lifecycle
+## [SUPERSEDED] Chunk Lifecycle
+
+*Control plane design superseded. CPU-authoritative batched commits with one-frame latency per `render_pipeline_v2.md` §Core/Control Plane.*
 
 ### Load
 
@@ -516,7 +530,9 @@ imperceptible.
 5. No stalls, no data movement, no rebuild.
 
 
-## LOD via Decimation
+## [SUPERSEDED] LOD via Decimation
+
+*Replaced by OR-reduction hierarchy. See `render_pipeline_v2.md` §LOD Hierarchy.*
 
 Level of detail reduces quad count at distance without reducing grid resolution.
 The occupancy grid stays 32x32x32. Only the surface geometry is simplified.
@@ -579,7 +595,9 @@ aggressive decimation budgets without explicit special-case logic.
 Flat terrain: already merges perfectly. Unaffected by decimation.
 
 
-## Far-Field Rendering
+## [SUPERSEDED] Far-Field Rendering
+
+*Merged into the primary path. Sub-chunk DDA is the rendering primitive at all distances; there is no separate near/far split.*
 
 Beyond the effective range of rasterization, chunks are rendered via bounded
 ray marching through the occupancy bitmask. No build shader, no greedy merge,
@@ -638,7 +656,9 @@ No build shader dispatch. No quad buffer allocation. No material sub-blocks.
 A far chunk needs only its 4 KB occupancy bitmask and an averaged color.
 
 
-## Streaming Hierarchy
+## [SUPERSEDED] Streaming Hierarchy
+
+*Occlusion-driven residency rejected. Replaced by distance-based residency. See `render_pipeline_v2.md` §Core/Control Plane.*
 
 Chunk data residency is a continuous hierarchy, not discrete LOD tiers. Every
 level is a valid renderable. Coarser levels are always available as fallback.
@@ -678,7 +698,9 @@ beyond a threshold. Sub-chunk imposters (octants) improve parallax fidelity
 at the cost of 8x storage and management.
 
 
-## Layered Generation
+## [SUPERSEDED] Layered Generation
+
+*Streaming lifecycle depended on occlusion-driven promotion, which is superseded. GPU terrain fast path may still be relevant as an extension; see `render_pipeline_v2.md` §Procgen Fast Path.*
 
 Terrain generation is split between GPU and CPU to avoid the dual source of
 truth problem. Each layer has exactly one authoritative source.
