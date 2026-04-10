@@ -324,22 +324,66 @@ enlarged cube needs further design work. Deferred.
 
 ### Transparency
 
-DDA visits voxels in depth order naturally. Transparent voxels accumulate
-front-to-back via over-compositing inside the fragment shader; the first opaque
-hit terminates the march and writes depth.
+Transparent voxels are not in the primary occupancy bitmap. The primary
+visibility DDA marches to the first opaque surface and ignores transparent
+voxels entirely, keeping the main render path simple and efficient.
 
-No sort, no OIT, no layer storage, no per-axis arrays. The entire transparency
-machinery from the prior design was there to serve the greedy-quad path and
-is unnecessary under sub-chunk DDA.
+Shadow and lighting DDA traversal is a different concern: a shadow ray
+marching toward the sun needs to detect transparent voxels and accumulate
+their transmission color to produce colored shadows through glass or water.
+This requires either a second transparent-occupancy bitmap per sub-chunk or
+a 2-bit combined structure (opaque | transparent per voxel). That same data
+also feeds the quad extraction path described below — it is not extra storage
+solely for lighting. The shadow/lighting traversal DDA is deferred to
+§Lighting (Extensions, not yet written).
 
-**Inter-sub-chunk ordering.** Transparent sub-chunks render in a second pass
-after opaque with depth test on, depth write off. Ordering errors can occur
-only when two transparent sub-chunks overlap in screen space and neither
-terminates on an opaque voxel. In typical gameplay (scattered glass, water
-surfaces) this is rare enough to handle with painter's-order sub-chunk
-sorting when it matters. For denser transparent content (heavy foliage,
-layered glass structures) a fallback plan will be needed; scoped for the
-extension pass.
+**Water.** Water is not a transparent-sub-chunk rendering problem. The visual
+work that makes water look like water — refraction, reflection, surface
+displacement, foam — lives at the water surface, not through a volume of
+transparent voxels. The surface is identified at build time (water voxel with
+non-water above, the same face-exposure evaluation already done for the
+exposure mask) and rendered as a dedicated surface pass. Underwater is
+post-processing: tint, fog, distortion, caustics. No OIT, no sub-chunk sort,
+no DDA transparency pass involved.
+
+**Transparent face rendering.** For glass, ice, and other solid transparent
+materials, the quad extraction pipeline handles inter-sub-chunk ordering.
+
+Face emission rules:
+
+- **Same material adjacent:** face not emitted. A glass voxel adjacent to the
+  same glass material shares no visible boundary; the interior is culled
+  exactly as it is for opaque geometry.
+- **Different material adjacent** (glass–air, glass–water, orange glass–red
+  glass): face emitted on both sides. Back-face culling is enabled for the
+  transparent pass.
+
+The back-face culling rule resolves material boundaries without sorting or
+z-fighting. At any boundary between two different transparent materials, the
+two collocated faces have opposite normals. Back-face culling discards exactly
+one regardless of view angle — the pair that would z-fight is structurally
+prevented because one is always a back face.
+
+The surviving front-facing transparent quads are sorted back-to-front by
+camera-space depth (GPU radix sort) and rendered with alpha blending after the
+opaque pass, with depth test on against the opaque buffer and depth write off.
+
+**Greedy merge and mixed materials.** For single-material transparent surfaces
+— a lake, a glass window — a per-material occupancy bitmap supports greedy
+merge: the lake surface collapses to a handful of quads and the sort is
+trivially cheap. For mixed or irregular transparent geometry — player-built
+colored glass structures — non-greedy emission (one quad per exposed face) is
+correct and sufficient.
+
+The two cases decompose cleanly. Greedy merge provides the most benefit on
+large same-material surfaces, and those are exactly the cases the per-material
+bitmap handles. Mixed-material geometry breaks the bitmap but provides little
+merge benefit anyway because it is irregular. There is no regime where both
+concerns apply simultaneously.
+
+The quad count for transparent geometry in any realistic build is not a
+rendering bottleneck on modern hardware. No player-facing constraint on
+transparent block placement follows from this design.
 
 **Foliage:** separate pass with non-cubic meshes. Same approach as Project
 Ascendent.
@@ -422,8 +466,10 @@ terminates in a handful of steps on the first opaque hit and is expected to be
 competitive. The §Prototype Milestone validates this directly before any
 decisions about the quad path's long-term role.
 
-**Layer storage / OIT.** Dropped with the quad path. Transparency is handled
-inside the DDA shader in natural depth order.
+**Layer storage / OIT.** Dropped. Intra-sub-chunk transparency is handled
+inside the DDA shader in natural depth order. Inter-sub-chunk transparent
+face rendering uses the quad extraction path with GPU back-to-front sort —
+sorted geometry, not per-pixel OIT.
 
 **Per-voxel billboards as primary path.** Dropped. Remains the 1³ degenerate
 case of sub-chunk DDA but has no separate implementation — sparse sub-chunks

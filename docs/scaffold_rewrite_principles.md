@@ -88,12 +88,14 @@ produce exactly the class of bug that triggered the rewrite.
 
 Concretely, this pushes toward two reusable primitives:
 
-- `UploadRing<T, N>` — a CPU-writable, GPU-readable ring of `N` buffers
-  with a bounded per-frame capacity and a configurable overflow policy.
+- `UploadRing<T>` — a CPU-writable, GPU-readable ring with a runtime
+  frame-count (passed at construction from the surface configuration),
+  a bounded per-frame capacity, and a configurable overflow policy.
   Rotation is automatic per frame.
-- `ReadbackChannel<T, N>` — a GPU-writable, CPU-readable ring with
-  fence-based retirement. Carries a frame/command watermark so callers
-  can line up retired snapshots with their pending-command history.
+- `ReadbackChannel<T>` — a GPU-writable, CPU-readable ring with the same
+  runtime frame-count, fence-based retirement, and a frame/command
+  watermark so callers can line up retired snapshots with their
+  pending-command history.
 
 Every other abstraction in the rewrite builds on these two. There is no
 third "shared buffer" primitive. Any case that seems to need one is
@@ -186,13 +188,20 @@ not raw byte offsets. HLSL does not give us `#[repr(C)]` structs inside
 `RWByteAddressBuffer`, but accessor helpers get most of the benefit for
 a fraction of the layout-bug surface.
 
-The single source of truth lives in exactly one authoring location.
-Neither side hand-maintains field offsets that must agree with the
-other. The pragmatic choices are a Rust schema parsed by a small
-build-script tool that emits the HLSL accessor header, or an HLSL
-accessor header that the Rust side `include!`s for its offset constants.
-Either is fine; what is not fine is two files that happen to contain
-the same numbers.
+Type layout divergence is a different problem from runtime constant divergence
+(see §5). A mismatched runtime constant fails silently — the shader uses
+the wrong bounds and produces corruption or OOB reads with no obvious
+indication. A mismatched type layout fails loudly — the shader reads the
+wrong field and produces visibly wrong output or a GPU fault, both of which
+are caught quickly during development. Behavioral verification is therefore
+sufficient: if the shader produces correct output across its test workloads,
+the layouts agree.
+
+If a trivial codegen path exists — a build-script tool that emits the HLSL
+accessor header from Rust type definitions, or vice versa — use it. The
+benefit is real and the cost is low. If no trivial path exists, the
+behavioral verification property makes manual maintenance acceptable; it is
+not the same risk as hand-maintaining runtime constants.
 
 
 ### 5. Constants flow from one source
@@ -339,13 +348,15 @@ In scope for the first pass:
   shader-local compile-time constants.
 - HLSL accessor helpers (`include/types.hlsl`) for the shared struct
   set, with a single authoring location per type.
-- A test harness that exercises the primitives under realistic
-  conditions: ring backpressure (submit faster than drain, verify the
-  overflow policy fires), a two-subsystem shadow ledger pattern
-  end-to-end (command watermark + aggregate snapshot + an intentional
-  invariant violation that crashes cleanly), and a multi-frame
-  roundtrip that validates frames-in-flight correctness (distinct
-  sentinel per frame, verified in order on retirement).
+- A standalone validation binary that exercises the primitives under
+  realistic conditions: ring backpressure (submit faster than drain,
+  verify the overflow policy fires), a two-subsystem shadow ledger
+  pattern end-to-end (command watermark + aggregate snapshot + an
+  intentional invariant violation that crashes cleanly), and a
+  multi-frame roundtrip that validates frames-in-flight correctness
+  (distinct sentinel per frame, verified in order on retirement). This
+  binary runs against real GPU hardware; software emulation is not a
+  reliable substitute.
 
 Out of scope for the first pass (but must remain *achievable* on top of
 the primitives):
@@ -359,15 +370,6 @@ The goal of the first pass is not to replace any functionality. It is
 to establish a layer where the principles above are enforced by
 construction, so that every subsequent port lands in a place that
 cannot repeat the class of bug that triggered the rewrite.
-
-**Isolation during the drift window.** Between "primitives exist" and
-"pipeline is ported," the crate contains both the new layer and the
-legacy code. To prevent the primitives from being bent to accommodate
-the legacy code they are meant to replace, the primitives live in a
-separate module (or sub-crate) that legacy code is not permitted to
-depend on. Ports happen at whole-subsystem granularity: a subsystem
-either uses the new primitives end-to-end or continues to use the
-legacy path. No mixing.
 
 
 ## What this does not attempt to fix
@@ -391,40 +393,11 @@ as a clean `free_count > FREE_LIST_MAX` crash with full diagnostic
 context instead of silent 93% buffer corruption — a large improvement
 over current behavior — but "cleaner crash" is not "works."
 
-The fundamental problem is that the allocator's free path funnels every
-free through a single bounded shared structure. No amount of
-frames-in-flight discipline or ring backpressure fixes this; it is a
-data-structure choice. Backpressure turns "too much" into latency
-*only* when the underlying work can eventually drain. If the drain path
-cannot accept bursts at all, backpressure just converts immediate
-corruption into indefinite stalls. The allocator needs a free path that
-can accept bursts natively.
-
-One candidate direction (not committed — this is allocator-design
-territory that deserves its own pass):
-
-**Tombstone + bounded compaction.** Each chunk owns a slot. Freeing
-sets a tombstone flag on the slot. No shared structure contention, no
-free list push, O(1) per free with no overflow risk. A periodic
-compaction pass runs every frame on a bounded time budget, scans a
-region of the metadata buffer, and reclaims tombstoned slots into the
-actual allocation structure in batches. Mass frees complete "instantly"
-from the CPU's perspective (17,000 tombstones set in one dispatch is
-trivial), and reclamation happens over however many frames it takes,
-amortized under the budget. The ledger maps naturally: a tombstone-set
-command gets a watermark, the CPU treats the slot as semantically freed
-the moment the watermark advances, regardless of reclamation progress.
-
-Properties worth calling out: free throughput is decoupled from
-reclamation throughput, fragmentation becomes a compaction-pass problem
-(the right place for it), and the front-end API stays simple. The
-downside is that allocation coordinates with a background reclaimer,
-which adds some cursor bookkeeping — bounded, but nonzero.
-
-This is one viable direction. Final design TBD. What matters now is the
-explicit handoff point: **the primitives pass does not pick an
-allocator**, and the allocator pass happens after the primitives are
-stable so it can be built on top of them instead of around them.
+**The primitives pass does not pick an allocator.** The allocator redesign
+is a separate pass that happens after the primitives are stable, so it
+can be built on top of them rather than around them. The design should
+be chosen based on the actual access patterns and burst characteristics
+observed once the ledger gives clean diagnostic data.
 
 
 ### Phase 1 scan throughput
