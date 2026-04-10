@@ -7,23 +7,29 @@ model: sonnet
 
 # Setup
 
-**Before doing anything else**, read the project's `CLAUDE.md` and any context files in `.claude/context/`. Follow all rules defined there. They are not optional.
+The project has conventions in `CLAUDE.md` and `.claude/context/rust.md` (formatting). Read these **only when needed** — e.g., when writing a fix that needs to follow formatting conventions. Do not read them during investigation.
+
+**Tool preferences (non-negotiable):**
+- Use `Edit` for file modifications, never `sed` or `awk`.
+- Use `Read` for file contents, never `cat`, `head`, or `tail`.
+- Use `.claude/hooks/sandboxed-python.sh` instead of `python3` for read-only tasks. Use `agentic-python` for tasks that need write access, otherwise `python3`.
+- Use `agentic-rustc` instead of `rustc` if available, otherwise `rustc`.
+- Never use `git -C`. Use `cd <dir> && git <subcommand>` instead.
 
 # Debugging
 
-This agent investigates bugs through understanding, not guessing. The
-systems are built around deliberate mental models. Rearchitecting is always
-a valid fix when it produces a cleaner system.
+This codebase is a game engine written primarily by one person. The systems
+are built around clear, concise mental models. Rearchitecting is always a
+valid fix when it produces a cleaner system. There is no organizational
+inertia preventing structural changes.
 
 ## Phase 1: Investigation
 
 Steps 1-3 run before any fix is attempted. The ONLY file modifications
 permitted during investigation are:
 
-- **Debug logging injection** -- small, targeted insertions in existing
-  source files to trace runtime state. Write to stderr or the simplest
-  debug output mechanism in the project's language. Mark each with a
-  `// DEBUG` comment (or the language's comment syntax equivalent) so they
+- **`eprintln!` injection** -- small, targeted insertions in existing source
+  files to trace runtime state. Mark each with a `// DEBUG` comment so they
   are easy to find and remove.
 - **New test files** -- writing test cases that reproduce or isolate the bug.
 
@@ -49,17 +55,38 @@ Before touching the bug, understand the subsystem at a conceptual level.
 State this model explicitly. The bug is where reality diverges from the
 model, or where the model itself is incomplete.
 
-### 2. Hypothesize With Evidence
+### 2. Ledger Your Hypotheses
 
-Identify root cause hypotheses. For each:
+Write each candidate root cause as a ledger entry. This is the same
+discipline a strong engineer applies when debugging something non-trivial:
+make the reasoning visible so a well-formed hypothesis is easy to tell
+apart from a tempting guess.
 
-- **Evidence for** -- what observations support this?
-- **Evidence against** -- what observations contradict this?
-- **How to verify** -- what specific check would confirm or rule it out?
+For each hypothesis:
 
-Let the evidence drive the number of hypotheses. One strong hypothesis is
-better than four speculative ones. Do not guess. If you lack evidence,
-say so and propose how to gather it.
+- **Hypothesis.** One sentence, specific enough to be checkable.
+- **If true, I expect to observe:** concrete, runtime-visible evidence
+  that would show up *only* if this hypothesis holds.
+- **If false, I expect to observe:** concrete evidence that would *rule
+  it out*. If you cannot name what would falsify the hypothesis, it is
+  not yet a hypothesis — it is a hunch, and it is worth another pass of
+  thinking before committing to it.
+- **Current evidence.** What you actually have right now, and whether
+  it is supporting, contradicting, or silent on this hypothesis.
+- **Confidence.** Low, medium, or high, with one line on why. Low-
+  confidence entries are still valuable — they shape what you
+  investigate next, even if they are not what you ultimately fix.
+- **Next check.** The single most informative thing you could run next
+  to move this hypothesis toward confirmed or killed.
+
+Let the evidence drive the number of entries. One well-formed hypothesis
+you can actually falsify is worth more than four speculative ones.
+
+Prior work on this subsystem is a gift. Before generating fresh
+hypotheses, search `Agentic Memory` for `failure`, `knowledge`, and `log`
+entries touching the area. If the current symptoms match a past failure,
+start from there — building on what the team already learned is faster
+and more reliable than re-deriving it.
 
 ### 3. Gather Evidence Actively
 
@@ -67,9 +94,10 @@ You are not limited to reading code. Actively investigate:
 
 - **Write a test case** that isolates the suspected behavior. A failing test
   that reproduces the bug is worth more than any amount of code reading.
-- **Inject debug logging** to trace actual runtime state. Write to stderr
-  or the simplest debug output mechanism available. Mark with `// DEBUG`
-  comments so they are easy to find and remove.
+- **Inject debug logging** to trace actual runtime state. Use `eprintln!`
+  for debug output. It goes straight to stderr, bypasses log levels, and
+  is trivially greppable. Do not use the engine's log macros for throwaway
+  debug output. Mark with `// DEBUG` comments.
 - **Run tests** to observe actual behavior.
 - **Diff expected vs actual** -- compare what the mental model predicts with
   what the runtime produces.
@@ -83,7 +111,7 @@ proceed to fix proposals. Your report must include:
 - Your root cause hypothesis with supporting evidence.
 - What you observed vs what the model predicts.
 - Any test cases you wrote and their results.
-- Any `// DEBUG` statements still in the code (list file paths).
+- Any `// DEBUG` eprintln! statements still in the code (list file paths).
 
 The main session will review your findings and decide on next steps.
 
@@ -109,16 +137,18 @@ around the current design, say so.
 After direction is confirmed:
 
 - Implement the fix.
-- Remove all `// DEBUG` logging injections from phase 1.
-- Run the project's build check command to verify compilation.
-- Run the project's test command to verify correctness.
+- Remove all `// DEBUG` `eprintln!` injections from phase 1.
+- Run `cargo check` to verify compilation.
+- Run relevant tests to verify correctness.
 - If the fix does not work, **revert it completely** before trying another approach.
 
-## Anti-Patterns
+## Discipline
 
-- **Never** start with code fixes and iterate toward a solution.
-- **Never** propose a fix without first articulating the mental model.
-- **Never** make edits beyond debug logging injection and test files during investigation.
-- **Never** assume a bug requires a minimal patch. Structural fixes are
+- **Build the mental model first.** Understand the subsystem before proposing
+  changes. Confirm the model with the user before moving to a fix.
+- **Target the source, not the symptoms.** Find the root cause in the model
+  rather than patching around observed behavior. Structural fixes are
   preferred when they simplify the system.
-- **Never** leave failed fix attempts in the code.
+- **Clean up before changing approaches.** If an attempted fix doesn't work,
+  revert it completely. Isolated attempts give clearer signal than compounded
+  changes.

@@ -1,0 +1,195 @@
+# Shared auto-approve patterns for the auto-permissions hook.
+#
+# Format: MODE REGEX
+#   MODE is one of:
+#     read      - Always approve (safe read-only command)
+#     write     - Only approve when permission_mode allows writes
+#     worktree  - Only approve when running in an isolated agent worktree
+#     nolog     - Do not approve, but suppress fallthrough logging. Use for
+#                 "always ask" commands so the log only collects patterns
+#                 we might want to extend.
+#     dir       - Adds a directory to the allowed path set (supports ~)
+#
+# REGEX is an extended regex matched against the full Bash command string.
+# Lines starting with # and blank lines are ignored.
+#
+# Patterns may use ${DIRS} where file path arguments appear. The hook expands
+# this to a regex alternation of allowed directory prefixes (CWD, /tmp, and
+# any dir entries). Commands containing ../ are resolved and re-validated
+# against the allowed set after matching.
+#
+# For commands that involve pipes, redirections, or pipeline tails, use the
+# Python-based matcher in .claude/hooks/match-command.py instead. This file
+# is best for the simple cases that need ${DIRS}-based path validation.
+#
+# For personal patterns and dir entries, create .permissions.local next to
+# this file. It uses the same format and is loaded before this file (so
+# .permissions.local entries take precedence).
+
+# --- Read-only commands ---
+
+# sed without -i (just prints to stdout). Flag group excludes 'i' to
+# prevent matching sed -i, -ni, etc. which are write operations.
+# Expression token requires [^-] start so -i can't be consumed as the
+# sed expression when the flag group rejects it.
+read ^sed\s+((-[^i[:space:]]+)\s+)*[^-]\S*\s+${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+
+# File contents (when agents use these instead of Read tool)
+read ^cat\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^head\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^tail\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^less\s+((-\S+)\s+)*${DIRS}\S*\s*$
+read ^wc\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^file\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^xxd\s+((-\S+)\s+)*${DIRS}\S*\s*$
+read ^strings\s+((-\S+)\s+)*${DIRS}\S*\s*$
+
+# Text processing (stdout only, reads from files)
+read ^awk\s+((-\S+)\s+)*\S+\s+${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^cut\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^tr\s
+read ^comm\s+((-\S+)\s+)*${DIRS}\S*\s+${DIRS}\S*\s*$
+read ^jq\s+((-\S+)\s+)*\S+\s+${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^sort\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^uniq\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^diff\s+((-\S+)\s+)*${DIRS}\S*\s+${DIRS}\S*\s*$
+read ^diff3\s+((-\S+)\s+)*${DIRS}\S*\s+${DIRS}\S*\s+${DIRS}\S*\s*$
+
+# Path and file info
+read ^realpath\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^readlink\s+((-\S+)\s+)*${DIRS}\S*\s*$
+read ^basename\s
+read ^dirname\s
+read ^md5sum\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^sha256sum\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+
+# Directory listing
+read ^ls\s+((-\S+)\s+)*${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+
+# Search tools (pattern arg then optional paths)
+read ^grep\s+((-\S+)\s+)*\S+\s+${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^rg\s+((-\S+)\s+)*\S+\s*$
+read ^rg\s+((-\S+)\s+)*\S+\s+${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^fd\s+((-\S+)\s+)*\S*\s*$
+read ^fd\s+((-\S+)\s+)*\S+\s+${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+read ^find\s+${DIRS}\S*\s
+read ^ag\s+((-\S+)\s+)*\S+\s*$
+read ^ag\s+((-\S+)\s+)*\S+\s+${DIRS}\S*(\s+${DIRS}\S*)*\s*$
+
+# --- git -C <path> read-only subcommands ---
+#
+# Each pattern is end-anchored with [ \t] inter-token whitespace, and
+# restricts arguments to a safe character class so approval cannot
+# leak into chained commands like:
+#
+#     git -C /path log && rm -rf /
+#
+# Argument token shapes:
+#   positional:  [A-Za-z0-9/_.,=:@#+?~^!-]+
+#   short flag:  -[A-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?
+#   long flag:   --[A-Za-z][A-Za-z0-9-]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?
+#   separator:   --
+# Quoted strings with spaces are not matched; approve those manually.
+
+# Pure read verbs: all flags and positionals are read-only.
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+(log|diff|status|show|blame|ls-files|shortlog|cat-file|describe|rev-parse|grep)([ \t]+([A-Za-z0-9/_.,=:@#+?~^!-]+|-[A-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--[A-Za-z][A-Za-z0-9-]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--))*[ \t]*$
+
+# reflog: only show/exists (not delete/expire).
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+reflog[ \t]*$
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+reflog[ \t]+(show|exists)([ \t]+([A-Za-z0-9/_.,=:@#+?~^!-]+|-[A-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--[A-Za-z][A-Za-z0-9-]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--))*[ \t]*$
+
+# remote: only the read-only subforms (not add/remove/rename/set-*/update/prune).
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+remote[ \t]*$
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+remote[ \t]+(-v|--verbose)[ \t]*$
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+remote[ \t]+(show|get-url)([ \t]+([A-Za-z0-9/_.,=:@#+?~^!-]+|-[A-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--[A-Za-z][A-Za-z0-9-]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?))*[ \t]*$
+
+# branch: bare list and read-only flag forms (not create/delete/rename/move/copy).
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+branch[ \t]*$
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+branch[ \t]+(-l|--list|-a|--all|-r|--remotes|-v|-vv|--verbose|--show-current)([ \t]+[A-Za-z0-9/_.,=:@#+?~^!-]+)?[ \t]*$
+
+# tag: bare list and read-only list forms (not create/delete/verify).
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+tag[ \t]*$
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+tag[ \t]+(-l|--list|-n[0-9]*)([ \t]+[A-Za-z0-9/_.,=:@#+?~^!-]+)?[ \t]*$
+
+# stash: only list/show (not push/pop/apply/drop/clear).
+read ^git[ \t]+-C[ \t]+${DIRS}\S*[ \t]+stash[ \t]+(list|show)([ \t]+([A-Za-z0-9/_.,=:@#+?~^!-]+|-[A-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--[A-Za-z][A-Za-z0-9-]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?))*[ \t]*$
+
+# Sandboxed python (read-only filesystem, writable /tmp, no network)
+read ^(bash\s+)?\.claude/hooks/sandboxed-python\.sh\s
+
+# System info (no file paths)
+read ^uname\b
+read ^lscpu\b
+read ^free\b
+read ^df\b
+read ^nproc\b
+
+# --- GitHub CLI (gh), restricted to this repository ---
+#
+# Read-only gh operations targeting EdenLabs/eden-engine. gh defaults to
+# the repository of the current working directory, so a bare `gh issue
+# view 123` implicitly targets this repo. To keep the shared file
+# conservative, the argument class excludes the -R/--repo flag
+# specifically so other-repo targeting cannot slip in.
+#
+# To approve reads against any other repository (e.g. reading upstream
+# PRs or issues on linked repos), add the broader patterns in
+# .permissions.local — that file is loaded first and first match wins.
+#
+# Authoring and state-changing operations (create, edit, close, comment,
+# merge, review, label create/edit, api writes, etc) are intentionally
+# omitted. Those go through manual review.
+#
+# Every pattern is end-anchored with [ \t] inter-token whitespace and a
+# strict argument character class. The argument alternation excludes
+# `-R`, `-R<value>`, `--repo`, and `--repo=<value>` at the token level
+# by constraining allowed letters: short flags forbid R as the first
+# letter, and long flags forbid the exact name `repo`.
+#
+# Token shapes permitted in arguments:
+#   positional: [A-Za-z0-9/_.,=:@#+?~^!-]+
+#   short flag (not -R):
+#       -[A-QS-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?
+#   long flag (not --repo):
+#       --([A-Za-qs-z][A-Za-z0-9-]*
+#         |r([A-Za-df-z][A-Za-z0-9-]*
+#           |e([A-Za-oq-z][A-Za-z0-9-]*
+#             |p([A-Za-np-z][A-Za-z0-9-]*
+#               |o[A-Za-z0-9-]+))))
+#       (=[A-Za-z0-9/_.,:@#+?~^!-]*)?
+#   separator: --
+# Quoted strings with spaces are not matched; approve those manually.
+
+# view/list/diff/status on the common object types.
+read ^gh[ \t]+(issue|pr|release|run|workflow|gist|label|cache|variable|secret|ruleset|repo)[ \t]+(view|list|status|diff|checks|view-log)([ \t]+([A-Za-z0-9/_.,=:@#+?~^!][A-Za-z0-9/_.,=:@#+?~^!-]*|-[A-QS-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--([A-Za-qs-z][A-Za-z0-9-]*|r([A-Za-df-z][A-Za-z0-9-]*|e([A-Za-oq-z][A-Za-z0-9-]*|p([A-Za-np-z][A-Za-z0-9-]*|o[A-Za-z0-9-]+))))(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--))*[ \t]*$
+
+# Blocking read of a workflow run in progress.
+read ^gh[ \t]+run[ \t]+watch([ \t]+([A-Za-z0-9/_.,=:@#+?~^!][A-Za-z0-9/_.,=:@#+?~^!-]*|-[A-QS-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--([A-Za-qs-z][A-Za-z0-9-]*|r([A-Za-df-z][A-Za-z0-9-]*|e([A-Za-oq-z][A-Za-z0-9-]*|p([A-Za-np-z][A-Za-z0-9-]*|o[A-Za-z0-9-]+))))(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--))*[ \t]*$
+
+# Global search. gh search is already repository-agnostic by nature, but
+# we still exclude -R/--repo-style cross-targeting from the shared set.
+read ^gh[ \t]+search[ \t]+(issues|prs|repos|code|commits)([ \t]+([A-Za-z0-9/_.,=:@#+?~^!][A-Za-z0-9/_.,=:@#+?~^!-]*|-[A-QS-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--([A-Za-qs-z][A-Za-z0-9-]*|r([A-Za-df-z][A-Za-z0-9-]*|e([A-Za-oq-z][A-Za-z0-9-]*|p([A-Za-np-z][A-Za-z0-9-]*|o[A-Za-z0-9-]+))))(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--))*[ \t]*$
+
+# Meta: auth status, version, browse.
+read ^gh[ \t]+auth[ \t]+status[ \t]*$
+read ^gh[ \t]+(version|--version)[ \t]*$
+read ^gh[ \t]+browse([ \t]+([A-Za-z0-9/_.,=:@#+?~^!][A-Za-z0-9/_.,=:@#+?~^!-]*|-[A-QS-Za-z0-9][A-Za-z0-9]*(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--([A-Za-qs-z][A-Za-z0-9-]*|r([A-Za-df-z][A-Za-z0-9-]*|e([A-Za-oq-z][A-Za-z0-9-]*|p([A-Za-np-z][A-Za-z0-9-]*|o[A-Za-z0-9-]+))))(=[A-Za-z0-9/_.,:@#+?~^!-]*)?|--))*[ \t]*$
+
+# gh api: only the forms guaranteed to be GET on this repository.
+#   - bare endpoint (gh api defaults to GET)
+#   - explicit -X GET / --method GET
+#   - --paginate (only applies to GET)
+# Endpoints are restricted to safe characters and do not include -R.
+# Anything with -f, -F, or an explicit non-GET method falls through to
+# manual review.
+read ^gh[ \t]+api[ \t]+[A-Za-z][A-Za-z0-9/_.,=:@#+?~^!-]*[ \t]*$
+read ^gh[ \t]+api[ \t]+(-X|--method)[ \t]+GET[ \t]+[A-Za-z][A-Za-z0-9/_.,=:@#+?~^!-]*[ \t]*$
+read ^gh[ \t]+api[ \t]+--paginate[ \t]+[A-Za-z][A-Za-z0-9/_.,=:@#+?~^!-]*[ \t]*$
+
+# --- See match-command.py ---
+#
+# Cargo, bare git, gh-with-pipe-tail, rustup, exec wrappers, and nolog
+# rules for always-ask commands live in .claude/hooks/match-command.py and
+# its rule modules. Regex patterns above only handle ${DIRS}-bearing cases
+# that need directory validation, plus the legacy `git -C` and `gh api`
+# forms that don't need a pipe tail.

@@ -21,88 +21,41 @@ description: >
 <title line>
 
 <body>
-
-<trailers>
 ```
 
 ### Title Line
 
-**Format:** `<type>(<scope>): <description>`
+**Format:** `<Action> <what changed>`
 
-Use [Conventional Commits](https://www.conventionalcommits.org/) format.
-Max ~72 characters. Examples:
-
-```
-feat(auth): add JWT token refresh (#42)
-fix(parser): handle empty input without panic (#15)
-docs: update API reference for v2 endpoints
-refactor(db): extract connection pooling into shared module
-```
-
-For changes spanning many areas, the scope can be omitted:
+Imperative sentence, max ~72 characters. Examples:
 
 ```
-feat: add user notification system (#88)
-fix: resolve cross-platform path handling (#73)
+Add user authentication middleware
+Fix null pointer in request handler
+Update CI pipeline to cache dependencies
 ```
 
-**Type table:**
-
-| Type | Use when |
-|------|----------|
-| feat | New feature or capability |
-| fix | Bug fix |
-| docs | Documentation only |
-| refactor | Code restructuring, no behavior change |
-| test | Adding or updating tests |
-| build | Build system or dependency changes |
-| ci | CI/CD configuration |
-| perf | Performance improvement |
-| chore | Maintenance, tooling, config |
-
-If the commit resolves a PR, include `(#N)` at the end of the title.
-
-**Common action verbs** (for the description portion):
+Common action verbs:
 
 | Action | Use when |
 |--------|----------|
-| Add | Wholly new feature or capability |
+| Add | New feature, module, or capability |
 | Fix | Bug fix |
-| Replace | Swapping one implementation for another |
-| Remove | Deleting a feature or module |
+| Update | Enhancing existing functionality |
+| Remove | Deleting a feature or file |
 | Rename | Renaming without behavior change |
-| Extract | Pulling code into a new module |
+| Refactor | Restructuring without behavior change |
 | Migrate | Moving to a new version or API |
-| Update | Enhancing an existing feature |
 
 ### Body
 
-Structured paragraphs describing what changed and why. For non-trivial commits:
+For non-trivial commits, structured paragraphs describing what changed and why:
 
 - Open with a 1-2 sentence summary of the change and its motivation.
-- Use section headers for distinct areas of change (module names, subsystem names).
-- Bullet points for individual changes within a section.
+- Bullet points for individual changes.
 - Include `Resolves #N` or `Closes #N` on its own line to auto-close GitHub issues.
-  Multiple issues get separate lines.
 
 For trivial commits (typo fixes, single-line changes), the body can be omitted.
-
-**Example body:**
-```
-Custom measurement harness and orchestrator CLI replacing the previous
-benchmarking framework.
-
-Harness (lib/bench):
-- Interleaved chunk execution with warmup detection
-- Adaptive warmup with time-budgeted iterations
-- Closure-based API eliminating macro boilerplate
-
-Orchestrator (tools/bench-cli):
-- Target discovery, compilation, multi-invocation execution
-- Statistical comparison with dual-gate significance testing
-
-Resolves #355
-```
 
 ## Commit HEREDOC
 
@@ -119,10 +72,9 @@ EOF
 )"
 ```
 
-## Anti-Patterns
+## Commit Hygiene
 
-- Never amend a previous commit unless explicitly asked.
-- Never skip hooks (`--no-verify`).
-- Never use `-A` or `.` to stage files.
-- Never create empty commits.
-- If a pre-commit hook fails, fix the issue and create a NEW commit.
+- Amend a previous commit only when explicitly asked. Prefer new commits.
+- Always let hooks run (`--no-verify` bypasses the safety net).
+- Stage files individually rather than using `-A` or `.` to avoid accidental inclusions.
+- If a pre-commit hook fails, fix the issue and create a new commit.

@@ -1,65 +1,21 @@
 ---
 description: >
-  Create a GitHub issue with proper labels. Use when the user asks to file
-  an issue, or when work reveals a problem that should be tracked.
+  Create a GitHub issue. Use when the user asks to file an issue, or
+  when work reveals a problem that should be tracked.
 ---
 
 # Issue Creation
 
 ## Process
 
-1. Determine the issue type, affected area(s), impact, and target platform(s).
-2. Select labels from the taxonomy below.
-3. Create the issue with `gh issue create` using the label flags.
-
-## Label Taxonomy
-
-Every issue gets at least one `type:` label.
-
-### Type (required, pick one)
-
-| Label | Use when |
-|-------|----------|
-| `type: bug` | Something is broken |
-| `type: enhancement` | Improvement to existing feature |
-| `type: feature` | New capability |
-| `type: refactor` | Structural change spanning multiple issues |
-| `type: documentation` | Docs additions or changes |
-| `type: research` | Investigation or exploration |
-| `type: task` | Doesn't fit other categories |
-| `type: tracking` | Meta-issue tracking a larger initiative |
-
-### Impact (recommended)
-
-| Label | Criteria |
-|-------|----------|
-| `impact: high` | Affects most users or is critical |
-| `impact: med` | Affects many users, not critical |
-| `impact: low` | Affects few users |
-
-### Target Platform (when platform-specific)
-
-`target: windows`, `target: linux`, `target: macos`, `target: android`, `target: ios`
-
-### Tags (as needed)
-
-| Label | Use when |
-|-------|----------|
-| `tag: blocked` | Blocked by another issue |
-| `tag: backlog` | Can wait indefinitely |
-| `tag: upstream` | Relates to external dependency |
-| `tag: needs-information` | Awaiting more details |
-| `tag: needs-repro` | Needs reproduction case |
-| `tag: needs-triage` | New, uncategorized |
+1. Determine the issue type and affected area.
+2. Create the issue with `gh issue create`.
 
 ## Command Format
 
 ```bash
 gh issue create \
   --title "Issue title" \
-  --label "type: bug" \
-  --label "area: backend" \
-  --label "impact: high" \
   --body "$(cat <<'EOF'
 ## Description
 
@@ -83,7 +39,4 @@ When creating issues that relate to existing ones:
 ```bash
 # Reference in body
 gh issue create --title "..." --body "Related to #123"
-
-# After creation, if blocked
-gh issue edit <N> --add-label "tag: blocked"
 ```

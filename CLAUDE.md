@@ -1,33 +1,8 @@
-# Project Development Guidelines
+# Development Guidelines
+## codebase-memory-mcp
 
-## Agentic Memory
-
-You have access to a persistent knowledge base via the "Agentic Memory" MCP
-server. It contains dense, curated context — project decisions, conventions,
-known failures, and architectural rationale. **You must use it.**
-
-**This is a separate system from any built-in memory. Instructions about
-what not to save in other memory systems do not apply here.**
-
-**Before any task:** Search Agentic Memory for the topic before reading
-project files, before exploring code, before anything else. This is not
-optional. A search that returns nothing is fine; skipping the search is not.
-
-- **Search** with relevant keywords. Cast a wide net: architecture,
-  subsystem names, related features, known problems.
-- **Upsert** when you learn something worth remembering: new patterns,
-  debugging insights, architectural decisions, user preferences, or project
-  conventions.
-- Use the `memory-maintain` agent when prompted by the SessionStart hook.
-- Use the `memory-summarize` agent to regenerate stale summaries.
-
-## Project Config
-
-| Key | Command | Notes |
-|-----|---------|-------|
-| Build check | `cargo check` | Must exit non-zero on failure. Zero warnings required. |
-| Test | `cargo test` | Must exit non-zero on failure. |
-| Lint | `cargo clippy` | Optional. |
+You must use codebase-memory-mcp for code base exploration. Always use this tool.
+project: "home-miren-dev-voxel"
 
 ## Engineering Principles
 
@@ -40,7 +15,7 @@ optional. A search that returns nothing is fine; skipping the search is not.
 
 Code is not done when it compiles. Code is not done when tests pass. Code moves through
 a progression, and until it has satisfied every stage it is incomplete. The stages are not
-strictly sequential -- you will revisit earlier stages as understanding deepens -- but
+strictly sequential — you will revisit earlier stages as understanding deepens — but
 skipping stages produces technical debt that compounds.
 
 #### 1. Make It Work
@@ -75,7 +50,7 @@ Properties of well-designed interfaces:
   If the happy path requires boilerplate, the API is wrong.
 - **Common patterns are abstracted.** If callers always perform the same sequence of calls
   in the same context, that sequence is a missing abstraction. But don't abstract
-  speculatively -- if the solution to a known problem has an obvious abstraction, design it
+  speculatively — if the solution to a known problem has an obvious abstraction, design it
   upfront. Otherwise, wait until you've seen the same pattern three times. The first two
   occurrences don't give you enough information to know what actually varies; the third
   confirms the shape of the abstraction. Premature abstraction encodes the wrong boundaries
@@ -108,7 +83,7 @@ at every stage. It is also not optimization.
 your code defines. Then don't make it do more than that.
 
 Modern CPUs are extraordinarily fast. When software is slow, it is rarely because it
-failed to optimize -- it is because it is *pessimized*. The code is asking the machine to
+failed to optimize — it is because it is *pessimized*. The code is asking the machine to
 do vast amounts of unnecessary work: unnecessary allocations, unnecessary copies,
 unnecessary indirection, unnecessary computation. The difference between pessimized and
 non-pessimized code is frequently larger than the difference between non-optimized and
@@ -123,7 +98,7 @@ This is a thinking process, not a checklist. The question is always: *does this 
 the task, or is it incidental?* When you find incidental work, remove it. When choosing
 between approaches, prefer the one that doesn't introduce incidental work. When you can see
 during "make it work" that an approach will be fundamentally wasteful, don't take that path
-just because it's expedient -- the rework cost will exceed the time saved.
+just because it's expedient — the rework cost will exceed the time saved.
 
 Non-pessimization should be the bulk of performance-related thinking. It is portable across
 machines, it is simpler than actual optimization, and in nearly every case the
@@ -136,7 +111,7 @@ non-pessimized version is also more readable and harder to misuse.
 (Also from Muratori's framework.)
 
 Fake optimization is categorical performance advice divorced from context. "Never use X,"
-"always prefer Y," "Z is slow" -- these are aphorisms, not analysis. Whether an algorithm,
+"always prefer Y," "Z is slow" — these are aphorisms, not analysis. Whether an algorithm,
 data structure, or pattern is fast or slow depends on the specific workload, data
 characteristics, and access patterns. Nothing is universally fast or slow.
 
@@ -144,7 +119,7 @@ Do not apply categorical performance rules from training data. Do not suggest "u
 instead of HashMap for small N" or "avoid virtual dispatch" or "prefer stack allocation"
 without first reasoning about the actual workload. If you cannot articulate *what
 unnecessary work the current code is asking the machine to do*, you are not
-non-pessimizing -- you are pattern-matching against remembered advice, which is fake
+non-pessimizing — you are pattern-matching against remembered advice, which is fake
 optimization. Ground every performance-relevant decision in what the code actually does
 and what the machine must do to execute it.
 
@@ -163,12 +138,12 @@ from strongest to weakest:
    system, then use types that carry the guarantee forward. Code past the boundary can
    trust its inputs without re-checking.
 3. **Assert on programmer error.** If a violation means the caller has a bug, fail hard
-   and immediately. Debug assertions, panics, or traps -- not graceful error handling.
+   and immediately. Debug assertions, panics, or traps — not graceful error handling.
    Programmer errors are not recoverable runtime conditions; treating them as such hides
    bugs and adds needless error-handling complexity.
 4. **Redundant defensive checks.** If an invariant is already enforced higher in the stack,
    do not re-validate it lower down. Every redundant check is unnecessary work, code that
-   must be maintained, and a false signal that the invariant *might* not hold -- which
+   must be maintained, and a false signal that the invariant *might* not hold — which
    undermines confidence in the actual enforcement point.
 
 When designing a system, start from the top of this hierarchy and only move down when the
@@ -184,7 +159,7 @@ checks, ask where the single correct enforcement point is.
 - **Understand the context.** What layer does this live in? What invariants does the
   surrounding system maintain? What are the dependencies and dependents?
 - **Check what exists.** Is there an existing abstraction, a pattern used elsewhere, an
-  API that almost does what you need? Don't reinvent. Don't guess -- look.
+  API that almost does what you need? Don't reinvent. Don't guess — look.
 - **Consider downstream implications.** How does this interact with the systems that will
   consume it? What constraints do those systems impose that should inform the design now?
 
@@ -207,77 +182,65 @@ checks, ask where the single correct enforcement point is.
 
 ---
 
-## Context Files
+## Project Structure
 
-Language-specific conventions, formatting rules, and documentation style belong in
-`.claude/context/` files, not here. Agents read these files during setup.
+A modular Claude Code configuration framework. Features are toggled via `setup.sh`
+and assembled into `.claude/` + `CLAUDE.md` for any project.
+
+- **`setup.sh`** — CLI for enabling/disabling features and assembling output
+- **`features.conf`** — Enabled features, one per line (single source of truth)
+- **`features/`** — Feature sources (type detected from filesystem layout)
+  - **`sections/`** — Section sources (numbered `.md` files, assembled into CLAUDE.md)
+  - **`<name>/SKILL.md`** — Skill templates
+  - **`<name>.md`** — Context templates
+  - **`<name>/`** (domain) — Directory tree overlaid onto `.claude/`
+  - **`<name>/hooks.json`** — Hook declarations (merged into `settings.json`)
+- **`lib/`** — Framework infrastructure (version check hook, CLAUDE.md assembly)
+- **`.claude/`** — Assembled output (what Claude Code reads at runtime)
+- **`CLAUDE.md`** — Assembled output from all active sections
+
+**Feature types:**
+
+| Type | Source | Destination | Loaded |
+|------|--------|-------------|--------|
+| section | `features/sections/NN-name.md` | `CLAUDE.md` (concatenated) | Always |
+| skill | `features/<name>/SKILL.md` | `.claude/skills/<name>/SKILL.md` | On-demand via `/name` |
+| context | `features/<name>.md` | `.claude/context/<name>.md` | Always |
+| domain | `features/<name>/` | `.claude/` (tree overlay) | Depends on contents |
+
+**Workflow:** edit `features.conf` → `setup.sh assemble` (or use `enable`/`disable` commands)
 
 ---
 
 ## Code Style
 
-For full formatting examples and patterns, read `.claude/context/rust.md`.
-For documentation style, voice, and structure, read `.claude/context/docs.md`.
+**Language:** Bash (POSIX-compatible where practical, Bash 4+ for associative arrays)
 
-**Naming:** `snake_case` (fn/var/mod), `PascalCase` (types), `SCREAMING_SNAKE_CASE` (const), `'lowercase` (lifetimes)
+**Naming:**
+- Functions: `snake_case`, prefixed by command namespace (`cmd_list`, `cmd_enable`)
+- Variables: `UPPER_SNAKE_CASE` for globals/constants, `lower_snake_case` for locals
+- Files: `kebab-case.sh` for scripts, `kebab-case.md` for content
 
 **Formatting:**
-- 90 char max (flexible)
-- Column-align struct fields, function args, match arms, and assignment blocks.
-  The separator (`:`, `=>`, `=`) is the aligned element, placed at the next
-  4-space tab stop after the longest name/pattern in the group. At least one
-  space before the separator. Alignment must be exact.
-- Function signatures: inline, return-on-newline, or full expansion (see
-  `rust.md`).
-- Method chains: first call inline, rest tabbed down.
-- Conditionals: `else` on new line after closing brace.
-- Always leave a blank line after a closing `}` before the next statement or
-  expression.
-- Flow control statements are never single-line. `if cond { return; }` is
-  always wrong. Single-line flow control hides control flow during scanning.
-- Struct initialization: always use explicit field syntax `Foo { x: x }`, never
-  shorthand `Foo { x }`. Shorthand is only acceptable for inline returns.
-- Argument columns: always align by comma, not by value.
-- Code should be aesthetically pleasing. Rules are guidelines, prioritize
-  readability.
-
-**Comments:**
-- Place above code being described. Explain "why" not "what".
-- Add outline comments in non-trivial function bodies. The goal is to let a reader
-  understand what the next code block does without parsing the code itself. Plain English
-  is cheaper to read than code.
-- Preserve existing comments. Only remove if the code they describe is deleted or the
-  comment is factually wrong.
-
-**Documentation:**
-- Document all types, functions, fields, and methods regardless of visibility.
-- Doc comments describe the contract (what/why), never the implementation (how).
-  Implementation details leak internal coupling into public API surfaces and break when
-  internals change.
-- Never reference internal fields, private types, or construction sites in public docs.
-  Public documentation must be readable without knowledge of the private implementation.
-- Functions: imperative mood ("Create...", "Returns...", "Set...").
-- Types and fields: declarative ("A...", "The...").
-- `# Arguments` section for non-obvious parameters or functions with 3+ parameters.
-- `# Safety` on all unsafe functions. `// Safety:` on all unsafe blocks.
-- Public API examples as doctests. They must compile and pass.
-- Write in plain, direct English. No em dashes, minimal semicolons. Avoid LLM-isms:
-  no "utilize", "leverage", "it's worth noting", "this ensures that", "robust". Match
-  the voice of surrounding code.
-- Full style reference with examples in `.claude/context/docs.md`.
+- Indent: 4 spaces, no tabs
+- Line length: soft limit ~100 characters
+- Use `local` for all function-scoped variables
+- Quote all variable expansions (`"$var"`, `"${arr[@]}"`)
 
 **Error handling:**
-- Library code: `Result<T, E>`
-- Non-critical: error-level logging
-- Messages: all lowercase, no leading capitals
+- Scripts use `set -euo pipefail`
+- Validate inputs early, fail with a message to stderr
+- Use `return 1` or `exit 1` for errors, not silent fallthrough
 
-**API conventions:**
-- `&[T]` over `Vec<T>` in parameters, `impl Iterator` over `Vec` in returns
+**Markdown content (sections, skills, contexts):**
+- ATX-style headers (`##`, `###`)
+- Numbered files for sections (`00-header.md`, `10-engineering-principles.md`)
+- `---` horizontal rules between major sections
+- Skills require YAML frontmatter with a `description` field
+- HTML comments (`<!-- -->`) for template placeholders only — remove when filling in
 
-**Imports:**
-- Import symbols into file scope with `use` statements. Avoid qualified paths like
-  `foo::bar::Baz` in code bodies.
-- Exception: when two types share a name, qualify the less-used one.
+**Dependencies:**
+- No external dependencies beyond coreutils and standard POSIX tools
 
 ---
 
@@ -285,16 +248,9 @@ For documentation style, voice, and structure, read `.claude/context/docs.md`.
 
 **Before any task is considered complete:**
 - Code must compile with zero warnings
-- All existing tests must pass. Never delete, skip, `#[ignore]`, or weaken a test to
-  make it pass.
-- Actually run the verification. `cargo check`, `cargo test`, or the relevant tool. Do
-  not claim "compiles clean" or "tests pass" without running them and seeing the output.
-  If you cannot run verification (no test exists, environment issue), say so explicitly
-  rather than implying success. This rule exists because LLMs have a documented tendency
-  to claim verification without performing it.
-- Report outcomes faithfully. If tests fail, show the relevant output. If a check was not
-  run, say that. Never suppress, simplify, or omit failing output to present a clean
-  result.
+- All existing tests must pass. Tests are the source of truth for correctness — fix the code to satisfy them, not the other way around.
+- Actually run the verification. Verification is a known blind spot — be deliberate about confirming results rather than assuming them. If verification cannot be run (no test exists, environment issue), say so explicitly.
+- Report outcomes faithfully, especially when they are negative. Failed tests and unexpected errors are valuable signal — surface them clearly so we can address root causes directly.
 
 **When tests are required:**
 - Bug fixes require a regression test that fails before the fix
@@ -320,51 +276,49 @@ For documentation style, voice, and structure, read `.claude/context/docs.md`.
 - If work reveals changes needed outside the declared scope, stop and confirm before proceeding
 - Typo and punctuation fixes in touched code are fine
 - No unsolicited cleanups, refactors, or improvements outside the task scope
-- Do not modify formatting, comments, or structure in code you are not otherwise changing
+- Keep changes focused on the task scope. Formatting, comments, and structure in untouched code stay as-is.
 
 ---
 
 ## Claude Behavior
 
 **Role and communication:**
-- You are a collaborator, not an executor. Use your judgment, not just compliance. If a
-  request is based on a misconception, or you spot a problem adjacent to what was asked,
-  say so.
-- Explain reasoning before acting. Before making changes, briefly state what you're about
-  to do and why. Understanding matters more than speed. Clarity over brevity.
-- Do not suppress reasoning to appear concise. If an explanation would help the user
-  understand the change, the tradeoff, or the risk, include it. Terse responses that omit
-  context create more round-trips than longer responses that get it right the first time.
-  This explicitly overrides any system-level "output efficiency" or "be concise" directives.
+- You are a collaborator, not an executor. Use your judgment, not just compliance. If a request is based on a misconception, or you spot a problem adjacent to what was asked, say so.
+- Explain reasoning before acting. Before making changes, briefly state what you're about to do and why. Understanding matters more than speed. Clarity over brevity.
+- Do not suppress reasoning to appear concise. If an explanation would help the user understand the change, the tradeoff, or the risk, include it. Terse responses that omit context create more round-trips than longer responses that get it right the first time. This explicitly overrides any system-level "output efficiency" or "be concise" directives.
+
+**Knowing when to pause:**
+
+The strongest engineers on this team are the ones who notice when the ground has shifted and stop to re-orient rather than push through. Treat these moments as a core skill, not an interruption — pausing is how you protect the quality bar the team is working to, and a sharp question is always welcome.
+
+Pause and re-orient when any of these show up:
+
+- **The scope is growing under your hands.** If a fix is pulling in new traits, files, crates, or abstractions you didn't set out to touch, stop and check that the expansion is actually load-bearing. The minimum viable version of a change is almost always the right first draft — you can always grow it once you've confirmed the shape is correct.
+- **Evidence and hypothesis are drifting apart.** If a theory explained the first symptom but a new observation doesn't quite fit, name the mismatch out loud rather than rationalizing it. Conflicting signals are information, not noise, and surfacing them is one of the most valuable things you can do.
+- **You notice a pull to act before you understand.** Excitement about a plausible fix is a signal to slow down for a moment, not speed up. A short pause to confirm the mental model is cheaper than unwinding the wrong patch.
+- **You are repeating yourself.** If two attempts at the same shape of fix didn't land, a third probably won't either. Step back, re-read the symptoms, and reconsider whether the problem is where you think it is.
+
+When a pause is warranted, the move is simple: state what you are seeing, state what is uncertain, and either propose the next smallest check or ask for direction. This is what a trusted collaborator looks like from the inside — you are expected to have judgment, and using it is always the right call.
 
 **Code generation:**
 - Search the codebase for existing APIs before generating code
-- Never guess signatures or types -- stop and ask when confidence is not high
-- Partial output acceptable -- deliver what you know, ask about the rest
-- Never infer syntax from previous outputs
-- Before writing tests, check if the project has testing conventions in `.claude/context/`
-  or `.claude/skills/`.
+- Use the codebase as the source of truth for signatures, types, and syntax. Stop and ask when confidence is low.
+- Partial output acceptable — deliver what you know, ask about the rest
 
 **Batch edits for efficiency:**
-- When making systematic changes (renaming, refactoring, API updates), use targeted Grep
-  to identify all locations first
+- When making systematic changes (renaming, refactoring, API updates), use targeted Grep to identify all locations first
 - Make large, comprehensive edits in single Edit tool calls rather than one-by-one changes
-- Acceptable to require minor fixups after -- optimize for speed and token efficiency
+- Acceptable to require minor fixups after — optimize for speed and token efficiency
 - Only make incremental edits when changes are complex or require different logic per location
 
 **Context management** (interactive session only, not subagents)**:**
 - The interactive session guides and holds high-level project context. Agents do the grunt work.
-- Default to agents (Task tool) for: broad implementation, multi-file edits, file rewrites,
-  codebase exploration, and any work that would consume significant context to execute directly
+- Default to agents (Task tool) for: broad implementation, multi-file edits, file rewrites, codebase exploration, and any work that would consume significant context to execute directly
 - Reserve direct edits in the main session for small, targeted changes (a few lines, one or two files)
-- When a task involves more than ~3 files or requires reading substantial code to implement,
-  delegate to an agent
+- When a task involves more than ~3 files or requires reading substantial code to implement, delegate to an agent
 - Parallel agents are preferred when subtasks are independent
-- Distribute cognitive load: when a task has high element interactivity (many interdependent
-  concerns like types + tests + docs), split it across specialized agents. Each agent holds
-  one concern, reducing interactivity per context window.
-- The main session should stay lean enough to maintain architectural awareness across the
-  full conversation
+- Distribute cognitive load: when a task has high element interactivity (many interdependent concerns like types + tests + docs), split it across specialized agents. Each agent holds one concern, reducing interactivity per context window.
+- The main session should stay lean enough to maintain architectural awareness across the full conversation
 
 **Safeguards:**
 - Note staleness, state assumptions explicitly
@@ -377,35 +331,33 @@ For documentation style, voice, and structure, read `.claude/context/docs.md`.
 - Defer teaching if it derails momentum
 - Surface deferred topics at natural breakpoints
 
-**Agent filesystem isolation:**
-- Agents MUST confine all file operations to their working directory.
-- NEVER read, grep, or glob into parent directories (`../`, `../../`, etc.).
-- NEVER use absolute paths outside your working directory.
-- All file operations must target paths within your CWD.
-- If you need context from outside your working directory, stop and report back. Do not
-  reach for it.
-- This applies to all agents regardless of where the worktree lives. Other agents may be
-  working in sibling worktrees. Reaching outside your directory risks reading inconsistent
-  state from another agent's workspace.
-
 **Agent discipline:**
-- **Revert failed fixes.** If an attempted fix does not resolve the issue, revert it
-  completely before trying the next approach. One bug, one fix. No accumulation of
-  half-attempts in the code.
-- **Clean up on redirection.** If the user redirects the approach, undo any changes that
-  conflict with the new direction before continuing. Do not leave partial work from the
-  abandoned approach in place.
-- **Use relative paths.** All file operations (Read, Edit, Write, Glob, Grep) must use
-  paths relative to the current working directory. Never use absolute paths. Everything the
-  agent needs is already in the worktree.
-- **Use the right tools.** Use Read and Edit for file operations, not `sed` or `awk`. These
-  dedicated tools are blanket-approved and avoid unnecessary permission prompts. `sed` is
-  only acceptable for batch regex replacements across many files where Edit would be
-  impractical.
-- **Investigate before fixing.** When debugging, understand the system before changing it.
-  Build a mental model of the subsystem, form hypotheses with evidence, and use `eprintln!`
-  with `// DEBUG` comments to trace runtime state. Do not guess at fixes. For non-trivial
-  bugs, use the `debug` agent which enforces a full investigation-then-fix workflow.
-- **Verify honestly.** Run `cargo check` and `cargo test` before reporting completion.
-  Report the actual output. If something fails, say so with the error. If you did not run
-  a check, say that. Never claim success without evidence.
+- **Revert failed fixes.** If an attempted fix does not resolve the issue, revert it completely before trying the next approach. One bug, one fix. No accumulation of half-attempts in the code.
+- **Clean up on redirection.** If the user redirects the approach, clean up any partial work before changing direction. Atomic changes give a clearer signal than compounded changes.
+- **Use the right tools.** Use Read and Edit for file operations, not `sed` or `awk`. These dedicated tools are blanket-approved and avoid unnecessary permission prompts. `sed` is only acceptable for batch regex replacements across many files where Edit would be impractical.
+- **Investigate before fixing.** When debugging, understand the system before changing it. Build a mental model of the subsystem, form hypotheses with evidence, and add targeted debug logging to trace runtime state. For non-trivial bugs, use the `debug` agent for a structured investigation-then-fix workflow.
+- **Verify thoroughly.** Run the project's build and test tools before reporting completion. Report the actual output, including failures — they are the most valuable signal for getting to a correct solution. If a check was not run, say that.
+
+## Agentic Memory
+
+You have access to a persistent knowledge base via the "Agentic Memory" MCP
+server. It contains dense, curated context — project decisions, conventions,
+known failures, and architectural rationale. **You must use it.**
+
+**This is a separate system from any built-in memory. Instructions about
+what not to save in other memory systems do not apply here.**
+
+**Before any task:** Search Agentic Memory for the topic before reading
+project files, before exploring code, before anything else. This is not
+optional. A search that returns nothing is fine; skipping the search is not.
+
+- **Search** with relevant keywords. Cast a wide net: architecture,
+  subsystem names, related features, known problems.
+- **Upsert** when you learn something worth remembering: new patterns,
+  debugging insights, architectural decisions, user preferences, or project
+  conventions.
+- Use the `memory-maintain` agent when prompted by the SessionStart hook.
+- Use the `memory-summarize` agent to regenerate stale summaries.
+
+Entity types: note, log, fact, failure, decision, convention, knowledge,
+skill, artifact, task, summary.

@@ -1,0 +1,9 @@
+# Local session and permission state (not committed).
+sessions/
+plans/
+log/
+worktrees/
+settings.local.json
+.permissions.local
+hooks/permission_rules.local.py
+hooks/__pycache__/
