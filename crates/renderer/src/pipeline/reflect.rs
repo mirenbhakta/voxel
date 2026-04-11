@@ -131,6 +131,15 @@ fn find_workgroup_size(
                 let y = extract_literal_bit32(&inst.operands, 3, "LocalSize y")?;
                 let z = extract_literal_bit32(&inst.operands, 4, "LocalSize z")?;
 
+                if x == 0 || y == 0 || z == 0 {
+                    return Err(RendererError::ShaderReflectionFailed(format!(
+                        "entry point '{entry_point}' has invalid LocalSize \
+                         [{x}, {y}, {z}]; all dimensions must be ≥ 1 \
+                         (Vulkan spec: WorkgroupSize must be at least 1 \
+                         in each dimension)"
+                    )));
+                }
+
                 return Ok([x, y, z]);
             }
 
@@ -244,18 +253,34 @@ fn find_pointed_struct_id(
     -> Option<spirv::Word>
 {
     // Find the OpVariable to get its result_type (the pointer type id).
+    // Only accept Uniform storage class — storage buffers also live at
+    // descriptor set 0 / binding 0 in some shaders and must not be mistaken
+    // for the GpuConsts uniform buffer.
+    // OpVariable operand layout: [StorageClass, optional initializer].
     let pointer_type_id = module.types_global_values.iter()
         .find(|inst| {
             inst.class.opcode == spirv::Op::Variable
                 && inst.result_id == Some(var_id)
+                && matches!(
+                    inst.operands.first(),
+                    Some(Operand::StorageClass(spirv::StorageClass::Uniform))
+                )
         })
         .and_then(|inst| inst.result_type)?;
 
-    // Find the OpTypePointer with that result id; operands[1] = IdRef(pointee).
+    // Find the OpTypePointer with that result id.
+    // OpTypePointer operand layout: [StorageClass, IdRef(pointee)].
+    // Require Uniform storage class as a belt-and-suspenders check: a
+    // storage-buffer pointer (StorageBuffer class) pointing to a struct must
+    // not be treated as the GpuConsts slot.
     let struct_id = module.types_global_values.iter()
         .find(|inst| {
             inst.class.opcode == spirv::Op::TypePointer
                 && inst.result_id == Some(pointer_type_id)
+                && matches!(
+                    inst.operands.first(),
+                    Some(Operand::StorageClass(spirv::StorageClass::Uniform))
+                )
         })
         .and_then(|inst| {
             if let Some(Operand::IdRef(pointee)) = inst.operands.get(1) {
@@ -394,6 +419,99 @@ fn member_byte_size(module: &rspirv::dr::Module, type_id: spirv::Word) -> Option
 mod tests {
     use super::*;
     use crate::error::RendererError;
+
+    /// Build a minimal little-endian SPIR-V compute shader binary with the
+    /// given `[numthreads(x, y, z)]` and no descriptor bindings.
+    ///
+    /// Equivalent HLSL (x=64, y=1, z=1):
+    /// ```hlsl
+    /// [numthreads(64, 1, 1)]
+    /// void main() {}
+    /// ```
+    ///
+    /// IDs used: %void=1, %voidfn=2, %main=3, %label=4 (bound=5).
+    fn minimal_compute_spirv(x: u32, y: u32, z: u32) -> Vec<u8> {
+        #[rustfmt::skip]
+        let words: &[u32] = &[
+            // Header
+            0x07230203, // magic
+            0x00010100, // version 1.1
+            0x00000000, // generator
+            0x00000005, // bound (IDs 1–4 used)
+            0x00000000, // schema
+
+            // OpCapability Shader  (op=17, 2 words)
+            0x00020011, 0x00000001,
+
+            // OpMemoryModel Logical GLSL450  (op=14, 3 words)
+            0x0003000E, 0x00000000, 0x00000001,
+
+            // OpEntryPoint GLCompute %main "main"  (op=15, 5 words)
+            // "main\0" occupies 2 words (5 bytes padded to 8).
+            0x0005000F, 0x00000005, 0x00000003, 0x6E69616D, 0x00000000,
+
+            // OpExecutionMode %main LocalSize x y z  (op=16, 6 words)
+            0x00060010, 0x00000003, 0x00000011, x, y, z,
+
+            // %void = OpTypeVoid  (op=19, 2 words)
+            0x00020013, 0x00000001,
+
+            // %voidfn = OpTypeFunction %void  (op=33, 3 words)
+            0x00030021, 0x00000002, 0x00000001,
+
+            // %main = OpFunction %void None %voidfn  (op=54, 5 words)
+            0x00050036, 0x00000001, 0x00000003, 0x00000000, 0x00000002,
+
+            // %label = OpLabel  (op=248, 2 words)
+            0x000200F8, 0x00000004,
+
+            // OpReturn  (op=253, 1 word)
+            0x000100FD,
+
+            // OpFunctionEnd  (op=56, 1 word)
+            0x00010038,
+        ];
+
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// Hand-crafted minimal SPIR-V (no DXC required). Verifies the success
+    /// path: correct workgroup size returned, and `None` for `gpu_consts_byte_size`
+    /// since the shader declares no descriptor bindings.
+    #[test]
+    fn reflect_spirv_succeeds_on_minimal_compute_shader() {
+        let spv = minimal_compute_spirv(64, 1, 1);
+        let reflected = reflect_spirv(&spv, "main")
+            .expect("reflect_spirv should succeed on a valid minimal SPIR-V");
+
+        assert_eq!(
+            reflected.workgroup_size,
+            [64, 1, 1],
+            "workgroup size should match the LocalSize 64 1 1 in the binary",
+        );
+        assert_eq!(
+            reflected.gpu_consts_byte_size,
+            None,
+            "gpu_consts_byte_size should be None: shader has no descriptor bindings",
+        );
+    }
+
+    /// A LocalSize with any zero dimension is invalid per the Vulkan spec.
+    /// `reflect_spirv` must reject it rather than letting `dispatch_linear`
+    /// divide by zero later.
+    #[test]
+    fn reflect_spirv_errors_on_zero_workgroup_dimension() {
+        for (x, y, z) in [(0, 1, 1), (1, 0, 1), (1, 1, 0)] {
+            let spv = minimal_compute_spirv(x, y, z);
+            let result = reflect_spirv(&spv, "main");
+
+            assert!(
+                matches!(result, Err(RendererError::ShaderReflectionFailed(_))),
+                "expected ShaderReflectionFailed for LocalSize [{x}, {y}, {z}], \
+                 got {result:?}",
+            );
+        }
+    }
 
     /// Fewer than 5 words (20 bytes) can never be a valid SPIR-V header.
     /// `rspirv`'s parser rejects this as `HeaderIncomplete`.
