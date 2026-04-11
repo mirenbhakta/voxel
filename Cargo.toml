@@ -12,6 +12,7 @@ thiserror = "1"
 wgpu      = { version = "29", default-features = false, features = ["wgsl", "spirv", "vulkan"] }
 bytemuck  = { version = "1", features = ["derive"] }
 pollster  = "0.4.0"
+rspirv    = "0.13"
 
 [profile.dev.package."*"]
 opt-level = 2

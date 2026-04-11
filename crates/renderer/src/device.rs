@@ -182,7 +182,6 @@ impl FrameEncoder {
     /// Mutable access to the underlying `wgpu::CommandEncoder`. `pub(crate)`
     /// so that ring and pipeline primitives inside the renderer can record
     /// commands; callers outside the crate never touch the raw encoder.
-    #[allow(dead_code)] // First caller: ReadbackChannel / ComputePipeline (later increments).
     pub(crate) fn encoder_mut(&mut self) -> &mut wgpu::CommandEncoder {
         &mut self.encoder
     }

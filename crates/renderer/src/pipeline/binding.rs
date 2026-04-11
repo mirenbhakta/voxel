@@ -100,7 +100,6 @@ impl BindingLayout {
     /// The underlying wgpu layout handle, used by pipeline construction
     /// within this crate. Not exposed publicly — higher layers go through
     /// `ComputePipeline` / `RenderPipeline` which consume a `BindingLayout`.
-    #[allow(dead_code)] // Consumed in Increment 6 by ComputePipeline.
     pub(crate) fn wgpu_layout(&self) -> &wgpu::BindGroupLayout {
         &self.wgpu_layout
     }

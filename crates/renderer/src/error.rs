@@ -28,4 +28,19 @@ pub enum RendererError {
     /// `RequestDeviceError` is a thin opaque type.
     #[error("failed to create wgpu device: {0}")]
     DeviceCreationFailed(String),
+
+    /// SPIR-V reflection encountered a structural error in the module.
+    ///
+    /// Covers bugs in the reflection surface itself — malformed SPV that the
+    /// parser rejected, a module with no entry point matching the requested
+    /// name, or a missing `LocalSize` execution mode that is required for
+    /// workgroup-size reflection. These are build-time programming errors (bad
+    /// shader, wrong entry-point name, unsupported execution-mode form) rather
+    /// than recoverable runtime conditions; see `.local/renderer_plan.md` §7.
+    ///
+    /// `LocalSizeId` (spec-constant workgroup sizes) produces this variant
+    /// with a message advising use of literal `numthreads` instead — not yet
+    /// supported in the first rewrite pass.
+    #[error("shader reflection failed: {0}")]
+    ShaderReflectionFailed(String),
 }
