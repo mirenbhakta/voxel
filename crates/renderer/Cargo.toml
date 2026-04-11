@@ -5,3 +5,5 @@ edition.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+wgpu.workspace     = true
+pollster.workspace = true

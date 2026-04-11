@@ -9,6 +9,9 @@ edition = "2024"
 [workspace.dependencies]
 eden-math = { path = "../eden/eden-engine/lib/eden-math", default-features = false }
 thiserror = "1"
+wgpu      = { version = "29", default-features = false, features = ["wgsl", "spirv", "vulkan"] }
+bytemuck  = { version = "1", features = ["derive"] }
+pollster  = "0.4.0"
 
 [profile.dev.package."*"]
 opt-level = 2

@@ -13,4 +13,6 @@ pub mod shader;
 
 mod device;
 
+pub use device::RendererContext;
 pub use error::RendererError;
+pub use frame::{FrameCount, FrameIndex};
