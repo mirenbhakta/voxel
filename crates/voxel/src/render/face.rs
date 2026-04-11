@@ -441,8 +441,8 @@ mod tests {
         // The identity matrix (bit i set in row i) should remain unchanged
         // after transpose.
         let mut m = [0u32; 32];
-        for i in 0..32 {
-            m[i] = 1 << i;
+        for (i, slot) in m.iter_mut().enumerate() {
+            *slot = 1 << i;
         }
 
         let expected = m;
@@ -456,8 +456,8 @@ mod tests {
     fn transpose_roundtrip() {
         // Transposing twice should return the original matrix.
         let mut m = [0u32; 32];
-        for i in 0..32 {
-            m[i] = (i as u32).wrapping_mul(0x1234_5678) ^ (i as u32 * 7);
+        for (i, slot) in m.iter_mut().enumerate() {
+            *slot = (i as u32).wrapping_mul(0x1234_5678) ^ (i as u32 * 7);
         }
 
         let original = m;
@@ -477,8 +477,8 @@ mod tests {
 
         transpose_32x32(&mut m);
 
-        for i in 0..32 {
-            assert_eq!(m[i], 1, "row {i} should have only bit 0 set");
+        for (i, &row) in m.iter().enumerate() {
+            assert_eq!(row, 1, "row {i} should have only bit 0 set");
         }
     }
 

@@ -229,6 +229,15 @@ impl BlockRegistry {
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
+
+    /// Returns whether this registry has no registered block types.
+    ///
+    /// Always `false` in practice: the registry is initialized with at
+    /// least the Air block, but the method is provided for API symmetry
+    /// with [`len`](Self::len).
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------

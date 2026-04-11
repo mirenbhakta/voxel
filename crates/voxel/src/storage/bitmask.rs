@@ -33,13 +33,13 @@ pub struct Bitmask<S: VoxelIndexer> {
 impl<S: VoxelIndexer> Bitmask<S> {
     /// Create a new bitmask with `count` voxels, all set to `fill`.
     pub fn new(count: usize, fill: bool) -> Self {
-        let word_count = (count + 31) / 32;
+        let word_count = count.div_ceil(32);
         let fill_word  = if fill { !0u32 } else { 0u32 };
         let mut words  = vec![fill_word; word_count];
 
         // Clear trailing bits in the last word so they don't inflate
         // count_ones.
-        if fill && count % 32 != 0 {
+        if fill && !count.is_multiple_of(32) {
             let valid_bits = count % 32;
             let last       = words.len() - 1;
             words[last]    = (1u32 << valid_bits) - 1;
@@ -75,6 +75,11 @@ impl<S: VoxelIndexer> Bitmask<S> {
         self.count
     }
 
+    /// Returns whether this bitmask contains no voxels.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
     /// Returns the number of occupied voxels.
     pub fn count_ones(&self) -> usize {
         self.words.iter().map(|w| w.count_ones() as usize).sum()
@@ -107,7 +112,7 @@ impl<S: VoxelIndexer> Bitmask<S> {
         Src: IntoVoxelStream,
     {
         let (count, stream) = src.into_voxel_stream();
-        let word_count      = (count + 31) / 32;
+        let word_count      = count.div_ceil(32);
         let mut words       = vec![0u32; word_count];
 
         for (i, value) in stream.take(count).enumerate() {
@@ -174,8 +179,8 @@ impl<S: VoxelIndexer> IntoVoxelStream for Bitmask<S> {
         let current = words.next().unwrap_or(0);
 
         let iter = BitmaskIter {
-            words     : words,
-            current   : current,
+            words,
+            current,
             bit_pos   : 0,
             remaining : count,
         };
@@ -195,7 +200,7 @@ impl<S: VoxelIndexer> FromVoxelStream for Bitmask<S> {
         stream : impl Iterator<Item = bool>,
     ) -> Self
     {
-        let word_count = (count + 31) / 32;
+        let word_count = count.div_ceil(32);
         let mut words  = vec![0u32; word_count];
 
         for (i, value) in stream.take(count).enumerate() {
@@ -331,10 +336,10 @@ mod tests {
 
         let dense: Dense<L, bool> = convert(bm);
 
-        assert_eq!(*dense.get(&Vector3::new(0, 0, 0)), true);
-        assert_eq!(*dense.get(&Vector3::new(3, 3, 3)), true);
-        assert_eq!(*dense.get(&Vector3::new(2, 1, 0)), true);
-        assert_eq!(*dense.get(&Vector3::new(1, 1, 1)), false);
+        assert!(*dense.get(&Vector3::new(0, 0, 0)));
+        assert!(*dense.get(&Vector3::new(3, 3, 3)));
+        assert!(*dense.get(&Vector3::new(2, 1, 0)));
+        assert!(!*dense.get(&Vector3::new(1, 1, 1)));
     }
 
     // -- convert_from_dense --

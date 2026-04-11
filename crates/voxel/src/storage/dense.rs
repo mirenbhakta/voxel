@@ -53,6 +53,11 @@ impl<S: VoxelIndexer, T> Dense<S, T> {
         self.data.len()
     }
 
+    /// Returns whether this volume contains no voxels.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
     /// Returns the voxel data as a flat slice in index order.
     pub fn as_slice(&self) -> &[T] {
         &self.data

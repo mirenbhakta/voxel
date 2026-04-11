@@ -36,6 +36,11 @@ impl<S: VoxelIndexer, T> Palette<S, T> {
         self.indices.len()
     }
 
+    /// Returns whether this storage contains no voxels.
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+
     /// Returns the number of unique values in the palette.
     pub fn palette_len(&self) -> usize {
         self.entries.len()
@@ -136,7 +141,7 @@ mod tests {
     fn single_value() {
         // A stream of identical values must collapse to a single palette entry
         // regardless of how many voxels are in the volume.
-        let stream = std::iter::repeat(42u32).take(1000);
+        let stream = std::iter::repeat_n(42u32, 1000);
         let palette = Palette::<Morton3D, u32>::from_voxel_stream(1000, stream);
 
         assert_eq!(palette.palette_len(), 1);

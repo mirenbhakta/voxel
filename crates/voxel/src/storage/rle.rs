@@ -30,6 +30,11 @@ impl<T> Run<T> {
         self.len
     }
 
+    /// Returns whether this run is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Returns a reference to the repeated value.
     pub fn value(&self) -> &T {
         &self.value
@@ -76,6 +81,11 @@ impl<S: VoxelIndexer, T> Rle<S, T> {
     /// Returns the total number of logical voxels.
     pub fn len(&self) -> usize {
         self.count
+    }
+
+    /// Returns whether this storage contains no voxels.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 
     /// Returns the number of compressed runs.
@@ -148,9 +158,9 @@ impl<S: VoxelIndexer, T: Clone> IntoVoxelStream for Rle<S, T> {
         };
 
         let iter = RleIter {
-            runs      : runs,
-            current   : current,
-            remaining : remaining,
+            runs,
+            current,
+            remaining,
         };
 
         (count, iter)
@@ -211,8 +221,8 @@ impl<S: VoxelIndexer, T: PartialEq + Clone> FromVoxelStream for Rle<S, T> {
         }
 
         Rle {
-            runs    : runs,
-            count   : count,
+            runs,
+            count,
             _marker : PhantomData,
         }
     }
@@ -232,7 +242,7 @@ mod tests {
     #[test]
     fn constant_stream() {
         // A uniform stream of identical values must compress to a single run.
-        let stream = std::iter::repeat(42u32).take(1000);
+        let stream = std::iter::repeat_n(42u32, 1000);
         let rle    = Rle::<Linear3D<10, 10, 10>, u32>::from_voxel_stream(1000, stream);
 
         assert_eq!(rle.run_count(), 1);
@@ -270,7 +280,7 @@ mod tests {
         // Use Linear3D<30, 1, 1> so index == x coordinate.
         type L = Linear3D<30, 1, 1>;
 
-        let stream = (0u32..3).flat_map(|v| std::iter::repeat(v).take(10));
+        let stream = (0u32..3).flat_map(|v| std::iter::repeat_n(v, 10));
         let rle    = Rle::<L, u32>::from_voxel_stream(30, stream);
 
         assert_eq!(rle.run_count(), 3);
