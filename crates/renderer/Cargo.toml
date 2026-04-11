@@ -7,3 +7,4 @@ edition.workspace = true
 thiserror.workspace = true
 wgpu.workspace     = true
 pollster.workspace = true
+bytemuck.workspace = true

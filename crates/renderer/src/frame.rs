@@ -50,9 +50,11 @@ pub struct FrameIndex(u64);
 
 impl FrameIndex {
     /// Advance the counter by one. Saturates at `u64::MAX`, which at 60 FPS is
-    /// ~9.7 billion years away — not a concern.
+    /// ~9.7 billion years away — not a concern in practice, but saturating
+    /// makes the "cannot overflow" contract explicit instead of relying on
+    /// debug-mode panic + release-mode wrap.
     pub fn advance(&mut self) {
-        self.0 += 1;
+        self.0 = self.0.saturating_add(1);
     }
 
     /// Get the raw index.

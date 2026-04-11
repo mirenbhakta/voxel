@@ -13,6 +13,8 @@ pub mod shader;
 
 mod device;
 
-pub use device::RendererContext;
+pub use device::{FrameEncoder, RendererContext};
 pub use error::RendererError;
 pub use frame::{FrameCount, FrameIndex};
+pub use gpu_consts::{GpuConsts, GpuConstsData};
+pub use pipeline::{BindEntry, BindKind, BindingLayout, BindingLayoutBuilder};

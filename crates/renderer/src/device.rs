@@ -11,15 +11,15 @@ use crate::frame::{FrameCount, FrameIndex};
 /// Owns the wgpu device and queue plus the renderer's frame counters. The
 /// single place any other module in this crate receives GPU handles from.
 ///
-/// Increment 3 exposes only headless construction and frame getters; the
-/// surface-based constructor, `begin_frame`/`end_frame`, and the `pub(crate)`
-/// device/queue accessors land as later increments need them.
+/// Increment 3 added headless construction and frame getters; Increment 4
+/// opens the `pub(crate)` device/queue accessors so `GpuConsts` and
+/// `BindingLayout` can allocate their GPU resources, and adds the
+/// [`Self::begin_frame`] / [`Self::end_frame`] pair so command recording
+/// flows through a single [`FrameEncoder`] from day one. The surface-based
+/// constructor still lands in a later increment once a windowed caller
+/// first needs it.
 pub struct RendererContext {
-    // Held but unused in Increment 3. Accessors land in Increment 4 when
-    // `GpuConsts` first needs to allocate a uniform buffer.
-    #[allow(dead_code)]
     device: wgpu::Device,
-    #[allow(dead_code)]
     queue: wgpu::Queue,
     frame_count: FrameCount,
     frame_index: FrameIndex,
@@ -71,10 +71,113 @@ impl RendererContext {
         self.frame_count
     }
 
-    /// The current monotonic frame index. Starts at zero at construction and
-    /// advances as `begin_frame`/`end_frame` land in later increments.
+    /// The current monotonic frame index — the frame that the *next* call to
+    /// [`Self::begin_frame`] will tag its [`FrameEncoder`] with. Starts at
+    /// zero at construction and advances by one each time [`Self::end_frame`]
+    /// submits a frame.
     pub fn frame_index(&self) -> FrameIndex {
         self.frame_index
+    }
+
+    /// Begin recording a new frame.
+    ///
+    /// Creates a fresh `wgpu::CommandEncoder`, tags it with the current
+    /// [`FrameIndex`], and returns it wrapped in a [`FrameEncoder`]. Ring and
+    /// pipeline primitives landing in later increments take
+    /// `&mut FrameEncoder` so their `copy_buffer_to_buffer` / `dispatch`
+    /// calls all record into the same encoder, and the caller never touches
+    /// `wgpu::CommandEncoder` directly — principle 3.
+    ///
+    /// Does not advance `frame_index` — the current frame index *is* the
+    /// frame this encoder records for. The advance happens in
+    /// [`Self::end_frame`] after the command buffer is submitted.
+    ///
+    /// Must be paired with exactly one [`Self::end_frame`] call using the
+    /// returned `FrameEncoder`. The type's lack of `Clone` / `Copy` plus the
+    /// by-value consume in `end_frame` is the forced-pairing mechanism.
+    pub fn begin_frame(&mut self) -> FrameEncoder {
+        let encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("renderer_frame_encoder"),
+            });
+        FrameEncoder {
+            encoder,
+            frame: self.frame_index,
+        }
+    }
+
+    /// End the current frame.
+    ///
+    /// Consumes the [`FrameEncoder`] returned by a previous
+    /// [`Self::begin_frame`], calls `finish()` on it to produce a
+    /// `CommandBuffer`, submits that buffer to the queue, and advances
+    /// `frame_index` by one.
+    ///
+    /// Polling wgpu for readback map callbacks (§3.2 of the plan) is
+    /// deliberately not done here yet — it lands with `ReadbackChannel` in
+    /// Increment 9 when there is something mapped to poll for.
+    pub fn end_frame(&mut self, frame_encoder: FrameEncoder) {
+        let command_buffer = frame_encoder.encoder.finish();
+        self.queue.submit(std::iter::once(command_buffer));
+        self.frame_index.advance();
+    }
+
+    /// The wgpu device handle. Only visible within the renderer crate —
+    /// external callers interact with the device exclusively through
+    /// primitives (`GpuConsts`, `BindingLayout`, rings, pipelines) per
+    /// principle 3 in `docs/renderer_rewrite_principles.md`.
+    pub(crate) fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The wgpu queue handle. Same visibility rationale as [`Self::device`].
+    #[allow(dead_code)] // First caller: GpuConsts::new / upload_if_dirty (already in crate).
+    pub(crate) fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+}
+
+/// The per-frame command-recording wrapper returned by
+/// [`RendererContext::begin_frame`] and consumed by
+/// [`RendererContext::end_frame`].
+///
+/// Holds the single `wgpu::CommandEncoder` into which all ring copies and
+/// pipeline dispatches for the frame are recorded. Exists so the renderer
+/// crate keeps its own `pub(crate)` view of `wgpu::CommandEncoder` out of
+/// public APIs (principle 3) while still giving callers a handle they can
+/// thread through ring / pipeline methods — which in later increments will
+/// accept `&mut FrameEncoder` rather than `&mut wgpu::CommandEncoder`.
+///
+/// `FrameEncoder` is deliberately not `Clone` or `Copy`. Together with the
+/// by-value consume in `end_frame`, this makes "forgot to submit" and
+/// "submitted twice" into compile errors.
+///
+/// Rationale and the longer-range plan: `.local/renderer_plan.md` §14.4
+/// under "Render graph and resource manager", and Agentic Memory entry
+/// `decision-render-graph-deferral`.
+pub struct FrameEncoder {
+    encoder: wgpu::CommandEncoder,
+    frame: FrameIndex,
+}
+
+impl FrameEncoder {
+    /// The frame index this encoder was created for. Convenience for ring and
+    /// pipeline primitives whose APIs take a `FrameIndex` — instead of
+    /// threading it alongside the encoder, they can read it back from the
+    /// wrapper. Not a guarantee of real-time ordering — that's maintained by
+    /// the begin/end pairing on [`RendererContext`].
+    #[allow(dead_code)] // First caller: ReadbackChannel::schedule_copy_and_map (Increment 9).
+    pub fn frame(&self) -> FrameIndex {
+        self.frame
+    }
+
+    /// Mutable access to the underlying `wgpu::CommandEncoder`. `pub(crate)`
+    /// so that ring and pipeline primitives inside the renderer can record
+    /// commands; callers outside the crate never touch the raw encoder.
+    #[allow(dead_code)] // First caller: ReadbackChannel / ComputePipeline (later increments).
+    pub(crate) fn encoder_mut(&mut self) -> &mut wgpu::CommandEncoder {
+        &mut self.encoder
     }
 }
 
@@ -98,5 +201,59 @@ mod tests {
 
         assert_eq!(ctx.frame_count().get(), 2);
         assert_eq!(ctx.frame_index().get(), 0);
+    }
+
+    /// `begin_frame` tags the returned `FrameEncoder` with the current frame
+    /// index (which has not yet advanced); `end_frame` submits and advances
+    /// by one. The observable property is that after a begin/end pair the
+    /// context's `frame_index` is exactly one past where it started.
+    ///
+    /// Also exercises a "no-op frame" — no commands are recorded on the
+    /// encoder between begin and end. wgpu accepts an empty command buffer,
+    /// so this checks that the plumbing is fine with a zero-work frame.
+    #[test]
+    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
+    fn begin_end_frame_submits_and_advances_index() {
+        let mut ctx = pollster::block_on(RendererContext::new_headless(
+            FrameCount::new(2).unwrap(),
+        ))
+        .expect("headless GPU context should construct on a vulkan-capable machine");
+
+        assert_eq!(ctx.frame_index().get(), 0);
+
+        let fe0 = ctx.begin_frame();
+        assert_eq!(fe0.frame().get(), 0);
+        ctx.end_frame(fe0);
+
+        assert_eq!(ctx.frame_index().get(), 1);
+
+        // A second frame advances again — the counter is monotonic and not
+        // reset by submission.
+        let fe1 = ctx.begin_frame();
+        assert_eq!(fe1.frame().get(), 1);
+        ctx.end_frame(fe1);
+
+        assert_eq!(ctx.frame_index().get(), 2);
+    }
+
+    /// Slot-rotation smoke test: with `FrameCount::new(2)` the per-frame slot
+    /// derived from `frame_index.slot(frame_count)` alternates 0, 1, 0, 1 as
+    /// `end_frame` advances. Once the rings land, this is the number they
+    /// will use to pick a slot — pinning the behavior now in the smallest
+    /// possible surface catches any future `advance` regression.
+    #[test]
+    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
+    fn begin_end_frame_rotates_slot_across_frames() {
+        let mut ctx = pollster::block_on(RendererContext::new_headless(
+            FrameCount::new(2).unwrap(),
+        ))
+        .expect("headless GPU context should construct on a vulkan-capable machine");
+
+        let count = ctx.frame_count();
+        for expected in [0u32, 1, 0, 1] {
+            assert_eq!(ctx.frame_index().slot(count), expected);
+            let fe = ctx.begin_frame();
+            ctx.end_frame(fe);
+        }
     }
 }
