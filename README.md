@@ -8,8 +8,9 @@ and converts between them at runtime.
 ## Architecture
 
 The library (`src/`) has zero GPU dependencies. A separate binary crate
-(`crates/scaffold/`) provides a wgpu + winit render loop for visual testing and
-development.
+(`crates/renderer/`, in progress) will provide a wgpu + winit render loop for
+visual testing and development. Its design is governed by
+[docs/renderer_rewrite_principles.md](docs/renderer_rewrite_principles.md).
 
 ### Storage
 

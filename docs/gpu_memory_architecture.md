@@ -6,7 +6,7 @@ pre-allocation waste, and sync stalls in the current rendering pipeline.
 > **Partial supersession (2026-04-10):** The GPU-side allocator, quad storage,
 > cull cascade, far-field rendering as a distinct path, occlusion-driven streaming,
 > LOD decimation, layered generation, and chunk lifecycle sections have been
-> superseded by `render_pipeline_v2.md` and `scaffold_rewrite_principles.md` —
+> superseded by `render_pipeline_v2.md` and `renderer_rewrite_principles.md` —
 > marked **[SUPERSEDED]** below. The material storage model (§Material Storage),
 > async feedback principles, and occupancy discussion remain in effect and are
 > used directly by V2.
@@ -80,7 +80,7 @@ occupied voxels.
 
 ## [SUPERSEDED] Contiguous Allocation Model
 
-*GPU-side bump allocator and free list rolled back. CPU-authoritative allocation per `scaffold_rewrite_principles.md`.*
+*GPU-side bump allocator and free list rolled back. CPU-authoritative allocation per `renderer_rewrite_principles.md`.*
 
 Both quad and material storage use the same principle: chunks own contiguous
 ranges in shared buffers, not scattered blocks. The page table and block pool

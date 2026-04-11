@@ -2,7 +2,7 @@
 
 Cubic voxels throughout. Sub-chunk DDA is the sole rendering primitive at every
 distance. This document supersedes `gpu_memory_architecture.md` for rendering
-architecture. `scaffold_rewrite_principles.md` still governs CPU/GPU boundary
+architecture. `renderer_rewrite_principles.md` still governs CPU/GPU boundary
 discipline and applies unchanged.
 
 The document is split into **Core** — the minimum viable path that validates or
@@ -112,7 +112,7 @@ enough to preempt the camera.
 Fast camera motion is the steady state, not a special case. Continuous small
 residency deltas are exactly what the control-plane batching absorbs.
 Worst-case spikes (view distance changes, world load) remain bounded by the
-scaffold rewrite principles.
+renderer rewrite principles.
 
 ### Cull Pass
 

@@ -1,14 +1,15 @@
-# Scaffold Rewrite Principles
+# Renderer Rewrite Principles
 
-Design principles for the next iteration of the `scaffold` crate. Recorded
-after a debugging session that surfaced accumulated architectural debt which
-cannot be resolved by patches in place.
+Design principles for the `renderer` crate — a ground-up rewrite that
+replaces the prior `scaffold` feasibility spike. Recorded after a debugging
+session that surfaced accumulated architectural debt which could not be
+resolved by patches in place.
 
 
 ## Why a rewrite
 
 The `scaffold` crate began as a feasibility spike for the rendering design
-proposal and has grown into a working renderer. Over time the CPU↔GPU
+proposal and grew, over successive patches, into a working renderer. Over time the CPU↔GPU
 boundary has accumulated a specific class of bug that keeps recurring in new
 forms. A non-exhaustive list from the git history and Agentic Memory:
 
