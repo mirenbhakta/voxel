@@ -26,10 +26,7 @@ The project has conventions in `CLAUDE.md` and `.claude/context/rust.md` (format
 
 # Debugging
 
-This codebase is a game engine written primarily by one person. The systems
-are built around clear, concise mental models. Rearchitecting is always a
-valid fix when it produces a cleaner system. There is no organizational
-inertia preventing structural changes.
+<!-- TODO: Describe the project's codebase character — architectural philosophy and whether structural changes are welcome. -->
 
 ## Phase 1: Investigation
 
@@ -162,3 +159,5 @@ After direction is confirmed:
 - **Clean up before changing approaches.** If an attempted fix doesn't work,
   revert it completely. Isolated attempts give clearer signal than compounded
   changes.
+
+<!-- If placeholder comments above are unfilled, stop and inform the main session that this agent has not been configured for this project. Ask whether to derive the missing context from CLAUDE.md or the project structure. -->

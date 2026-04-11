@@ -1,7 +1,7 @@
 # Development Guidelines
 ## codebase-memory-mcp
 
-You must use codebase-memory-mcp for code base exploration. Always use this tool.
+Use codebase-memory-mcp for codebase exploration.
 project: "home-miren-dev-voxel"
 
 ## Engineering Principles

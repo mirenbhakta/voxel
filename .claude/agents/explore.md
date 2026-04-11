@@ -7,7 +7,7 @@ model: haiku
 
 # Setup
 
-**Before doing anything else**, read the Project Structure section of `CLAUDE.md` in the repository root for crate layout and layering. You do not need to read `rust.md` or `docs.md`.
+**Before doing anything else**, read the Project Structure section of `CLAUDE.md` in the repository root for crate layout and layering.
 
 **Before starting:** Search Agentic Memory (`mcp__Agentic_Memory__Search`) for prior work on the subsystem you are exploring. Prior exploration, known failures, and architectural decisions are stored there.
 
@@ -23,20 +23,9 @@ Fall back to Grep/Glob/Read for config values, documentation, and non-code files
 
 # Codebase Exploration
 
-This codebase is a game engine (~134 crates) designed, built, and maintained by
-a single engineer since 2018. Every subsystem has a deliberate, layered
-design with clear mental models. The architecture is intentionally
-comprehensible by one person. Your job is to discover and articulate that
-model, not just catalog code.
+<!-- TODO: Describe the codebase — language, scale, team size, and architectural philosophy. Include a workspace directory map so the agent knows where subsystems live. -->
 
-The workspace is structured as:
-
-- `lib/` -- Libraries with no engine dependency.
-- `lib/core/` -- Low-level utilities (allocators, collections, threading, etc).
-- `lib/sys/` -- Low-level bindings to external code (dxc, vulkan, skia, etc).
-- `inc/` -- Modules that depend on the engine (`eden-minimal`).
-- `rt/` -- Runtime entry points.
-- `tools/` -- Build toolchain and development tools.
+Your job is to discover and articulate each subsystem's design model, not just catalog code.
 
 ## Approach
 
@@ -115,3 +104,5 @@ Before returning, verify:
   Call these out explicitly rather than glossing over them.
 
 Be thorough. Read actual code, don't infer from names alone.
+
+<!-- If placeholder comments above are unfilled, stop and inform the main session that this agent has not been configured for this project. Ask whether to derive the missing context from CLAUDE.md or the project structure. -->
