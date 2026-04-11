@@ -92,8 +92,7 @@ impl BindingLayout {
     }
 
     /// All binding entries in this layout, including the injected
-    /// `GpuConstsData` entry at slot 0. The order is: slot 0 first, then user
-    /// entries in the order they were added.
+    /// `GpuConstsData` entry at slot 0, in ascending binding-slot order.
     pub fn entries(&self) -> &[BindEntry] {
         &self.entries
     }
@@ -122,14 +121,16 @@ impl BindingLayoutBuilder {
     /// GpuConsts slot is reserved and the builder injects it automatically at
     /// [`Self::build`].
     ///
-    /// Also panics on duplicate bindings at the same slot, which is a
-    /// programmer error and would otherwise fail later in
-    /// `device.create_bind_group_layout` with a much less readable diagnostic.
+    /// Panics on duplicate bindings at the same slot, which is a programmer
+    /// error and would otherwise fail later in `device.create_bind_group_layout`
+    /// with a much less readable diagnostic.
     ///
-    /// Both checks belong at the "assert on programmer error" tier of the
-    /// invariant hierarchy in `docs/renderer_rewrite_principles.md`: a
-    /// caller that tried to target a reserved slot or collided on a slot
-    /// has a bug, not a recoverable runtime condition.
+    /// Panics if a buffer `kind`'s `size` is zero. `NonZeroU64::new(0)` maps to
+    /// `min_binding_size: None`, which silently disables wgpu's binding-size
+    /// validation; catching it here keeps the error local to the caller's bug.
+    ///
+    /// All three checks belong at the "assert on programmer error" tier of the
+    /// invariant hierarchy in `docs/renderer_rewrite_principles.md`.
     pub fn add_entry(mut self, entry: BindEntry) -> Self {
         assert!(
             entry.binding != BindingLayout::GPU_CONSTS_SLOT,
@@ -142,6 +143,19 @@ impl BindingLayoutBuilder {
             "BindingLayoutBuilder::add_entry: duplicate binding at slot {}",
             entry.binding,
         );
+        match entry.kind {
+            BindKind::UniformBuffer { size }
+            | BindKind::StorageBufferReadOnly { size }
+            | BindKind::StorageBufferReadWrite { size } => {
+                assert!(
+                    size > 0,
+                    "BindingLayoutBuilder::add_entry: buffer size at slot {} must be \
+                     non-zero (zero maps to min_binding_size: None, skipping wgpu's \
+                     binding size validation)",
+                    entry.binding,
+                );
+            }
+        }
         self.entries.push(entry);
         self
     }
@@ -156,15 +170,14 @@ impl BindingLayoutBuilder {
             kind: BindKind::UniformBuffer {
                 size: std::mem::size_of::<GpuConstsData>() as u64,
             },
-            // COMPUTE is sufficient for the first pass — the validation
-            // binary is compute-only. When a real render pipeline first
-            // needs vertex/fragment visibility on GpuConsts, widen this.
-            visibility: wgpu::ShaderStages::COMPUTE,
+            // GpuConsts is read by every shader stage — vertex, fragment, and
+            // compute all need the ring slot / sentinel values it carries.
+            visibility: wgpu::ShaderStages::VERTEX
+                | wgpu::ShaderStages::FRAGMENT
+                | wgpu::ShaderStages::COMPUTE,
         };
-        // Insert at the front so `entries()` reads in slot order on the
-        // common case (caller adds user entries in ascending order starting
-        // from 1).
-        self.entries.insert(0, gpu_consts_entry);
+        self.entries.push(gpu_consts_entry);
+        self.entries.sort_by_key(|e| e.binding);
 
         let wgpu_entries: Vec<wgpu::BindGroupLayoutEntry> = self
             .entries
@@ -255,6 +268,21 @@ mod tests {
             });
     }
 
+    /// A buffer entry with `size: 0` silently disables wgpu's `min_binding_size`
+    /// check (since `NonZeroU64::new(0)` produces `None`). Catch it early so the
+    /// error is local to the caller.
+    ///
+    /// Pure CPU — the builder does not touch wgpu until `build()`.
+    #[test]
+    #[should_panic(expected = "buffer size at slot")]
+    fn add_entry_panics_on_zero_size() {
+        let _ = BindingLayout::builder("test_layout").add_entry(BindEntry {
+            binding: 1,
+            kind: BindKind::StorageBufferReadOnly { size: 0 },
+            visibility: wgpu::ShaderStages::COMPUTE,
+        });
+    }
+
     /// GPU smoke test: `build()` injects the GpuConsts binding at slot 0 with
     /// a uniform-buffer type sized to `GpuConstsData`.
     ///
@@ -279,7 +307,12 @@ mod tests {
             }
             other => panic!("expected UniformBuffer, got {other:?}"),
         }
-        assert!(entry.visibility.contains(wgpu::ShaderStages::COMPUTE));
+        assert_eq!(
+            entry.visibility,
+            wgpu::ShaderStages::VERTEX
+                | wgpu::ShaderStages::FRAGMENT
+                | wgpu::ShaderStages::COMPUTE
+        );
     }
 
     /// GPU smoke test: user bindings added in order end up after the

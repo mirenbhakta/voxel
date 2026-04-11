@@ -32,9 +32,17 @@ impl RendererContext {
     /// will be sized against. Headless callers pass it explicitly because
     /// there is no swapchain to read it from.
     ///
-    /// Requests `Features::empty()` — this increment only verifies that a
-    /// device opens. Later increments widen the feature set as they need
-    /// specific capabilities (`PASSTHROUGH_SHADERS`, etc.).
+    /// Requires `Features::PASSTHROUGH_SHADERS` — the renderer compiles
+    /// HLSL to SPIR-V via DXC at build time and hands the bytes straight
+    /// to `create_shader_module_passthrough`, bypassing naga. See
+    /// `.local/renderer_plan.md` §8.1 and Agentic Memory
+    /// `decision-scaffold-rewrite-principles` for the rationale — naga
+    /// can't round-trip `DrawIndex`, which real subsystems will need, so
+    /// the pass uses the same toolchain the old scaffold proved. A machine
+    /// whose Vulkan driver doesn't expose `PASSTHROUGH_SHADERS` will fail
+    /// device creation here, which is what the ignored GPU tests also
+    /// observe; the software fallback (lavapipe/swiftshader) is explicitly
+    /// not a substitute per the phase exit criterion.
     pub async fn new_headless(frame_count: FrameCount) -> Result<Self, RendererError> {
         let instance = wgpu::Instance::new(
             wgpu::InstanceDescriptor::new_without_display_handle(),
@@ -51,7 +59,7 @@ impl RendererContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("renderer_headless_device"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::PASSTHROUGH_SHADERS,
                 required_limits: wgpu::Limits::default(),
                 ..Default::default()
             })
@@ -132,7 +140,6 @@ impl RendererContext {
     }
 
     /// The wgpu queue handle. Same visibility rationale as [`Self::device`].
-    #[allow(dead_code)] // First caller: GpuConsts::new / upload_if_dirty (already in crate).
     pub(crate) fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
