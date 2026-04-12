@@ -15,11 +15,11 @@
 #define RENDERER_GPU_CONSTS_HLSL
 
 struct GpuConsts {
-    // --- Ring machinery ---
-    uint upload_slot;
-    uint readback_slot;
+    // --- Reserved (formerly ring slot machinery; now graph-managed) ---
+    uint _reserved0;
+    uint _reserved1;
     uint frame_count;
-    uint upload_capacity;
+    uint _reserved2;
 
     // --- Validation binary only ---
     uint frame_sentinel;

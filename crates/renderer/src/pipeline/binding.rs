@@ -20,8 +20,8 @@ use crate::gpu_consts::GpuConstsData;
 
 /// Descriptor for a single binding in a [`BindingLayout`].
 ///
-/// Produced by primitives like `UploadRing::bind_entry` / `ReadbackChannel::bind_entry`
-/// (landing in later increments) and passed into [`BindingLayoutBuilder::add_entry`].
+/// Constructed by callers using a buffer's size and usage, then passed into
+/// [`BindingLayoutBuilder::add_entry`].
 /// Callers never construct wgpu bind group layout entries directly — this is
 /// the primitives-layer boundary that keeps binding descriptor shape in one
 /// place.

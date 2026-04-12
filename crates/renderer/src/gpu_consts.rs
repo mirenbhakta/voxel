@@ -12,9 +12,14 @@ use crate::device::RendererContext;
 /// Shared constants read by all shaders via a uniform buffer bound at slot 0
 /// of every [`BindingLayout`](crate::pipeline::binding::BindingLayout).
 ///
-/// Updated rarely — this is a "constants" table, not a ring. The first rewrite
-/// pass adds exactly the fields the validation binary exercises and no more;
-/// later passes grow this table as real shared constants appear.
+/// Updated rarely — this is a "constants" table, not a per-frame ring. Later
+/// passes grow this table as real shared constants appear.
+///
+/// The `_reserved*` fields hold byte positions formerly used by per-ring slot
+/// machinery (`upload_slot`, `readback_slot`, `upload_capacity`) which moved
+/// to render-graph-managed resource resolution. They exist to preserve the
+/// 32-byte layout agreement with the HLSL mirror and are available for future
+/// graph-level constants.
 ///
 /// ## Layout agreement with HLSL
 ///
@@ -24,12 +29,11 @@ use crate::device::RendererContext;
 ///
 /// 1. A Rust const assertion: `size_of::<GpuConstsData>() == 32` (below).
 ///    Any change that breaks the size fails to compile.
-/// 2. A runtime SPIR-V reflection check landing in Increment 6 that asserts
-///    the HLSL uniform buffer size reflected out of the compiled shader
-///    matches the Rust side.
+/// 2. A runtime SPIR-V reflection check that asserts the HLSL uniform buffer
+///    size reflected out of the compiled shader matches the Rust side.
 /// 3. Behavioral verification via the validation binary's sentinel roundtrip
-///    (Increments 10–11) — any layout disagreement produces a garbage echo
-///    which the test detects loudly.
+///    — any layout disagreement produces a garbage echo which the test
+///    detects loudly.
 ///
 /// ## Padding fields
 ///
@@ -40,17 +44,15 @@ use crate::device::RendererContext;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuConstsData {
-    // --- Ring machinery (read by any shader that touches a ring) ---
-    /// Current upload ring slot in `0..frame_count`.
-    pub upload_slot: u32,
-    /// Current readback ring slot in `0..frame_count`.
-    pub readback_slot: u32,
-    /// Frame count (2..=4). Used by shaders that index slot rotation directly.
+    // --- Reserved (formerly ring slot machinery; now graph-managed) ---
+    #[doc(hidden)]
+    pub _reserved0: u32,
+    #[doc(hidden)]
+    pub _reserved1: u32,
+    /// Frame count (2..=4). Used by shaders that need frame-in-flight context.
     pub frame_count: u32,
-    /// Per-slot capacity of upload rings. Single number because the first-pass
-    /// validation binary uses one upload ring; later passes can extend this
-    /// to per-ring capacities via additional fields.
-    pub upload_capacity: u32,
+    #[doc(hidden)]
+    pub _reserved2: u32,
 
     // --- Validation binary only ---
     /// A sentinel the CPU writes each frame, which the validation shader
@@ -187,10 +189,7 @@ mod tests {
     #[test]
     fn gpu_consts_data_default_is_zeroed() {
         let d = GpuConstsData::default();
-        assert_eq!(d.upload_slot, 0);
-        assert_eq!(d.readback_slot, 0);
         assert_eq!(d.frame_count, 0);
-        assert_eq!(d.upload_capacity, 0);
         assert_eq!(d.frame_sentinel, 0);
     }
 

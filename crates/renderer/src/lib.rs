@@ -4,21 +4,21 @@
 //! crate enforces, and `.local/renderer_plan.md` for the implementation plan
 //! of the first rewrite pass.
 
+pub mod buffer;
 pub mod error;
 pub mod frame;
 pub mod gpu_consts;
 pub mod graph;
 pub mod pipeline;
-pub mod ring;
 pub mod shader;
 
 mod device;
 
+pub use buffer::StagedBuffer;
 pub use device::{FrameEncoder, RendererContext};
 pub use error::RendererError;
 pub use frame::{FrameCount, FrameIndex};
 pub use gpu_consts::{GpuConsts, GpuConstsData};
 pub use pipeline::{BindEntry, BindKind, BindingLayout, BindingLayoutBuilder};
 pub use pipeline::{ComputePipeline, ComputePipelineDescriptor};
-pub use ring::{CommandWatermark, OverflowPolicy, PolicyError, UploadRing};
 pub use shader::{ShaderSource, load_shader};
