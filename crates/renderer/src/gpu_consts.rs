@@ -72,6 +72,12 @@ pub struct GpuConstsData {
 // loudest possible signal, which is a compile error.
 const _: () = assert!(std::mem::size_of::<GpuConstsData>() == 32);
 
+// Alignment must be 4 (the alignment of u32, the largest member under
+// #[repr(C)]). A change here means someone added a wider member, which
+// would alter padding and break the field-for-field layout agreement with
+// the HLSL mirror — force a review.
+const _: () = assert!(std::mem::align_of::<GpuConstsData>() == 4);
+
 /// GPU-resident uniform buffer holding a single snapshot of [`GpuConstsData`].
 ///
 /// Owns one persistent `wgpu::Buffer` sized for the Pod struct. Updates flow

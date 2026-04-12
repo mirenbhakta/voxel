@@ -475,6 +475,101 @@ mod tests {
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
     }
 
+    /// Build a SPIR-V compute shader with `[numthreads(x, y, z)]` and a
+    /// uniform buffer at `(set=0, binding=0)` containing `num_u32_members`
+    /// `u32` fields with `std140` member offsets at `0, 4, 8, …`.
+    ///
+    /// IDs: %1=void, %2=voidfn, %3=main, %4=label,
+    ///      %5=uint, %6=struct, %7=pointer, %8=variable. Bound=9.
+    fn compute_spirv_with_uniform(
+        x: u32, y: u32, z: u32,
+        num_u32_members: u32,
+    ) -> Vec<u8> {
+        assert!(num_u32_members > 0);
+
+        let mut w: Vec<u32> = Vec::new();
+
+        // --- Header ---
+        w.extend_from_slice(&[
+            0x07230203, // magic
+            0x00010100, // version 1.1
+            0x00000000, // generator
+            0x00000009, // bound (IDs 1–8)
+            0x00000000, // schema
+        ]);
+
+        // OpCapability Shader
+        w.extend_from_slice(&[0x00020011, 0x00000001]);
+
+        // OpMemoryModel Logical GLSL450
+        w.extend_from_slice(&[0x0003000E, 0x00000000, 0x00000001]);
+
+        // OpEntryPoint GLCompute %3 "main"
+        w.extend_from_slice(&[
+            0x0005000F, 0x00000005, 0x00000003, 0x6E69616D, 0x00000000,
+        ]);
+
+        // OpExecutionMode %3 LocalSize x y z
+        w.extend_from_slice(&[0x00060010, 0x00000003, 0x00000011, x, y, z]);
+
+        // --- Annotations ---
+
+        // OpDecorate %8 DescriptorSet 0
+        w.extend_from_slice(&[0x00040047, 0x00000008, 0x00000022, 0x00000000]);
+
+        // OpDecorate %8 Binding 0
+        w.extend_from_slice(&[0x00040047, 0x00000008, 0x00000021, 0x00000000]);
+
+        // OpDecorate %6 Block
+        w.extend_from_slice(&[0x00030047, 0x00000006, 0x00000002]);
+
+        // OpMemberDecorate %6 i Offset (i*4) for each member
+        for i in 0..num_u32_members {
+            w.extend_from_slice(&[0x00050048, 0x00000006, i, 0x00000023, i * 4]);
+        }
+
+        // --- Types ---
+
+        // %1 = OpTypeVoid
+        w.extend_from_slice(&[0x00020013, 0x00000001]);
+
+        // %2 = OpTypeFunction %1
+        w.extend_from_slice(&[0x00030021, 0x00000002, 0x00000001]);
+
+        // %5 = OpTypeInt 32 0
+        w.extend_from_slice(&[0x00040015, 0x00000005, 0x00000020, 0x00000000]);
+
+        // %6 = OpTypeStruct %5 %5 ... (num_u32_members times)
+        let struct_wc = 2 + num_u32_members;
+        w.push((struct_wc << 16) | 0x001E);
+        w.push(0x00000006);
+        w.extend(std::iter::repeat_n(0x00000005u32, num_u32_members as usize));
+
+        // %7 = OpTypePointer Uniform %6
+        w.extend_from_slice(&[0x00040020, 0x00000007, 0x00000002, 0x00000006]);
+
+        // %8 = OpVariable %7 Uniform
+        w.extend_from_slice(&[0x0004003B, 0x00000007, 0x00000008, 0x00000002]);
+
+        // --- Function ---
+
+        // %3 = OpFunction %1 None %2
+        w.extend_from_slice(&[
+            0x00050036, 0x00000001, 0x00000003, 0x00000000, 0x00000002,
+        ]);
+
+        // %4 = OpLabel
+        w.extend_from_slice(&[0x000200F8, 0x00000004]);
+
+        // OpReturn
+        w.push(0x000100FD);
+
+        // OpFunctionEnd
+        w.push(0x00010038);
+
+        w.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
     /// Hand-crafted minimal SPIR-V (no DXC required). Verifies the success
     /// path: correct workgroup size returned, and `None` for `gpu_consts_byte_size`
     /// since the shader declares no descriptor bindings.
@@ -493,6 +588,44 @@ mod tests {
             reflected.gpu_consts_byte_size,
             None,
             "gpu_consts_byte_size should be None: shader has no descriptor bindings",
+        );
+    }
+
+    /// Hand-crafted SPV with a uniform buffer at (set=0, binding=0)
+    /// containing 8 × u32 (32 bytes, matching `GpuConstsData`). Exercises
+    /// the full `reflect_spirv` success path — workgroup size *and*
+    /// `gpu_consts_byte_size` — without requiring DXC.
+    #[test]
+    fn reflect_spirv_reports_gpu_consts_byte_size_from_hand_crafted_spv() {
+        let spv = compute_spirv_with_uniform(64, 1, 1, 8);
+        let reflected = reflect_spirv(&spv, "main")
+            .expect("reflect_spirv should succeed on hand-crafted SPV with uniform buffer");
+
+        assert_eq!(
+            reflected.workgroup_size,
+            [64, 1, 1],
+            "workgroup size should match the LocalSize in the binary",
+        );
+        assert_eq!(
+            reflected.gpu_consts_byte_size,
+            Some(32),
+            "gpu_consts_byte_size should be Some(32) for 8 × u32 members",
+        );
+    }
+
+    /// Verify the byte-size calculation isn't hard-coded to 32: a 4-member
+    /// struct should reflect as 16 bytes.
+    #[test]
+    fn reflect_spirv_reports_correct_byte_size_for_different_member_count() {
+        let spv = compute_spirv_with_uniform(32, 1, 1, 4);
+        let reflected = reflect_spirv(&spv, "main")
+            .expect("reflect_spirv should succeed on 4-member uniform buffer");
+
+        assert_eq!(reflected.workgroup_size, [32, 1, 1]);
+        assert_eq!(
+            reflected.gpu_consts_byte_size,
+            Some(16),
+            "gpu_consts_byte_size should be Some(16) for 4 × u32 members",
         );
     }
 
