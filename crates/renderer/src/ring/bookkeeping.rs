@@ -37,14 +37,10 @@
 //!
 //! [`OverflowPolicy::TimeoutCrash { frames }`]: OverflowPolicy::TimeoutCrash
 
-// `RingBookkeeping` and its accessors have no non-test callers until
-// `UploadRing` (Increment 8) and `ReadbackChannel` (Increment 9) wrap
-// them. The #[cfg(test)] tests below exercise every item, but those
-// don't count toward dead-code analysis on the non-test build. Landing
-// the type ahead of its consumer matches the precedent set by Increment
-// 3 (`device`/`queue` fields carried the same allow until Increment 4
-// consumed them).
-#![allow(dead_code)]
+// Increment 8 (`UploadRing`) is now the first non-test consumer of
+// `RingBookkeeping`. The file-level `#![allow(dead_code)]` is removed;
+// individual inspection methods whose first non-test consumer lands in
+// a later increment carry per-method allows below.
 
 use crate::frame::FrameCount;
 
@@ -148,18 +144,22 @@ impl RingBookkeeping {
         self.current_slot
     }
 
+    #[allow(dead_code)] // First non-test caller: ReadbackChannel (Increment 9).
     pub(crate) fn last_observed_gpu_watermark(&self) -> CommandWatermark {
         self.last_observed_gpu_watermark
     }
 
+    #[allow(dead_code)] // First non-test caller: ReadbackChannel (Increment 9).
     pub(crate) fn slot_fill(&self, slot: u32) -> u32 {
         self.slot_fills[slot as usize]
     }
 
+    #[allow(dead_code)] // First non-test caller: ReadbackChannel (Increment 9).
     pub(crate) fn slot_watermark(&self, slot: u32) -> CommandWatermark {
         self.slot_watermarks[slot as usize]
     }
 
+    #[allow(dead_code)] // First non-test caller: validation harness (Increment 10).
     pub(crate) fn rotations_without_progress(&self) -> u32 {
         self.rotations_without_progress
     }
