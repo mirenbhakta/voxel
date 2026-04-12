@@ -1,5 +1,16 @@
 //! Resource handles and access types for the render graph.
 
+// --- BufferDesc ---
+
+/// Describes a transient buffer's requirements for pool allocation.
+#[derive(Clone, Copy, Debug)]
+pub struct BufferDesc {
+    /// Buffer size in bytes.
+    pub size  : u64,
+    /// Required wgpu usage flags.
+    pub usage : wgpu::BufferUsages,
+}
+
 // --- BufferHandle ---
 
 /// Opaque handle to a buffer resource in the render graph.

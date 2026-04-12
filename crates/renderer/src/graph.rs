@@ -14,10 +14,12 @@
 //! The graph is rebuilt from scratch each frame.
 
 mod compile;
+mod pool;
 mod resource;
 
 pub use compile::{Barrier, CompileError};
-pub use resource::{Access, BufferHandle};
+pub use pool::{BufferPool, PendingRelease};
+pub use resource::{Access, BufferDesc, BufferHandle};
 
 use crate::device::FrameEncoder;
 
@@ -70,9 +72,10 @@ struct PassData<T> {
 /// [`add_pass`](Self::add_pass), and [`mark_output`](Self::mark_output),
 /// then [`compile`](Self::compile) it into a [`CompiledGraph`].
 pub struct RenderGraph<T> {
-    passes    : Vec<PassData<T>>,
-    buf_count : u32,
-    outputs   : Vec<BufferHandle>,
+    passes          : Vec<PassData<T>>,
+    buf_count       : u32,
+    outputs         : Vec<BufferHandle>,
+    transient_descs : Vec<(BufferHandle, BufferDesc)>,
 }
 
 impl<T> Default for RenderGraph<T> {
@@ -85,9 +88,10 @@ impl<T> RenderGraph<T> {
     /// Create a new empty render graph.
     pub fn new() -> Self {
         Self {
-            passes    : Vec::new(),
-            buf_count : 0,
-            outputs   : Vec::new(),
+            passes          : Vec::new(),
+            buf_count       : 0,
+            outputs         : Vec::new(),
+            transient_descs : Vec::new(),
         }
     }
 
@@ -120,7 +124,7 @@ impl<T> RenderGraph<T> {
     ///
     /// ```ignore
     /// let output = graph.add_pass("compute", |pass| {
-    ///     let buf = pass.create_buffer();
+    ///     let buf = pass.create_buffer(BufferDesc { size: 1024, usage: wgpu::BufferUsages::STORAGE });
     ///     pass.read(input);
     ///     pass.execute(move |ctx, encoder, res| { /* ... */ });
     ///     buf
@@ -167,6 +171,17 @@ impl<T> RenderGraph<T> {
             self.buf_count as usize,
         )?;
 
+        // Determine which transient handles survive culling.
+        let live_creates: std::collections::HashSet<BufferHandle> =
+            result.execution_order.iter()
+                .flat_map(|&i| pass_creates[i].iter().copied())
+                .collect();
+
+        let transient_descs: Vec<(BufferHandle, BufferDesc)> =
+            self.transient_descs.into_iter()
+                .filter(|(h, _)| live_creates.contains(h))
+                .collect();
+
         // Reorder passes into execution order, dropping culled passes.
         let mut slots: Vec<Option<PassData<T>>> = self.passes
             .into_iter()
@@ -178,10 +193,11 @@ impl<T> RenderGraph<T> {
             .collect();
 
         Ok(CompiledGraph {
-            passes       : ordered,
-            barriers     : result.barriers,
-            culled_count : result.culled_count,
-            bindings     : vec![None; self.buf_count as usize],
+            passes          : ordered,
+            barriers        : result.barriers,
+            culled_count    : result.culled_count,
+            bindings        : vec![None; self.buf_count as usize],
+            transient_descs,
         })
     }
 }
@@ -210,9 +226,14 @@ impl<'g, T> PassBuilder<'g, T> {
     /// The pass is implicitly the first writer.  Returns a handle that
     /// other passes can reference via [`read`](Self::read) or
     /// [`write`](Self::write).
-    pub fn create_buffer(&mut self) -> BufferHandle {
+    ///
+    /// The [`BufferDesc`] specifies the size and usage flags for pool
+    /// allocation.  The actual GPU buffer is allocated later via
+    /// [`CompiledGraph::allocate_transients`].
+    pub fn create_buffer(&mut self, desc: BufferDesc) -> BufferHandle {
         let handle = self.graph.alloc_handle();
         self.graph.passes[self.pass_index].creates.push(handle);
+        self.graph.transient_descs.push((handle, desc));
         handle
     }
 
@@ -253,10 +274,11 @@ impl<'g, T> PassBuilder<'g, T> {
 /// Contains passes in execution order (dead passes already culled) and
 /// barrier metadata.  Obtain by calling [`RenderGraph::compile`].
 pub struct CompiledGraph<T> {
-    passes       : Vec<PassData<T>>,
-    barriers     : Vec<Barrier>,
-    culled_count : usize,
-    bindings     : Vec<Option<wgpu::Buffer>>,
+    passes          : Vec<PassData<T>>,
+    barriers        : Vec<Barrier>,
+    culled_count    : usize,
+    bindings        : Vec<Option<wgpu::Buffer>>,
+    transient_descs : Vec<(BufferHandle, BufferDesc)>,
 }
 
 impl<T> CompiledGraph<T> {
@@ -287,21 +309,52 @@ impl<T> CompiledGraph<T> {
         self.bindings[handle.0 as usize] = Some(buffer);
     }
 
+    /// Allocate transient buffers from the pool.
+    ///
+    /// Call after [`bind`](Self::bind)ing all imported handles and before
+    /// [`execute`](Self::execute).  Each transient buffer created during
+    /// the build phase (and not culled) is allocated from `pool`.
+    pub fn allocate_transients(
+        &mut self,
+        pool   : &mut BufferPool,
+        device : &wgpu::Device,
+    ) {
+        for &(handle, ref desc) in &self.transient_descs {
+            let buffer = pool.acquire(device, desc);
+            self.bindings[handle.0 as usize] = Some(buffer);
+        }
+    }
+
     /// Execute all passes in compiled order.
     ///
     /// Calls each pass's execute closure sequentially with the user
     /// context.  Only one `&mut T` borrow exists at a time.
     ///
     /// Each pass's closure receives a [`ResourceMap`] built from the
-    /// bindings established via [`bind`](Self::bind).
-    pub fn execute(self, ctx: &mut T, encoder: &mut FrameEncoder) {
-        let resources = ResourceMap { buffers: self.bindings };
+    /// bindings established via [`bind`](Self::bind) and
+    /// [`allocate_transients`](Self::allocate_transients).
+    ///
+    /// Returns a [`PendingRelease`] holding the transient buffers.
+    /// The caller must hold it until the GPU has completed the submit
+    /// containing this frame's commands, then call
+    /// [`PendingRelease::release`] to return the buffers to the pool.
+    pub fn execute(self, ctx: &mut T, encoder: &mut FrameEncoder) -> PendingRelease {
+        let Self { passes, transient_descs, bindings, .. } = self;
 
-        for pass in self.passes {
+        // Clone transient buffer arcs before ResourceMap takes ownership.
+        let transient_buffers: Vec<wgpu::Buffer> = transient_descs.iter()
+            .filter_map(|&(handle, _)| bindings[handle.0 as usize].clone())
+            .collect();
+
+        let resources = ResourceMap { buffers: bindings };
+
+        for pass in passes {
             if let Some(f) = pass.execute_fn {
                 f(ctx, encoder, &resources);
             }
         }
+
+        PendingRelease { buffers: transient_buffers }
     }
 }
 
@@ -310,6 +363,10 @@ impl<T> CompiledGraph<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn desc() -> BufferDesc {
+        BufferDesc { size: 256, usage: wgpu::BufferUsages::STORAGE }
+    }
 
     #[test]
     fn empty_graph_compiles() {
@@ -333,7 +390,7 @@ mod tests {
     fn single_live_pass() {
         let mut graph = RenderGraph::<()>::new();
 
-        let buf = graph.add_pass("A", |pass| pass.create_buffer());
+        let buf = graph.add_pass("A", |pass| pass.create_buffer(desc()));
         graph.mark_output(buf);
 
         let compiled = graph.compile().unwrap();
@@ -345,7 +402,7 @@ mod tests {
     fn single_dead_pass_is_culled() {
         let mut graph = RenderGraph::<()>::new();
         graph.add_pass("A", |pass| {
-            pass.create_buffer();
+            pass.create_buffer(desc());
         });
 
         let compiled = graph.compile().unwrap();
@@ -357,16 +414,16 @@ mod tests {
     fn linear_chain_preserves_order() {
         let mut graph = RenderGraph::<()>::new();
 
-        let a_out = graph.add_pass("A", |pass| pass.create_buffer());
+        let a_out = graph.add_pass("A", |pass| pass.create_buffer(desc()));
 
         let b_out = graph.add_pass("B", |pass| {
             pass.read(a_out);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         let c_out = graph.add_pass("C", |pass| {
             pass.read(b_out);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         graph.mark_output(c_out);
@@ -380,22 +437,22 @@ mod tests {
     fn diamond_dag_valid_order() {
         let mut graph = RenderGraph::<()>::new();
 
-        let a_out = graph.add_pass("A", |pass| pass.create_buffer());
+        let a_out = graph.add_pass("A", |pass| pass.create_buffer(desc()));
 
         let b_out = graph.add_pass("B", |pass| {
             pass.read(a_out);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         let c_out = graph.add_pass("C", |pass| {
             pass.read(a_out);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         let d_out = graph.add_pass("D", |pass| {
             pass.read(b_out);
             pass.read(c_out);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         graph.mark_output(d_out);
@@ -416,17 +473,17 @@ mod tests {
     fn dead_branch_is_culled() {
         let mut graph = RenderGraph::<()>::new();
 
-        let shared = graph.add_pass("root", |pass| pass.create_buffer());
+        let shared = graph.add_pass("root", |pass| pass.create_buffer(desc()));
 
         let live_out = graph.add_pass("live_branch", |pass| {
             pass.read(shared);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         // Dead: reads shared but output is never consumed.
         graph.add_pass("dead_branch", |pass| {
             pass.read(shared);
-            pass.create_buffer();
+            pass.create_buffer(desc());
         });
 
         graph.mark_output(live_out);
@@ -440,11 +497,11 @@ mod tests {
     fn no_outputs_culls_all_passes() {
         let mut graph = RenderGraph::<()>::new();
 
-        let a_out = graph.add_pass("A", |pass| pass.create_buffer());
+        let a_out = graph.add_pass("A", |pass| pass.create_buffer(desc()));
 
         graph.add_pass("B", |pass| {
             pass.read(a_out);
-            pass.create_buffer();
+            pass.create_buffer(desc());
         });
 
         let compiled = graph.compile().unwrap();
@@ -458,7 +515,7 @@ mod tests {
         let imported = graph.import_buffer();
 
         graph.add_pass("unrelated", |pass| {
-            pass.create_buffer();
+            pass.create_buffer(desc());
         });
 
         // Nobody writes imported, so no live pass is seeded.
@@ -474,8 +531,8 @@ mod tests {
         let mut graph = RenderGraph::<()>::new();
 
         let (live, _dead) = graph.add_pass("multi_output", |pass| {
-            let a = pass.create_buffer();
-            let b = pass.create_buffer();
+            let a = pass.create_buffer(desc());
+            let b = pass.create_buffer(desc());
             (a, b)
         });
 
@@ -492,11 +549,11 @@ mod tests {
     fn write_then_read_produces_barrier() {
         let mut graph = RenderGraph::<()>::new();
 
-        let buf = graph.add_pass("writer", |pass| pass.create_buffer());
+        let buf = graph.add_pass("writer", |pass| pass.create_buffer(desc()));
 
         let out = graph.add_pass("reader", |pass| {
             pass.read(buf);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         graph.mark_output(out);
@@ -523,12 +580,12 @@ mod tests {
 
         let out_a = graph.add_pass("reader_a", |pass| {
             pass.read(imported);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         let out_b = graph.add_pass("reader_b", |pass| {
             pass.read(imported);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         graph.mark_output(out_a);
@@ -554,7 +611,7 @@ mod tests {
 
         let out = graph.add_pass("writer_b", |pass| {
             pass.write(imported);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         graph.mark_output(out);
@@ -584,7 +641,7 @@ mod tests {
 
         let out = graph.add_pass("consume", |pass| {
             pass.read(imported);
-            pass.create_buffer()
+            pass.create_buffer(desc())
         });
 
         graph.mark_output(out);
@@ -631,7 +688,7 @@ mod tests {
 
         let out = graph.add_pass("resolve_test", |pass| {
             pass.read(h);
-            let out = pass.create_buffer();
+            let out = pass.create_buffer(desc());
             pass.execute(move |_ctx, _enc, resources| {
                 assert_eq!(
                     resources.buffer(h), &expected,
@@ -647,9 +704,170 @@ mod tests {
         compiled.bind(h, gpu_buf);
 
         let mut encoder = ctx.begin_frame();
-        compiled.execute(&mut (), &mut encoder);
+        let _pending = compiled.execute(&mut (), &mut encoder);
         ctx.end_frame(encoder);
 
         assert!(ran.load(Ordering::SeqCst), "execute closure must have run");
+    }
+
+    // -- Transient / pool tests --
+
+    #[test]
+    fn culled_pass_transient_not_in_compiled() {
+        let mut graph = RenderGraph::<()>::new();
+
+        let live = graph.add_pass("live", |pass| {
+            pass.create_buffer(BufferDesc {
+                size: 512,
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        });
+
+        // Dead pass — its transient should be filtered out.
+        graph.add_pass("dead", |pass| {
+            pass.create_buffer(BufferDesc {
+                size: 1024,
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        });
+
+        graph.mark_output(live);
+
+        let compiled = graph.compile().unwrap();
+        assert_eq!(compiled.pass_names(), ["live"]);
+        assert_eq!(compiled.transient_descs.len(), 1);
+        assert_eq!(compiled.transient_descs[0].1.size, 512);
+    }
+
+    #[test]
+    fn no_transients_yields_empty_descs() {
+        let mut graph = RenderGraph::<()>::new();
+        let imported = graph.import_buffer();
+
+        graph.add_pass("writer", |pass| {
+            pass.write(imported);
+        });
+
+        graph.mark_output(imported);
+
+        let compiled = graph.compile().unwrap();
+        assert!(compiled.transient_descs.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
+    fn pool_acquire_creates_and_release_recycles() {
+        use crate::device::RendererContext;
+        use crate::frame::FrameCount;
+
+        let ctx = pollster::block_on(RendererContext::new_headless(
+            FrameCount::new(2).unwrap(),
+        ))
+        .expect("headless GPU context");
+
+        let mut pool = BufferPool::new();
+        let d = BufferDesc { size: 128, usage: wgpu::BufferUsages::STORAGE };
+
+        // First acquire creates a fresh buffer.
+        let buf = pool.acquire(ctx.device(), &d);
+        assert_eq!(buf.size(), 128);
+
+        // Release and re-acquire: same buffer returned (Arc identity).
+        let reference = buf.clone();
+        pool.release(buf);
+        let buf2 = pool.acquire(ctx.device(), &d);
+        assert_eq!(buf2, reference);
+    }
+
+    #[test]
+    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
+    fn pool_different_desc_not_shared() {
+        use crate::device::RendererContext;
+        use crate::frame::FrameCount;
+
+        let ctx = pollster::block_on(RendererContext::new_headless(
+            FrameCount::new(2).unwrap(),
+        ))
+        .expect("headless GPU context");
+
+        let mut pool = BufferPool::new();
+        let d_small = BufferDesc { size: 64, usage: wgpu::BufferUsages::STORAGE };
+        let d_large = BufferDesc { size: 256, usage: wgpu::BufferUsages::STORAGE };
+
+        let buf_small = pool.acquire(ctx.device(), &d_small);
+        let ref_small = buf_small.clone();
+        pool.release(buf_small);
+
+        // Different size — should get a new buffer, not the recycled one.
+        let buf_large = pool.acquire(ctx.device(), &d_large);
+        assert_ne!(buf_large, ref_small);
+        assert_eq!(buf_large.size(), 256);
+    }
+
+    #[test]
+    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
+    fn allocate_transients_and_pending_release() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::device::RendererContext;
+        use crate::frame::FrameCount;
+
+        let mut ctx = pollster::block_on(RendererContext::new_headless(
+            FrameCount::new(2).unwrap(),
+        ))
+        .expect("headless GPU context");
+
+        let mut pool = BufferPool::new();
+
+        let mut graph = RenderGraph::<()>::new();
+        let imported = graph.import_buffer();
+
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran_clone = ran.clone();
+
+        let out = graph.add_pass("compute", |pass| {
+            let transient = pass.create_buffer(BufferDesc {
+                size: 1024,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+            pass.read(imported);
+            pass.execute(move |_ctx, _enc, resources| {
+                // Both handles should resolve.
+                let _imp = resources.buffer(imported);
+                let t = resources.buffer(transient);
+                assert_eq!(t.size(), 1024);
+                ran_clone.store(true, Ordering::SeqCst);
+            });
+            transient
+        });
+        graph.mark_output(out);
+
+        let mut compiled = graph.compile().unwrap();
+
+        // Bind imported buffer.
+        let gpu_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test_imported"),
+            size: 64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        compiled.bind(imported, gpu_buf);
+
+        // Allocate transients from the pool.
+        compiled.allocate_transients(&mut pool, ctx.device());
+
+        let mut encoder = ctx.begin_frame();
+        let pending = compiled.execute(&mut (), &mut encoder);
+        ctx.end_frame(encoder);
+
+        assert!(ran.load(Ordering::SeqCst), "pass closure must have run");
+        assert_eq!(pending.len(), 1);
+
+        // Release back to pool — pool should now have a recyclable buffer.
+        pending.release(&mut pool);
+        let recycled = pool.acquire(ctx.device(), &BufferDesc {
+            size: 1024,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        assert_eq!(recycled.size(), 1024);
     }
 }
