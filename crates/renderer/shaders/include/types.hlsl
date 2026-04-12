@@ -1,13 +1,12 @@
 // types.hlsl — single source of truth for GPU-visible shared type layouts.
 //
-// Principle 4 (`docs/renderer_rewrite_principles.md`): every shared struct
-// is defined once here and accessed through namespaced helpers that
-// operate on `RWByteAddressBuffer`. Call sites never compute raw offsets;
-// every `buf.Store(offset + N * 4, value)` lives inside this file.
+// Principle 4: every shared struct is defined once here and accessed through
+// namespaced helpers that operate on `RWByteAddressBuffer`. Call sites never
+// compute raw offsets; every `buf.Store(offset + N * 4, value)` lives inside
+// this file.
 //
-// The first rewrite pass intentionally ships exactly two shared types:
-// `UploadMsg` and `WatermarkSnapshot`. More land when real subsystems do.
-// See `.local/renderer_plan.md` §6.
+// Shared types are added here when real subsystems land. Currently:
+// `UploadMsg` and `WatermarkSnapshot`.
 
 #ifndef RENDERER_TYPES_HLSL
 #define RENDERER_TYPES_HLSL

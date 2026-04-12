@@ -2,8 +2,7 @@
 //!
 //! Principle 3: the `wgpu::Device` and `wgpu::Queue` are owned here and
 //! nowhere else. Every other module that needs GPU handles receives them
-//! through ring or pipeline primitives that themselves go through this type.
-//! See `.local/renderer_plan.md` §3.2.
+//! through render primitives that themselves go through this type.
 
 use crate::error::RendererError;
 use crate::frame::{FrameCount, FrameIndex};
@@ -34,11 +33,10 @@ impl RendererContext {
     ///
     /// Requires `Features::PASSTHROUGH_SHADERS` — the renderer compiles
     /// HLSL to SPIR-V via DXC at build time and hands the bytes straight
-    /// to `create_shader_module_passthrough`, bypassing naga. See
-    /// `.local/renderer_plan.md` §8.1 and Agentic Memory
-    /// `decision-scaffold-rewrite-principles` for the rationale — naga
-    /// can't round-trip `DrawIndex`, which real subsystems will need, so
-    /// the pass uses the same toolchain the old scaffold proved. A machine
+    /// to `create_shader_module_passthrough`, bypassing naga — naga can't
+    /// round-trip `DrawIndex`, which real subsystems will need, so the
+    /// renderer uses the same HLSL/DXC toolchain the old scaffold proved
+    /// out. A machine
     /// whose Vulkan driver doesn't expose `PASSTHROUGH_SHADERS` will fail
     /// device creation here, which is what the ignored GPU tests also
     /// observe; the software fallback (lavapipe/swiftshader) is explicitly
@@ -122,9 +120,9 @@ impl RendererContext {
     /// `CommandBuffer`, submits that buffer to the queue, and advances
     /// `frame_index` by one.
     ///
-    /// Polling wgpu for readback map callbacks (§3.2 of the plan) is
-    /// deliberately not done here yet — it lands with `ReadbackChannel` in
-    /// Increment 9 when there is something mapped to poll for.
+    /// Polling wgpu for readback map callbacks is not done here yet — it
+    /// lands alongside readback buffer support when there is something
+    /// mapped to poll for.
     pub fn end_frame(&mut self, frame_encoder: FrameEncoder) {
         let command_buffer = frame_encoder.encoder.finish();
         self.queue.submit(std::iter::once(command_buffer));
@@ -133,8 +131,8 @@ impl RendererContext {
 
     /// The wgpu device handle. Only visible within the renderer crate —
     /// external callers interact with the device exclusively through
-    /// primitives (`GpuConsts`, `BindingLayout`, rings, pipelines) per
-    /// principle 3 in `docs/renderer_rewrite_principles.md`.
+    /// primitives (`GpuConsts`, `BindingLayout`, pipelines) per principle 3
+    /// (wgpu is contained behind render abstractions).
     pub(crate) fn device(&self) -> &wgpu::Device {
         &self.device
     }
@@ -159,10 +157,6 @@ impl RendererContext {
 /// `FrameEncoder` is deliberately not `Clone` or `Copy`. Together with the
 /// by-value consume in `end_frame`, this makes "forgot to submit" and
 /// "submitted twice" into compile errors.
-///
-/// Rationale and the longer-range plan: `.local/renderer_plan.md` §14.4
-/// under "Render graph and resource manager", and Agentic Memory entry
-/// `decision-render-graph-deferral`.
 pub struct FrameEncoder {
     encoder: wgpu::CommandEncoder,
     frame: FrameIndex,

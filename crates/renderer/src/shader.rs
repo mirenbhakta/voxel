@@ -7,15 +7,15 @@
 //! constants and hands them to [`load_shader`] which wraps
 //! `wgpu::Device::create_shader_module_passthrough`.
 //!
-//! The decision to stay on DXC (rather than write WGSL for the first pass)
-//! is argued in `.local/renderer_plan.md` §8.1: later subsystems will need
-//! `DrawIndex`, which naga can't round-trip, so switching later would cost
-//! two build-system transitions and force `types.hlsl` to be written twice.
+//! The toolchain is HLSL → DXC rather than WGSL because later subsystems
+//! need `DrawIndex`, which naga can't round-trip — switching toolchains later
+//! would cost two build-system transitions and force `types.hlsl` to be
+//! written twice.
 //!
-//! See `docs/renderer_rewrite_principles.md` principle 3 for the containment
-//! rule — `wgpu::ShaderModule` does not leak through this module's public
-//! API; higher layers consume [`load_shader`] and receive an opaque module
-//! they pass into `ComputePipeline` (Increment 6).
+//! `wgpu::ShaderModule` does not leak through this module's public API
+//! (principle 3: wgpu is contained behind render abstractions). Higher layers
+//! consume [`load_shader`] and receive an opaque module they pass into
+//! [`ComputePipeline`].
 
 use std::borrow::Cow;
 
@@ -95,8 +95,9 @@ mod tests {
     use crate::frame::FrameCount;
 
     /// Build-time promise: `validation.cs.hlsl` compiled to a non-empty blob
-    /// beginning with the SPIR-V magic number. This is the "DXC silently
-    /// produced nothing" guard from `.local/renderer_plan.md` §8.3.
+    /// beginning with the SPIR-V magic number. Guard against DXC silently
+    /// producing nothing — when DXC exits zero but writes no output, the
+    /// placeholder blob is not a valid shader module.
     ///
     /// Accepts either byte order — SPIR-V is defined in host endianness,
     /// but the build-time placeholder writes native-endian bytes and real

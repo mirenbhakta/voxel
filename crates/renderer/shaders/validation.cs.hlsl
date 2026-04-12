@@ -10,7 +10,6 @@
 // compute workload and is the value that the Increment 6 SPIR-V reflection
 // test asserts against (reflect_spirv_reports_workgroup_size_for_validation_cs).
 //
-// Plan reference: `.local/renderer_plan.md` §8.3, §9.5.
 
 #include "include/types.hlsl"
 

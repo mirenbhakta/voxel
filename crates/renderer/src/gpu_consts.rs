@@ -2,8 +2,7 @@
 //!
 //! [`GpuConstsData`] is the single source of truth for constants read by every
 //! shader in the renderer. It is bound at slot 0 of every [`BindingLayout`]
-//! via forced injection — see principle 5 in
-//! `docs/renderer_rewrite_principles.md` and `.local/renderer_plan.md` §5.
+//! via forced injection (principle 5: constants flow from one source).
 //!
 //! [`BindingLayout`]: crate::pipeline::binding::BindingLayout
 

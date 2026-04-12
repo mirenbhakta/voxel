@@ -20,10 +20,8 @@
 //! without the Vulkan SDK. It is *not* a loadable shader module; anyone who
 //! tries to pass the placeholder through `create_shader_module_passthrough`
 //! at runtime will fail loudly, which is the intended behaviour for CI.
-//! Increment 10's validation binary adds a higher-level refusal that
+//! The game crate's validation feature adds a higher-level check that
 //! pattern-matches this sentinel and prints an actionable message.
-//!
-//! Plan reference: `.local/renderer_plan.md` §8.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};

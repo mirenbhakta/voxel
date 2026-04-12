@@ -9,8 +9,7 @@
 //! The implementation uses `rspirv`'s data-representation layer (`rspirv::dr`)
 //! and scans the module's `entry_points`, `execution_modes`, `annotations`,
 //! and `types_global_values` collections — no full instruction stream walk is
-//! needed. See `.local/renderer_plan.md` §7 for the reflection strategy and
-//! §7.1 for the workgroup-size assertion policy.
+//! needed.
 //!
 //! [`GpuConstsData`]: crate::gpu_consts::GpuConstsData
 
@@ -51,9 +50,7 @@ pub struct Reflected {
 /// `LocalSizeId` (spec-constant workgroup sizes), this function returns an
 /// error advising the caller to switch to literal `numthreads`. The DXC
 /// toolchain emits `LocalSize` for literal `[numthreads(...)]`, so this
-/// restriction is transparent for all shaders in the first rewrite pass.
-///
-/// See `.local/renderer_plan.md` §7.
+/// restriction is transparent for all shaders in the renderer.
 pub fn reflect_spirv(spv: &[u8], entry_point: &str)
     -> Result<Reflected, RendererError>
 {

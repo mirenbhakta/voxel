@@ -5,7 +5,7 @@
 //! [`ComputePipeline::new`]), before any wgpu call, so a CPU-side mismatch
 //! panics deterministically without touching the GPU:
 //!
-//! 1. **Workgroup-size assertion** (`.local/renderer_plan.md` §7.1): if
+//! 1. **Workgroup-size assertion**: if
 //!    `ComputePipelineDescriptor::expected_workgroup_size` is `Some(expected)`,
 //!    the value is compared against the `LocalSize` execution mode reflected
 //!    from the SPIR-V binary. A mismatch is a `panic!` with a message pointing
@@ -17,10 +17,10 @@
 //!    occupies), its byte size is asserted equal to `size_of::<GpuConstsData>()`.
 //!    A mismatch indicates a Rust/HLSL layout disagreement.
 //!
-//! Both assertions fire at construction, not at dispatch, because "fires at
-//! load" is explicitly called out in the design (principle 5 / §7.1). If
-//! invariants were checked at dispatch the first failure would be invisible in
-//! tests that never actually dispatch.
+//! Both assertions fire at construction, not at dispatch — catching
+//! CPU/shader mismatches at load means they surface immediately on startup
+//! rather than on the first dispatch. If checked at dispatch, tests that
+//! construct but never use a pipeline would silently pass.
 //!
 //! ## wgpu::BindGroup leakage
 //!
@@ -56,8 +56,7 @@ use crate::shader::{ShaderSource, load_shader};
 
 /// Construction parameters for a [`ComputePipeline`].
 ///
-/// See module-level documentation for `push_constant_bytes` deferral and
-/// the `wgpu::BindGroup` leakage rationale. `.local/renderer_plan.md` §4.2.
+/// See module-level documentation for the `wgpu::BindGroup` leakage rationale.
 pub struct ComputePipelineDescriptor<'a> {
     /// Debug label forwarded to wgpu pipeline + pipeline layout.
     pub label: &'a str,
@@ -72,8 +71,6 @@ pub struct ComputePipelineDescriptor<'a> {
     /// a `panic!` at construction if it does not, with a message pointing at
     /// both values. Pass `None` to skip the assertion (not recommended — it
     /// exists precisely to catch `[numthreads]` / dispatch-size drift).
-    ///
-    /// See `.local/renderer_plan.md` §7.1 for the policy.
     pub expected_workgroup_size: Option<[u32; 3]>,
 }
 
@@ -86,7 +83,7 @@ pub struct ComputePipelineDescriptor<'a> {
 /// and GpuConsts-size assertions fire during [`Self::new`], before any wgpu
 /// call, so mismatches are caught at pipeline load rather than at dispatch.
 ///
-/// See `.local/renderer_plan.md` §4.2 and module-level documentation.
+/// See module-level documentation.
 pub struct ComputePipeline {
     pipeline: wgpu::ComputePipeline,
     layout: Arc<BindingLayout>,

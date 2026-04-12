@@ -3,7 +3,7 @@
 //!
 //! Principle 1: the frame count is a runtime value, not a const generic. It
 //! comes from surface configuration in windowed mode and is passed explicitly
-//! in headless mode. See `.local/renderer_plan.md` §3.1.
+//! in headless mode.
 
 use crate::error::RendererError;
 

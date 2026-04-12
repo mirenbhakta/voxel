@@ -7,9 +7,9 @@
 // explicit `[[vk::binding(0, 0)]]`.
 //
 // The field order, types, and count MUST match `GpuConstsData` in Rust.
-// The Rust side const-asserts `size_of::<GpuConstsData>() == 32`; a
-// SPIR-V reflection check landing in Increment 6 will assert this struct
-// reflects to the same byte size. See `.local/renderer_plan.md` §5.
+// The Rust side const-asserts `size_of::<GpuConstsData>() == 32`; the
+// SPIR-V reflection check in `ComputePipeline::new` asserts this struct
+// reflects to the same byte size.
 
 #ifndef RENDERER_GPU_CONSTS_HLSL
 #define RENDERER_GPU_CONSTS_HLSL

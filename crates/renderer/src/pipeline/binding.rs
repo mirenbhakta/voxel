@@ -5,8 +5,8 @@
 //! the caller targets the reserved slot, and [`BindingLayoutBuilder::build`]
 //! unconditionally inserts the `GpuConstsData` entry at
 //! [`BindingLayout::GPU_CONSTS_SLOT`] regardless of what the caller added.
-//! This is the "forced injection" form of enforcement referenced in
-//! `.local/renderer_plan.md` §4.1 and §5.2.
+//! This is the "forced injection" form of enforcement for principle 5
+//! (shared constants flow from one source — `GpuConstsData` is always at slot 0).
 //!
 //! A caller cannot forget to bind `GpuConstsData` at slot 0, and a shader
 //! that `#include`s `shaders/include/types.hlsl` (which forces `g_consts` to
@@ -34,14 +34,12 @@ pub struct BindEntry {
     /// Shader stages that may access the binding. `wgpu::ShaderStages` is the
     /// one wgpu type that deliberately leaks through the primitives layer —
     /// the stage names are a closed set and a wrapper would add zero safety.
-    /// Documented in `.local/renderer_plan.md` §4.1.
     pub visibility: wgpu::ShaderStages,
 }
 
 /// Kind of buffer resource exposed by a [`BindEntry`].
 ///
-/// Textures and samplers are deferred until a primitive genuinely needs them
-/// — see `.local/renderer_plan.md` §4.1.
+/// Textures and samplers are deferred until a primitive genuinely needs them.
 #[derive(Clone, Copy, Debug)]
 pub enum BindKind {
     /// A uniform buffer of the given size in bytes. Maps to wgpu's
@@ -129,7 +127,7 @@ impl BindingLayoutBuilder {
     /// validation; catching it here keeps the error local to the caller's bug.
     ///
     /// All three checks belong at the "assert on programmer error" tier of the
-    /// invariant hierarchy in `docs/renderer_rewrite_principles.md`.
+    /// invariant hierarchy (validate at the boundary; trust callers past it).
     pub fn add_entry(mut self, entry: BindEntry) -> Self {
         assert!(
             entry.binding != BindingLayout::GPU_CONSTS_SLOT,

@@ -1,8 +1,4 @@
 //! Renderer crate — primitives layer.
-//!
-//! See `docs/renderer_rewrite_principles.md` for the design principles this
-//! crate enforces, and `.local/renderer_plan.md` for the implementation plan
-//! of the first rewrite pass.
 
 pub mod buffer;
 pub mod error;

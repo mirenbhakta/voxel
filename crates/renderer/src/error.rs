@@ -4,8 +4,7 @@ use thiserror::Error;
 
 /// Top-level error type returned by renderer APIs.
 ///
-/// Variants are added as each increment of the first rewrite pass introduces
-/// new failure modes. See `.local/renderer_plan.md` §12.
+/// Variants are added as new failure modes appear in the renderer crate.
 #[derive(Debug, Error)]
 pub enum RendererError {
     /// [`FrameCount::new`](crate::frame::FrameCount::new) was called with a
@@ -36,7 +35,7 @@ pub enum RendererError {
     /// name, or a missing `LocalSize` execution mode that is required for
     /// workgroup-size reflection. These are build-time programming errors (bad
     /// shader, wrong entry-point name, unsupported execution-mode form) rather
-    /// than recoverable runtime conditions; see `.local/renderer_plan.md` §7.
+    /// than recoverable runtime conditions.
     ///
     /// `LocalSizeId` (spec-constant workgroup sizes) produces this variant
     /// with a message advising use of literal `numthreads` instead — not yet
