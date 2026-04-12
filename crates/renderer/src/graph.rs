@@ -28,12 +28,27 @@ use crate::device::FrameEncoder;
 /// Maps render-graph [`BufferHandle`]s to their backing wgpu resources.
 /// Passed to each pass's execute closure so it can look up actual GPU
 /// buffers by handle rather than capturing raw wgpu types.
-///
-/// Resource resolution (transient pool allocation, imported buffer binding)
-/// is not yet implemented — this is a placeholder for the execute-phase
-/// type signature.
 pub struct ResourceMap {
-    _private: (),
+    buffers: Vec<Option<wgpu::Buffer>>,
+}
+
+impl ResourceMap {
+    /// Look up the backing GPU buffer for a render graph handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle was not bound via [`CompiledGraph::bind`].
+    /// This is a programmer error (invariant: bind all imported handles
+    /// before execute).
+    pub fn buffer(&self, handle: BufferHandle) -> &wgpu::Buffer {
+        self.buffers[handle.0 as usize]
+            .as_ref()
+            .unwrap_or_else(|| panic!(
+                "buffer handle {} not bound — \
+                 call CompiledGraph::bind() before execute",
+                handle.0,
+            ))
+    }
 }
 
 // --- PassData ---
@@ -166,6 +181,7 @@ impl<T> RenderGraph<T> {
             passes       : ordered,
             barriers     : result.barriers,
             culled_count : result.culled_count,
+            bindings     : vec![None; self.buf_count as usize],
         })
     }
 }
@@ -240,6 +256,7 @@ pub struct CompiledGraph<T> {
     passes       : Vec<PassData<T>>,
     barriers     : Vec<Barrier>,
     culled_count : usize,
+    bindings     : Vec<Option<wgpu::Buffer>>,
 }
 
 impl<T> CompiledGraph<T> {
@@ -258,16 +275,27 @@ impl<T> CompiledGraph<T> {
         self.culled_count
     }
 
+    /// Bind an imported buffer handle to its backing GPU buffer.
+    ///
+    /// Call once per imported handle that any live pass references,
+    /// before calling [`execute`](Self::execute).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle index is out of range (programmer error).
+    pub fn bind(&mut self, handle: BufferHandle, buffer: wgpu::Buffer) {
+        self.bindings[handle.0 as usize] = Some(buffer);
+    }
+
     /// Execute all passes in compiled order.
     ///
     /// Calls each pass's execute closure sequentially with the user
     /// context.  Only one `&mut T` borrow exists at a time.
     ///
-    /// Resource resolution (pool allocation, imported buffer binding) is
-    /// not yet implemented — closures receive a placeholder
-    /// [`ResourceMap`].
+    /// Each pass's closure receives a [`ResourceMap`] built from the
+    /// bindings established via [`bind`](Self::bind).
     pub fn execute(self, ctx: &mut T, encoder: &mut FrameEncoder) {
-        let resources = ResourceMap { _private: () };
+        let resources = ResourceMap { buffers: self.bindings };
 
         for pass in self.passes {
             if let Some(f) = pass.execute_fn {
@@ -571,5 +599,57 @@ mod tests {
         assert_eq!(buf_barriers.len(), 1);
         assert_eq!(buf_barriers[0].src, Access::Write);
         assert_eq!(buf_barriers[0].dst, Access::Read);
+    }
+
+    // -- GPU test (requires Vulkan) --
+
+    #[test]
+    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
+    fn execute_resolves_bound_buffer() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::device::RendererContext;
+        use crate::frame::FrameCount;
+
+        let mut ctx = pollster::block_on(RendererContext::new_headless(
+            FrameCount::new(2).unwrap(),
+        ))
+        .expect("headless GPU context should construct on a vulkan-capable machine");
+
+        let gpu_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test_bind_resolve"),
+            size: 64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let mut graph = RenderGraph::<()>::new();
+        let h = graph.import_buffer();
+
+        let expected = gpu_buf.clone();
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let ran_clone = ran.clone();
+
+        let out = graph.add_pass("resolve_test", |pass| {
+            pass.read(h);
+            let out = pass.create_buffer();
+            pass.execute(move |_ctx, _enc, resources| {
+                assert_eq!(
+                    resources.buffer(h), &expected,
+                    "resolved buffer should be the bound GPU buffer",
+                );
+                ran_clone.store(true, Ordering::SeqCst);
+            });
+            out
+        });
+        graph.mark_output(out);
+
+        let mut compiled = graph.compile().unwrap();
+        compiled.bind(h, gpu_buf);
+
+        let mut encoder = ctx.begin_frame();
+        compiled.execute(&mut (), &mut encoder);
+        ctx.end_frame(encoder);
+
+        assert!(ran.load(Ordering::SeqCst), "execute closure must have run");
     }
 }
