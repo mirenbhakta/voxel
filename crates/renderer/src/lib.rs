@@ -7,6 +7,7 @@
 pub mod error;
 pub mod frame;
 pub mod gpu_consts;
+pub mod graph;
 pub mod pipeline;
 pub mod ring;
 pub mod shader;
