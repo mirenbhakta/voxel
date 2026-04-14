@@ -7,6 +7,18 @@
 use crate::error::RendererError;
 use crate::frame::{FrameCount, FrameIndex};
 
+// --- WindowedState ---
+
+/// Surface state owned by a windowed [`RendererContext`].  Absent for
+/// headless contexts.
+struct WindowedState {
+    surface         : wgpu::Surface<'static>,
+    preferred_format: wgpu::TextureFormat,
+    preferred_alpha : wgpu::CompositeAlphaMode,
+    /// `None` until the first [`RendererContext::configure_surface`] call.
+    config          : Option<wgpu::SurfaceConfiguration>,
+}
+
 /// Owns the wgpu device and queue plus the renderer's frame counters. The
 /// single place any other module in this crate receives GPU handles from.
 ///
@@ -18,10 +30,11 @@ use crate::frame::{FrameCount, FrameIndex};
 /// constructor still lands in a later increment once a windowed caller
 /// first needs it.
 pub struct RendererContext {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device     : wgpu::Device,
+    queue      : wgpu::Queue,
     frame_count: FrameCount,
     frame_index: FrameIndex,
+    windowed   : Option<WindowedState>,
 }
 
 impl RendererContext {
@@ -69,6 +82,7 @@ impl RendererContext {
             queue,
             frame_count,
             frame_index: FrameIndex::default(),
+            windowed: None,
         })
     }
 
@@ -129,6 +143,144 @@ impl RendererContext {
         self.frame_index.advance();
     }
 
+    /// Construct a windowed GPU context wired to a live swapchain surface.
+    ///
+    /// The caller is responsible for creating the `wgpu::Instance` and
+    /// `wgpu::Surface` from the OS window (both require the windowing library
+    /// that the game crate owns).  This constructor takes ownership of both
+    /// and drives the rest of device / surface initialisation.
+    ///
+    /// The surface is **not** configured here — the window size may not be
+    /// known at construction time.  Call [`Self::configure_surface`] with the
+    /// initial window size before the first [`Self::acquire_frame`].
+    pub async fn new_windowed(
+        instance   : wgpu::Instance,
+        surface    : wgpu::Surface<'static>,
+        frame_count: FrameCount,
+    ) -> Result<Self, RendererError> {
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            })
+            .await
+            .map_err(|_| RendererError::NoCompatibleAdapter)?;
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label            : Some("renderer_windowed_device"),
+                required_features: wgpu::Features::PASSTHROUGH_SHADERS,
+                required_limits  : wgpu::Limits::default(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| RendererError::DeviceCreationFailed(e.to_string()))?;
+
+        let caps = surface.get_capabilities(&adapter);
+
+        // Prefer an sRGB format so colours look correct without manual
+        // gamma correction in shaders.
+        let preferred_format = caps.formats.iter()
+            .find(|&&f| f.is_srgb())
+            .copied()
+            .unwrap_or(caps.formats[0]);
+
+        let preferred_alpha = caps.alpha_modes[0];
+
+        Ok(Self {
+            device,
+            queue,
+            frame_count,
+            frame_index: FrameIndex::default(),
+            windowed: Some(WindowedState {
+                surface,
+                preferred_format,
+                preferred_alpha,
+                config: None,
+            }),
+        })
+    }
+
+    /// Configure (or reconfigure) the swapchain surface.
+    ///
+    /// Must be called before the first [`Self::acquire_frame`], and again
+    /// whenever the window is resized.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a headless context, or if `width` or `height`
+    /// is zero (wgpu rejects zero-sized surfaces).
+    pub fn configure_surface(&mut self, width: u32, height: u32) {
+        assert!(width  > 0, "configure_surface: width must be > 0");
+        assert!(height > 0, "configure_surface: height must be > 0");
+
+        let ws = self.windowed.as_mut()
+            .expect("configure_surface called on a headless RendererContext");
+
+        let config = wgpu::SurfaceConfiguration {
+            usage                        : wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format                       : ws.preferred_format,
+            width,
+            height,
+            present_mode                 : wgpu::PresentMode::Fifo,
+            desired_maximum_frame_latency: 2,
+            alpha_mode                   : ws.preferred_alpha,
+            view_formats                 : vec![],
+        };
+
+        ws.surface.configure(&self.device, &config);
+        ws.config = Some(config);
+    }
+
+    /// Acquire the next swapchain image for this frame.
+    ///
+    /// Returns a [`SurfaceFrame`] that must be presented via
+    /// [`SurfaceFrame::present`] after the frame's command buffer is
+    /// submitted.
+    ///
+    /// If the surface is outdated or lost (e.g. after a resize race),
+    /// the surface is reconfigured with the last known size and
+    /// [`RendererError::SurfaceOutdated`] is returned — the caller should
+    /// skip the frame and retry on the next redraw.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a headless context, or if [`configure_surface`]
+    /// has not been called yet.
+    ///
+    /// [`configure_surface`]: Self::configure_surface
+    pub fn acquire_frame(&mut self) -> Result<SurfaceFrame, RendererError> {
+        let ws = self.windowed.as_mut()
+            .expect("acquire_frame called on a headless RendererContext");
+        let config = ws.config.as_ref()
+            .expect("acquire_frame called before configure_surface");
+
+        match ws.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
+                let view = texture.texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
+                Ok(SurfaceFrame { view, texture })
+            }
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                // Reconfigure with last known dimensions and ask the caller to skip
+                // this frame; the next acquire should succeed.
+                ws.surface.configure(&self.device, config);
+                Err(RendererError::SurfaceOutdated)
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                // Surface temporarily unavailable (e.g. minimised); skip without
+                // reconfiguring.
+                Err(RendererError::SurfaceOutdated)
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                Err(RendererError::SurfaceAcquireFailed(
+                    "GPU validation error during surface acquire".into(),
+                ))
+            }
+        }
+    }
+
     /// The wgpu device handle. Only visible within the renderer crate —
     /// external callers interact with the device exclusively through
     /// primitives (`GpuConsts`, `BindingLayout`, pipelines) per principle 3
@@ -140,6 +292,44 @@ impl RendererContext {
     /// The wgpu queue handle. Same visibility rationale as [`Self::device`].
     pub(crate) fn queue(&self) -> &wgpu::Queue {
         &self.queue
+    }
+}
+
+// --- SurfaceFrame ---
+
+/// An acquired swapchain image for the current frame.
+///
+/// Obtained from [`RendererContext::acquire_frame`].  Pass a shared
+/// reference to [`FrameEncoder::clear_surface`] (or future render-pass
+/// helpers) to record commands targeting the swapchain image, then call
+/// [`Self::present`] after the frame's command buffer has been submitted.
+///
+/// Drop order matters: the internal [`wgpu::TextureView`] is explicitly
+/// dropped before [`wgpu::SurfaceTexture::present`] is called, which is
+/// what wgpu requires.
+pub struct SurfaceFrame {
+    /// View is declared first so it is dropped before `texture` on both
+    /// explicit `present` and any accidental drops.
+    view   : wgpu::TextureView,
+    texture: wgpu::SurfaceTexture,
+}
+
+impl SurfaceFrame {
+    /// The texture view targeting this frame's swapchain image.
+    ///
+    /// `pub(crate)` — only render helpers inside the renderer crate
+    /// construct render passes; external callers use those helpers.
+    pub(crate) fn view(&self) -> &wgpu::TextureView {
+        &self.view
+    }
+
+    /// Present the swapchain image.
+    ///
+    /// Explicitly drops the view before calling `present` to satisfy wgpu's
+    /// requirement that all views of a surface texture are released first.
+    pub fn present(self) {
+        drop(self.view);
+        self.texture.present();
     }
 }
 
@@ -178,6 +368,34 @@ impl FrameEncoder {
     /// commands; callers outside the crate never touch the raw encoder.
     pub(crate) fn encoder_mut(&mut self) -> &mut wgpu::CommandEncoder {
         &mut self.encoder
+    }
+
+    /// Clear the swapchain image to a solid colour.
+    ///
+    /// Records a single-attachment render pass with
+    /// [`LoadOp::Clear`](wgpu::LoadOp::Clear) targeting the
+    /// [`SurfaceFrame`]'s texture view.  The pass is ended immediately —
+    /// this is a full-frame clear, not a pass that can be extended.
+    ///
+    /// `rgba` components are in linear light (not sRGB) as wgpu requires:
+    /// pass pre-linearised values if you're working in sRGB space.
+    pub fn clear_surface(&mut self, frame: &SurfaceFrame, [r, g, b, a]: [f64; 4]) {
+        let _pass = self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("clear_surface"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view          : frame.view(),
+                depth_slice   : None,
+                resolve_target: None,
+                ops           : wgpu::Operations {
+                    load : wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set     : None,
+            timestamp_writes        : None,
+            multiview_mask          : None,
+        });
     }
 }
 

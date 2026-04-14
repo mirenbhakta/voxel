@@ -28,6 +28,19 @@ pub enum RendererError {
     #[error("failed to create wgpu device: {0}")]
     DeviceCreationFailed(String),
 
+    /// [`RendererContext::acquire_frame`](crate::RendererContext::acquire_frame)
+    /// found the surface outdated or lost. The surface has been reconfigured
+    /// with the last known dimensions; the caller should skip this frame and
+    /// retry on the next redraw request.
+    #[error("surface is outdated or lost; reconfigured and skipping frame")]
+    SurfaceOutdated,
+
+    /// [`RendererContext::acquire_frame`](crate::RendererContext::acquire_frame)
+    /// failed for a reason other than outdated/lost (e.g. timeout, OOM).
+    /// The inner string is the wgpu error description.
+    #[error("surface acquire failed: {0}")]
+    SurfaceAcquireFailed(String),
+
     /// SPIR-V reflection encountered a structural error in the module.
     ///
     /// Covers bugs in the reflection surface itself — malformed SPV that the

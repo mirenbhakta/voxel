@@ -101,9 +101,9 @@ pub(super) fn compile(
     let mut last_writer        : Vec<Option<usize>> = vec![None; resource_count];
     let mut readers_since_write: Vec<Vec<usize>>    = vec![vec![]; resource_count];
 
-    for pass in 0..pass_count {
+    for (pass, pass_access_list) in pass_accesses.iter().enumerate() {
         // Explicit read/write declarations.
-        for &(idx, access) in &pass_accesses[pass] {
+        for &(idx, access) in pass_access_list {
             let b = idx as usize;
 
             match access {
@@ -138,8 +138,8 @@ pub(super) fn compile(
 
     let mut queue = VecDeque::new();
 
-    for i in 0..pass_count {
-        if in_degree[i] == 0 {
+    for (i, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
             queue.push_back(i);
         }
     }

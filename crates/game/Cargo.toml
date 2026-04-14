@@ -1,0 +1,17 @@
+[package]
+name    = "game"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "game"
+path = "src/main.rs"
+
+[dependencies]
+renderer.workspace = true
+wgpu.workspace     = true
+winit.workspace    = true
+pollster.workspace = true
+
+[features]
+validation = []

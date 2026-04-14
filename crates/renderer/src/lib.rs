@@ -11,7 +11,7 @@ pub mod shader;
 mod device;
 
 pub use buffer::StagedBuffer;
-pub use device::{FrameEncoder, RendererContext};
+pub use device::{FrameEncoder, RendererContext, SurfaceFrame};
 pub use error::RendererError;
 pub use frame::{FrameCount, FrameIndex};
 pub use gpu_consts::{GpuConsts, GpuConstsData};

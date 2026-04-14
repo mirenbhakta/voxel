@@ -23,6 +23,12 @@ pub use resource::{Access, BufferDesc, BufferHandle, ResourceId, TextureDesc, Te
 
 use crate::device::FrameEncoder;
 
+/// Type alias for the per-pass execute closure stored in [`PassData`].
+///
+/// Factored out to avoid triggering the `clippy::type_complexity` lint on
+/// every field declaration.
+type ExecuteFn<T> = Option<Box<dyn FnOnce(&mut T, &mut FrameEncoder, &ResourceMap)>>;
+
 // --- ResourceEntry ---
 
 enum ResourceEntry {
@@ -114,7 +120,7 @@ impl ResourceMap {
 struct PassData<T> {
     name       : String,
     accesses   : Vec<(u32, Access)>,
-    execute_fn : Option<Box<dyn FnOnce(&mut T, &mut FrameEncoder, &ResourceMap)>>,
+    execute_fn : ExecuteFn<T>,
 }
 
 // --- RenderGraph ---
