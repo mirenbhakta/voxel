@@ -339,7 +339,7 @@ impl<T> CompiledGraph<T> {
     /// containing this frame's commands, then call
     /// [`PendingRelease::release`] to return the buffers to the pool.
     pub fn execute(self, ctx: &mut T, encoder: &mut FrameEncoder) -> PendingRelease {
-        let Self { passes, transient_descs, bindings, .. } = self;
+        let Self { passes, transient_descs, bindings, barriers, .. } = self;
 
         // Clone transient buffer arcs before ResourceMap takes ownership.
         let transient_buffers: Vec<wgpu::Buffer> = transient_descs.iter()
@@ -348,11 +348,36 @@ impl<T> CompiledGraph<T> {
 
         let resources = ResourceMap { buffers: bindings };
 
-        for pass in passes {
+        // `barriers` is sorted non-decreasingly by `before` (compilation
+        // invariant: emitted in a single forward pass over execution order).
+        // A single cursor advancing in lockstep with the pass loop is O(P + B).
+        let mut barrier_cursor = 0usize;
+
+        for (i, pass) in passes.into_iter().enumerate() {
+            // Emit a debug marker for each barrier that fires before pass i.
+            while barrier_cursor < barriers.len()
+                && barriers[barrier_cursor].before == i
+            {
+                let b = &barriers[barrier_cursor];
+                encoder.encoder_mut().insert_debug_marker(&format!(
+                    "barrier: buf{} {:?}->{:?} (after={}, before={})",
+                    b.resource.0, b.src, b.dst, b.after, b.before,
+                ));
+                barrier_cursor += 1;
+            }
+
             if let Some(f) = pass.execute_fn {
                 f(ctx, encoder, &resources);
             }
         }
+
+        // All barriers must have been consumed; an orphan would mean a barrier
+        // was emitted with `before >= passes.len()`, which is a compiler bug.
+        debug_assert_eq!(
+            barrier_cursor,
+            barriers.len(),
+            "orphaned barriers with before >= passes.len(); compiler bug",
+        );
 
         PendingRelease { buffers: transient_buffers }
     }
@@ -869,5 +894,60 @@ mod tests {
             usage: wgpu::BufferUsages::STORAGE,
         });
         assert_eq!(recycled.size(), 1024);
+    }
+
+    #[test]
+    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
+    fn execute_emits_barriers_in_order() {
+        use std::sync::{Arc, Mutex};
+        use crate::device::RendererContext;
+        use crate::frame::FrameCount;
+
+        let mut ctx = pollster::block_on(RendererContext::new_headless(
+            FrameCount::new(2).unwrap(),
+        ))
+        .expect("headless GPU context");
+
+        let mut pool = BufferPool::new();
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+
+        let mut graph = RenderGraph::<()>::new();
+
+        // Pass 0: creates buf (implicit Write). Pass 1: reads buf.
+        // Compilation must produce exactly one Write->Read barrier at before=1.
+        let buf = graph.add_pass("writer", |pass| {
+            let b = pass.create_buffer(desc());
+            let o = order.clone();
+            pass.execute(move |_, _, _| { o.lock().unwrap().push("writer"); });
+            b
+        });
+
+        let out = graph.add_pass("reader", |pass| {
+            pass.read(buf);
+            let b = pass.create_buffer(desc());
+            let o = order.clone();
+            pass.execute(move |_, _, _| { o.lock().unwrap().push("reader"); });
+            b
+        });
+
+        graph.mark_output(out);
+
+        let mut compiled = graph.compile().unwrap();
+        assert_eq!(compiled.barriers().len(), 1);
+        assert_eq!(compiled.barriers()[0].src, Access::Write);
+        assert_eq!(compiled.barriers()[0].dst, Access::Read);
+        assert_eq!(compiled.barriers()[0].before, 1);
+
+        compiled.allocate_transients(&mut pool, ctx.device());
+
+        let mut encoder = ctx.begin_frame();
+        let pending = compiled.execute(&mut (), &mut encoder);
+        ctx.end_frame(encoder);
+
+        // Both closures must have run in the declared order; barrier emission
+        // must not have skipped or reordered any passes.
+        assert_eq!(*order.lock().unwrap(), ["writer", "reader"]);
+
+        pending.release(&mut pool);
     }
 }
