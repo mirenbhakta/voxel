@@ -19,6 +19,8 @@ use std::sync::Arc;
 #[cfg(not(feature = "validation"))]
 use renderer::{FrameCount, RendererContext, RendererError};
 #[cfg(not(feature = "validation"))]
+use renderer::{SubchunkTest, TestCamera, sphere_occupancy};
+#[cfg(not(feature = "validation"))]
 use winit::{
     application::ApplicationHandler,
     event::WindowEvent,
@@ -47,8 +49,9 @@ fn main() {
 #[cfg(not(feature = "validation"))]
 #[derive(Default)]
 struct App {
-    window: Option<Arc<Window>>,
-    ctx: Option<RendererContext>,
+    window:        Option<Arc<Window>>,
+    ctx:           Option<RendererContext>,
+    subchunk_test: Option<SubchunkTest>,
 }
 
 #[cfg(not(feature = "validation"))]
@@ -89,6 +92,10 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         ctx.configure_surface(size.width.max(1), size.height.max(1));
 
+        let occ  = sphere_occupancy();
+        let test = SubchunkTest::new(&ctx, &occ);
+        self.subchunk_test = Some(test);
+
         self.ctx = Some(ctx);
         self.window = Some(window);
     }
@@ -114,31 +121,37 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let (Some(ctx), Some(window)) = (&mut self.ctx, &self.window) else {
-                    return;
+                let (Some(ctx), Some(window), Some(test)) =
+                    (&mut self.ctx, &self.window, &self.subchunk_test) else { return; };
+
+                let size = window.inner_size();
+                let aspect = size.width as f32 / size.height.max(1) as f32;
+
+                let camera = TestCamera {
+                    pos:     [4.0, 4.0, -5.0],
+                    fov_y:   std::f32::consts::FRAC_PI_3,
+                    forward: [0.0, 0.0,  1.0],
+                    aspect,
+                    right:   [1.0, 0.0,  0.0],
+                    _pad0:   0.0,
+                    up:      [0.0, 1.0,  0.0],
+                    _pad1:   0.0,
                 };
 
                 match ctx.acquire_frame() {
                     Ok(frame) => {
                         let mut fe = ctx.begin_frame();
-                        // Deep blue-grey clear — visible proof the render loop
-                        // is running without any voxel content yet.
-                        fe.clear_surface(&frame, [0.08, 0.12, 0.18, 1.0]);
+                        test.draw(ctx, &mut fe, &frame, &camera);
                         ctx.end_frame(fe);
                         frame.present();
                     }
-                    Err(RendererError::SurfaceOutdated) => {
-                        // Swapchain temporarily unavailable (resize race,
-                        // minimise, occluded).  The next redraw will succeed.
-                    }
+                    Err(RendererError::SurfaceOutdated) => {}
                     Err(e) => {
                         eprintln!("fatal frame error: {e}");
                         event_loop.exit();
                     }
                 }
 
-                // Drive continuous rendering.  Remove this for event-driven
-                // (static) rendering once voxel content is present.
                 window.request_redraw();
             }
 

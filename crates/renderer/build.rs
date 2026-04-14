@@ -140,6 +140,12 @@ fn compile_with_dxc(dxc: &Path, src: &Path, out: &Path, stage: &str, include_dir
     let status = Command::new(dxc)
         .arg("-spirv")
         .arg("-fspv-target-env=vulkan1.1")
+        // Use D3D constant-buffer packing rules instead of std140. Without
+        // this flag DXC pads float3 to 16-byte alignment (std140), so
+        // float3+float occupies 20 bytes rather than 16 — silently
+        // misaligning every field after the first float3 against repr(C)
+        // Rust structs where [f32;3]+f32 packs tightly to 16 bytes.
+        .arg("-fvk-use-dx-layout")
         .arg("-O3")
         .arg("-T")
         .arg(stage)

@@ -9,6 +9,7 @@ pub mod pipeline;
 pub mod shader;
 
 mod device;
+mod subchunk_test;
 
 pub use buffer::StagedBuffer;
 pub use device::{FrameEncoder, RendererContext, SurfaceFrame};
@@ -19,3 +20,4 @@ pub use pipeline::{BindEntry, BindKind, BindingLayout, BindingLayoutBuilder};
 pub use pipeline::{ComputePipeline, ComputePipelineDescriptor};
 pub use pipeline::{RenderPipeline, RenderPipelineDescriptor};
 pub use shader::{ShaderModule, ShaderSource};
+pub use subchunk_test::{SubchunkTest, SubchunkOccupancy, TestCamera, sphere_occupancy};

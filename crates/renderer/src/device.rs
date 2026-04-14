@@ -293,6 +293,13 @@ impl RendererContext {
     pub(crate) fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
+
+    /// The texture format the swapchain surface was configured with, or `None`
+    /// for a headless context.  Used by render passes that target the swapchain
+    /// (e.g. `SubchunkTest`) to match their colour-attachment format.
+    pub fn surface_format(&self) -> Option<wgpu::TextureFormat> {
+        self.windowed.as_ref().map(|ws| ws.preferred_format)
+    }
 }
 
 // --- SurfaceFrame ---
