@@ -42,15 +42,11 @@
 //!
 //! [`GpuConstsData`]: crate::gpu_consts::GpuConstsData
 
-use std::mem::size_of;
 use std::sync::Arc;
 
 use crate::device::{FrameEncoder, RendererContext};
-use crate::error::RendererError;
-use crate::gpu_consts::GpuConstsData;
 use crate::pipeline::binding::BindingLayout;
-use crate::pipeline::reflect;
-use crate::shader::{ShaderSource, load_shader};
+use crate::shader::ShaderModule;
 
 // --- ComputePipelineDescriptor ---
 
@@ -60,10 +56,8 @@ use crate::shader::{ShaderSource, load_shader};
 pub struct ComputePipelineDescriptor<'a> {
     /// Debug label forwarded to wgpu pipeline + pipeline layout.
     pub label: &'a str,
-    /// Compiled SPIR-V shader source.
-    pub shader: ShaderSource,
-    /// Entry point name within the shader (typically `"main"` for DXC output).
-    pub entry_point: &'a str,
+    /// Loaded shader module (produced by [`ShaderModule::load`]).
+    pub shader: ShaderModule,
     /// The binding layout this pipeline was built against. Stored on the
     /// pipeline and available via [`ComputePipeline::layout`].
     pub layout: Arc<BindingLayout>,
@@ -96,68 +90,41 @@ pub struct ComputePipeline {
 impl ComputePipeline {
     /// Construct a new `ComputePipeline` from `desc`.
     ///
+    /// Reflection and `GpuConsts`-size assertions were already performed
+    /// inside [`ShaderModule::load`]. This function only performs the
+    /// workgroup-size check and wires up the wgpu pipeline.
+    ///
     /// The sequence is:
-    /// 1. SPIR-V reflection (CPU only — no GPU calls yet).
-    /// 2. Workgroup-size assertion if `expected_workgroup_size` is `Some`.
-    /// 3. GpuConsts size assertion if the shader declares a uniform buffer at
-    ///    `(set=0, binding=0)`.
-    /// 4. `wgpu` pipeline layout + compute pipeline construction.
-    ///
-    /// Steps 2–3 deliberately precede step 4 so a CPU-side mismatch panics
-    /// without issuing any GPU calls.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RendererError::ShaderReflectionFailed`] if SPIR-V reflection
-    /// fails (malformed bytes, missing entry point, `LocalSizeId` mode).
+    /// 1. Workgroup-size assertion if `expected_workgroup_size` is `Some`
+    ///    (fires before any GPU calls).
+    /// 2. `wgpu` pipeline layout + compute pipeline construction.
     ///
     /// # Panics
     ///
     /// Panics if `expected_workgroup_size` is `Some` and does not match the
-    /// reflected size. Panics if the reflected GpuConsts buffer size does not
-    /// equal `size_of::<GpuConstsData>()`.
-    pub fn new(
-        ctx: &RendererContext,
-        desc: ComputePipelineDescriptor<'_>,
-    )
-        -> Result<Self, RendererError>
-    {
-        // Step 1: extract the SPIR-V bytes. `ShaderSource::Spirv` holds a
-        // `&'static [u8]` which is `Copy`, so we can use it for both
-        // reflection and for `load_shader` below without moving the enum.
-        let ShaderSource::Spirv(spv_bytes) = desc.shader;
-
-        let reflected = reflect::reflect_spirv(spv_bytes, desc.entry_point)?;
-
-        // Step 2: workgroup-size assertion (fires before any wgpu calls).
-        if let Some(expected) = desc.expected_workgroup_size
-            && reflected.workgroup_size != expected
-        {
-            panic!(
-                "workgroup size mismatch for pipeline `{}`:\n  \
-                 expected {:?}, shader has {:?}\n  \
-                 (CPU dispatch code and shader [numthreads(...)] are out of sync)",
-                desc.label,
-                expected,
-                reflected.workgroup_size,
-            );
+    /// workgroup size reflected during [`ShaderModule::load`], or if a raster
+    /// shader is passed to a compute pipeline.
+    pub fn new(ctx: &RendererContext, desc: ComputePipelineDescriptor<'_>) -> Self {
+        // Step 1: workgroup-size assertion (fires before any GPU calls).
+        if let Some(expected) = desc.expected_workgroup_size {
+            match desc.shader.workgroup_size {
+                Some(actual) if actual == expected => {}
+                Some(actual) => panic!(
+                    "workgroup size mismatch for pipeline `{}`:\n  \
+                     expected {:?}, shader has {:?}\n  \
+                     (CPU dispatch code and shader [numthreads(...)] are out of sync)",
+                    desc.label, expected, actual,
+                ),
+                None => panic!(
+                    "workgroup size mismatch for pipeline `{}`:\n  \
+                     expected {:?}, but shader has no LocalSize \
+                     (did you pass a raster shader to a compute pipeline?)",
+                    desc.label, expected,
+                ),
+            }
         }
 
-        // Step 3: GpuConsts size assertion (fires before any wgpu calls).
-        if let Some(size) = reflected.gpu_consts_byte_size {
-            assert_eq!(
-                size as usize,
-                size_of::<GpuConstsData>(),
-                "GpuConsts size mismatch: HLSL sees {} bytes, Rust has {} bytes",
-                size,
-                size_of::<GpuConstsData>(),
-            );
-        }
-
-        // Step 4a: load the shader module.
-        let module = load_shader(ctx, desc.label, ShaderSource::Spirv(spv_bytes));
-
-        // Step 4b: create the pipeline layout.
+        // Step 2a: create the pipeline layout.
         let pipeline_layout =
             ctx.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(desc.label),
@@ -165,23 +132,25 @@ impl ComputePipeline {
                 immediate_size: 0,
             });
 
-        // Step 4c: create the compute pipeline.
+        // Step 2b: create the compute pipeline.
         let pipeline =
             ctx.device().create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(desc.label),
                 layout: Some(&pipeline_layout),
-                module: &module,
-                entry_point: Some(desc.entry_point),
+                module: &desc.shader.inner,
+                entry_point: Some(desc.shader.entry_point.as_str()),
                 compilation_options: Default::default(),
                 cache: None,
             });
 
-        Ok(Self {
+        let workgroup_size = desc.shader.workgroup_size;
+
+        Self {
             pipeline,
             layout: desc.layout,
-            workgroup_size: reflected.workgroup_size,
+            workgroup_size: workgroup_size.unwrap_or([1, 1, 1]),
             label: desc.label.to_string(),
-        })
+        }
     }
 
     /// The workgroup size reflected from the shader's `LocalSize` execution
@@ -244,7 +213,7 @@ mod tests {
     use super::*;
     use crate::frame::FrameCount;
     use crate::pipeline::binding::{BindEntry, BindKind, BindingLayout};
-    use crate::shader::VALIDATION_CS_SPV;
+    use crate::shader::{ShaderModule, ShaderSource, VALIDATION_CS_SPV};
 
     /// Builds a `ComputePipeline` for `validation.cs.hlsl` with the correct
     /// expected workgroup size and asserts the baked-in size is `[64, 1, 1]`.
@@ -270,17 +239,23 @@ mod tests {
                 .build(&ctx),
         );
 
+        let shader = ShaderModule::load(
+            &ctx,
+            "validation",
+            ShaderSource::Spirv(VALIDATION_CS_SPV),
+            "main",
+        )
+        .expect("ShaderModule::load should succeed for the validation shader");
+
         let pipeline = ComputePipeline::new(
             &ctx,
             ComputePipelineDescriptor {
                 label: "validation",
-                shader: ShaderSource::Spirv(VALIDATION_CS_SPV),
-                entry_point: "main",
+                shader,
                 layout: layout.clone(),
                 expected_workgroup_size: Some([64, 1, 1]),
             },
-        )
-        .expect("ComputePipeline::new should succeed for the validation shader");
+        );
 
         assert_eq!(
             pipeline.workgroup_size(),
@@ -320,13 +295,20 @@ mod tests {
                 .build(&ctx),
         );
 
+        let shader = ShaderModule::load(
+            &ctx,
+            "validation",
+            ShaderSource::Spirv(VALIDATION_CS_SPV),
+            "main",
+        )
+        .expect("ShaderModule::load should succeed for the validation shader");
+
         // [32, 1, 1] does not match the shader's [64, 1, 1] — should panic.
-        let _ = ComputePipeline::new(
+        ComputePipeline::new(
             &ctx,
             ComputePipelineDescriptor {
                 label: "validation",
-                shader: ShaderSource::Spirv(VALIDATION_CS_SPV),
-                entry_point: "main",
+                shader,
                 layout,
                 expected_workgroup_size: Some([32, 1, 1]),
             },

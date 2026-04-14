@@ -27,7 +27,8 @@ use crate::error::RendererError;
 pub struct Reflected {
     /// The workgroup size declared by the entry point's `LocalSize` execution
     /// mode — `[x, y, z]`, matching `[numthreads(x, y, z)]` in HLSL.
-    pub workgroup_size: [u32; 3],
+    /// `None` for raster (vertex/fragment) shaders, which have no `LocalSize`.
+    pub workgroup_size: Option<[u32; 3]>,
     /// Size in bytes of the uniform buffer at descriptor set 0 binding 0, or
     /// `None` if the shader does not declare one. This slot is always
     /// `GpuConstsData` in the renderer's binding model (forced injection by
@@ -98,7 +99,8 @@ fn find_entry_point_fn_id(
 }
 
 /// Walk `module.execution_modes` to find the `OpExecutionMode` for `fn_id`
-/// with mode `LocalSize`. Returns `[x, y, z]`.
+/// with mode `LocalSize`. Returns `Some([x, y, z])` for compute shaders,
+/// `None` for raster shaders that have no `LocalSize` execution mode.
 ///
 /// `OpExecutionMode` operand layout: `[IdRef(fn_id), ExecutionMode(mode),
 /// LiteralBit32(x), LiteralBit32(y), LiteralBit32(z)]` for `LocalSize`.
@@ -107,7 +109,7 @@ fn find_workgroup_size(
     fn_id: spirv::Word,
     entry_point: &str,
 )
-    -> Result<[u32; 3], RendererError>
+    -> Result<Option<[u32; 3]>, RendererError>
 {
     for inst in &module.execution_modes {
         let Some(Operand::IdRef(id)) = inst.operands.first() else {
@@ -137,7 +139,7 @@ fn find_workgroup_size(
                     )));
                 }
 
-                return Ok([x, y, z]);
+                return Ok(Some([x, y, z]));
             }
 
             spirv::ExecutionMode::LocalSizeId => {
@@ -152,9 +154,8 @@ fn find_workgroup_size(
         }
     }
 
-    Err(RendererError::ShaderReflectionFailed(format!(
-        "no LocalSize execution mode found for entry point '{entry_point}'"
-    )))
+    // No LocalSize found — raster shader (vertex/fragment).
+    Ok(None)
 }
 
 /// Extract a `LiteralBit32` from `operands[index]`, or return an error.
@@ -578,7 +579,7 @@ mod tests {
 
         assert_eq!(
             reflected.workgroup_size,
-            [64, 1, 1],
+            Some([64, 1, 1]),
             "workgroup size should match the LocalSize 64 1 1 in the binary",
         );
         assert_eq!(
@@ -600,7 +601,7 @@ mod tests {
 
         assert_eq!(
             reflected.workgroup_size,
-            [64, 1, 1],
+            Some([64, 1, 1]),
             "workgroup size should match the LocalSize in the binary",
         );
         assert_eq!(
@@ -618,7 +619,7 @@ mod tests {
         let reflected = reflect_spirv(&spv, "main")
             .expect("reflect_spirv should succeed on 4-member uniform buffer");
 
-        assert_eq!(reflected.workgroup_size, [32, 1, 1]);
+        assert_eq!(reflected.workgroup_size, Some([32, 1, 1]));
         assert_eq!(
             reflected.gpu_consts_byte_size,
             Some(16),
@@ -689,6 +690,63 @@ mod tests {
         );
     }
 
+    /// Build a minimal Fragment-shader SPIR-V with no `LocalSize` execution
+    /// mode — raster shaders (vertex/fragment) have no workgroup concept.
+    ///
+    /// IDs: %void=1, %voidfn=2, %main=3, %label=4 (bound=5).
+    fn minimal_fragment_spirv() -> Vec<u8> {
+        // Fragment shader: OpEntryPoint Fragment, no LocalSize.
+        // IDs: %void=1, %voidfn=2, %main=3, %label=4 (bound=5).
+        let words: &[u32] = &[
+            0x07230203, // magic
+            0x00010100, // version 1.1
+            0x00000000, // generator
+            0x00000005, // bound
+            0x00000000, // schema
+            // OpCapability Shader
+            0x00020011, 0x00000001,
+            // OpMemoryModel Logical GLSL450
+            0x0003000E, 0x00000000, 0x00000001,
+            // OpEntryPoint Fragment %main "main"  (execution model 4 = Fragment)
+            0x0005000F, 0x00000004, 0x00000003, 0x6E69616D, 0x00000000,
+            // No OpExecutionMode — raster shaders have no LocalSize
+            // %void = OpTypeVoid
+            0x00020013, 0x00000001,
+            // %voidfn = OpTypeFunction %void
+            0x00030021, 0x00000002, 0x00000001,
+            // %main = OpFunction %void None %voidfn
+            0x00050036, 0x00000001, 0x00000003, 0x00000000, 0x00000002,
+            // %label = OpLabel
+            0x000200F8, 0x00000004,
+            // OpReturn
+            0x000100FD,
+            // OpFunctionEnd
+            0x00010038,
+        ];
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A fragment shader has no `LocalSize` execution mode — `workgroup_size`
+    /// must be `None`. `gpu_consts_byte_size` is also `None` since this shader
+    /// declares no descriptor bindings.
+    #[test]
+    fn reflect_spirv_returns_none_workgroup_size_for_raster_shader() {
+        let spv = minimal_fragment_spirv();
+        let reflected = reflect_spirv(&spv, "main")
+            .expect("reflect_spirv should succeed on a valid fragment shader");
+
+        assert_eq!(
+            reflected.workgroup_size,
+            None,
+            "workgroup_size should be None for a raster (fragment) shader",
+        );
+        assert_eq!(
+            reflected.gpu_consts_byte_size,
+            None,
+            "gpu_consts_byte_size should be None: shader has no descriptor bindings",
+        );
+    }
+
     /// Reflects `VALIDATION_CS_SPV` and asserts the workgroup size matches
     /// the `[numthreads(64, 1, 1)]` declared in `validation.cs.hlsl`.
     ///
@@ -703,7 +761,7 @@ mod tests {
 
         assert_eq!(
             reflected.workgroup_size,
-            [64, 1, 1],
+            Some([64, 1, 1]),
             "expected [64, 1, 1] matching [numthreads(64, 1, 1)] in validation.cs.hlsl",
         );
     }

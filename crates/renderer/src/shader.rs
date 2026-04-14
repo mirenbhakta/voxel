@@ -4,8 +4,8 @@
 //! passthrough, matching the old scaffold exactly. The `build.rs` invokes
 //! DXC at build time and emits compiled SPV blobs under `$OUT_DIR/shaders/`;
 //! Rust then picks them up with `include_bytes!` into `&'static [u8]`
-//! constants and hands them to [`load_shader`] which wraps
-//! `wgpu::Device::create_shader_module_passthrough`.
+//! constants and passes them to [`ShaderModule::load`], which performs SPIR-V
+//! reflection, asserts `GpuConsts` layout, and uploads the module to the GPU.
 //!
 //! The toolchain is HLSL → DXC rather than WGSL because later subsystems
 //! need `DrawIndex`, which naga can't round-trip — switching toolchains later
@@ -13,13 +13,14 @@
 //! written twice.
 //!
 //! `wgpu::ShaderModule` does not leak through this module's public API
-//! (principle 3: wgpu is contained behind render abstractions). Higher layers
-//! consume [`load_shader`] and receive an opaque module they pass into
-//! [`ComputePipeline`].
+//! (principle 3: wgpu is contained behind render abstractions). The
+//! [`ShaderModule`] type exposes `inner` as `pub(crate)` so pipeline types
+//! in this crate can use it without exposing it to callers.
 
 use std::borrow::Cow;
 
 use crate::device::RendererContext;
+use crate::error::RendererError;
 
 /// The source bytes of a shader module.
 ///
@@ -31,10 +32,83 @@ use crate::device::RendererContext;
 pub enum ShaderSource {
     /// A binary SPIR-V module as a static byte slice. Typically sourced
     /// from `include_bytes!(concat!(env!("OUT_DIR"), "/shaders/<name>.spv"))`.
-    /// Must begin with the SPIR-V magic number; [`load_shader`] panics via
-    /// `wgpu::util::make_spirv_raw` otherwise.
+    /// Must begin with the SPIR-V magic number; [`ShaderModule::load`] panics
+    /// via `wgpu::util::make_spirv_raw` otherwise.
     Spirv(&'static [u8]),
 }
+
+// --- ShaderModule ---
+
+/// A loaded shader — SPIR-V reflected, GpuConsts-asserted, and uploaded to
+/// the GPU as a `wgpu::ShaderModule`. Consumed by pipeline constructors.
+///
+/// `wgpu::ShaderModule` does not leak through this type's public interface
+/// (principle 3); the `inner` field is `pub(crate)` so pipeline types in
+/// this crate can use it without exposing it to callers.
+pub struct ShaderModule {
+    pub(crate) inner: wgpu::ShaderModule,
+    pub(crate) entry_point: String,
+    /// Workgroup size reflected from the shader's `LocalSize` execution mode.
+    /// `None` for raster (vertex/fragment) shaders, which have no `LocalSize`.
+    pub workgroup_size: Option<[u32; 3]>,
+    /// Byte size of the `GpuConsts` uniform buffer at (set=0, binding=0),
+    /// or `None` if the shader does not declare one.
+    pub gpu_consts_byte_size: Option<u32>,
+}
+
+impl ShaderModule {
+    /// Load a shader from compiled SPIR-V.
+    ///
+    /// Performs SPIR-V reflection, asserts the `GpuConsts` uniform buffer size
+    /// against `GpuConstsData` if the shader declares one, then uploads the
+    /// module to the GPU via `wgpu`'s SPIR-V passthrough path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RendererError::ShaderReflectionFailed`] if SPIR-V parsing
+    /// fails, the entry point is not found, or a `LocalSizeId` execution mode
+    /// is present (spec-constant workgroup sizes are unsupported).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reflected `GpuConsts` buffer size does not match
+    /// `size_of::<GpuConstsData>()`, or if the SPIR-V bytes are malformed
+    /// (not a multiple of 4, missing magic number).
+    pub fn load(
+        ctx: &RendererContext,
+        label: &str,
+        source: ShaderSource,
+        entry_point: &str,
+    ) -> Result<Self, RendererError> {
+        use std::mem::size_of;
+        use crate::gpu_consts::GpuConstsData;
+        use crate::pipeline::reflect;
+
+        let ShaderSource::Spirv(spv_bytes) = source;
+        let reflected = reflect::reflect_spirv(spv_bytes, entry_point)?;
+
+        if let Some(size) = reflected.gpu_consts_byte_size {
+            assert_eq!(
+                size as usize,
+                size_of::<GpuConstsData>(),
+                "GpuConsts size mismatch for shader `{label}`: \
+                 HLSL sees {size} bytes, Rust has {} bytes",
+                size_of::<GpuConstsData>(),
+            );
+        }
+
+        let inner = create_wgpu_module(ctx, label, ShaderSource::Spirv(spv_bytes));
+
+        Ok(Self {
+            inner,
+            entry_point: entry_point.to_owned(),
+            workgroup_size: reflected.workgroup_size,
+            gpu_consts_byte_size: reflected.gpu_consts_byte_size,
+        })
+    }
+}
+
+// --- create_wgpu_module ---
 
 /// Create a `wgpu::ShaderModule` from a [`ShaderSource`].
 ///
@@ -52,7 +126,7 @@ pub enum ShaderSource {
 /// Panics if the SPIR-V bytes are malformed — specifically, if the length
 /// isn't a multiple of 4 or the magic number is absent. These are both
 /// "build-time promise violated" bugs, not recoverable runtime conditions.
-pub fn load_shader(
+fn create_wgpu_module(
     ctx: &RendererContext,
     label: &str,
     source: ShaderSource,
@@ -150,11 +224,13 @@ mod tests {
         ))
         .expect("headless GPU context should construct on a vulkan-capable machine");
 
-        let _module = load_shader(
+        let _module = ShaderModule::load(
             &ctx,
             "validation.cs",
             ShaderSource::Spirv(VALIDATION_CS_SPV),
-        );
+            "main",
+        )
+        .expect("ShaderModule::load should succeed for the validation shader");
         // Reaching this point without panicking is the assertion — the
         // wgpu driver accepted the SPIR-V module and produced a handle.
     }

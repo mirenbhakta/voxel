@@ -17,4 +17,5 @@ pub use frame::{FrameCount, FrameIndex};
 pub use gpu_consts::{GpuConsts, GpuConstsData};
 pub use pipeline::{BindEntry, BindKind, BindingLayout, BindingLayoutBuilder};
 pub use pipeline::{ComputePipeline, ComputePipelineDescriptor};
-pub use shader::{ShaderSource, load_shader};
+pub use pipeline::{RenderPipeline, RenderPipelineDescriptor};
+pub use shader::{ShaderModule, ShaderSource};
