@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use super::resource::{Access, BufferHandle};
+use super::resource::{Access, ResourceId};
 
 // --- Barrier ---
 
@@ -20,7 +20,7 @@ use super::resource::{Access, BufferHandle};
 #[derive(Clone, Debug)]
 pub struct Barrier {
     /// The resource that transitions.
-    pub resource : BufferHandle,
+    pub resource : ResourceId,
     /// Access kind in the earlier pass.
     pub src      : Access,
     /// Access kind in the later pass.
@@ -64,30 +64,29 @@ pub enum CompileError {
 
 /// Compile the render graph.
 ///
-/// Accepts per-pass resource declarations and output-buffer markers.
+/// Accepts per-pass resource declarations and output-resource markers.
 /// Returns an execution order (after dead-pass culling), barrier metadata,
 /// and the number of culled passes.
 ///
 /// ## Algorithm
 ///
 /// 1. **Dependency DAG** — built from resource access declarations.  For
-///    each buffer, the function tracks the last writer and all readers
+///    each resource, the function tracks the last writer and all readers
 ///    since the last write.  Edges encode RAW, WAW, and WAR hazards.
 /// 2. **Topological sort** — Kahn's algorithm.  Fails with
 ///    [`CompileError::Cycle`] if the graph contains a cycle.
-/// 3. **Dead-pass culling** — backward reachability from output-buffer
+/// 3. **Dead-pass culling** — backward reachability from output-resource
 ///    writers.  A pass is live if it transitively contributes to an output.
 ///    Note: WAW-chained passes are kept alive conservatively (the
 ///    superseded writer is not culled even though its output is
 ///    overwritten).
 /// 4. **Barrier derivation** — walks execution order and emits a barrier
-///    whenever a buffer transitions between incompatible access kinds
+///    whenever a resource transitions between incompatible access kinds
 ///    (any transition except Read → Read).
 pub(super) fn compile(
-    pass_accesses  : &[Vec<(BufferHandle, Access)>],
-    pass_creates   : &[Vec<BufferHandle>],
-    output_buffers : &[BufferHandle],
-    buffer_count   : usize,
+    pass_accesses    : &[Vec<(u32, Access)>],
+    output_resources : &[ResourceId],
+    resource_count   : usize,
 )
     -> Result<CompileResult, CompileError>
 {
@@ -98,30 +97,14 @@ pub(super) fn compile(
     let mut edges     : Vec<Vec<usize>> = vec![vec![]; pass_count];
     let mut in_degree : Vec<usize>      = vec![0; pass_count];
 
-    // Per-buffer tracking: last writer and readers since last write.
-    let mut last_writer        : Vec<Option<usize>> = vec![None; buffer_count];
-    let mut readers_since_write: Vec<Vec<usize>>    = vec![vec![]; buffer_count];
+    // Per-resource tracking: last writer and readers since last write.
+    let mut last_writer        : Vec<Option<usize>> = vec![None; resource_count];
+    let mut readers_since_write: Vec<Vec<usize>>    = vec![vec![]; resource_count];
 
     for pass in 0..pass_count {
-        // Creates: this pass is the writer of a new transient buffer.
-        for &buf in &pass_creates[pass] {
-            let b = buf.0 as usize;
-
-            if let Some(prev) = last_writer[b] {
-                add_edge(&mut edges, &mut in_degree, prev, pass);
-            }
-
-            for &reader in &readers_since_write[b] {
-                add_edge(&mut edges, &mut in_degree, reader, pass);
-            }
-
-            last_writer[b] = Some(pass);
-            readers_since_write[b].clear();
-        }
-
         // Explicit read/write declarations.
-        for &(buf, access) in &pass_accesses[pass] {
-            let b = buf.0 as usize;
+        for &(idx, access) in &pass_accesses[pass] {
+            let b = idx as usize;
 
             match access {
                 Access::Read => {
@@ -183,9 +166,9 @@ pub(super) fn compile(
 
     let mut live = vec![false; pass_count];
 
-    // Seed: last writer of each output buffer is live.
-    for &buf in output_buffers {
-        if let Some(writer) = last_writer[buf.0 as usize] {
+    // Seed: last writer of each output resource is live.
+    for res in output_resources {
+        if let Some(writer) = last_writer[res.0 as usize] {
             live[writer] = true;
         }
     }
@@ -216,23 +199,19 @@ pub(super) fn compile(
 
     // -- 4. Barrier derivation --
 
-    // Per-buffer: last (access kind, execution-order position).
-    let mut buf_last: Vec<Option<(Access, usize)>> = vec![None; buffer_count];
+    // Per-resource: last (access kind, execution-order position).
+    let mut buf_last: Vec<Option<(Access, usize)>> = vec![None; resource_count];
     let mut barriers = Vec::new();
 
     for (pos, &pass) in execution_order.iter().enumerate() {
-        // Collect the effective access per buffer for this pass.
-        // Write dominates Read when both appear on the same buffer.
+        // Collect the effective access per resource for this pass.
+        // Write dominates Read when both appear on the same resource.
         let mut effective: Vec<(usize, Access)> = Vec::new();
 
-        for &buf in &pass_creates[pass] {
-            effective.push((buf.0 as usize, Access::Write));
-        }
+        for &(idx, access) in &pass_accesses[pass] {
+            let b = idx as usize;
 
-        for &(buf, access) in &pass_accesses[pass] {
-            let b = buf.0 as usize;
-
-            if let Some(entry) = effective.iter_mut().find(|(idx, _)| *idx == b) {
+            if let Some(entry) = effective.iter_mut().find(|(i, _)| *i == b) {
                 if access == Access::Write {
                     entry.1 = Access::Write;
                 }
@@ -247,7 +226,7 @@ pub(super) fn compile(
                 // Read → Read needs no barrier.
                 if !(prev_access == Access::Read && access == Access::Read) {
                     barriers.push(Barrier {
-                        resource : BufferHandle(b as u32),
+                        resource : ResourceId(b as u32),
                         src      : prev_access,
                         dst      : access,
                         after    : prev_pos,
