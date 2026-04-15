@@ -19,11 +19,17 @@ mod resource;
 
 pub use compile::{Barrier, CompileError};
 pub use pool::{BufferPool, PendingRelease, TexturePool};
-pub use resource::{Access, BufferDesc, BufferHandle, ResourceId, TextureDesc, TextureHandle};
+pub use resource::{
+    Access, BindGroupHandle, BufferDesc, BufferHandle, ResourceId, TextureDesc, TextureHandle,
+};
+
+use std::sync::Arc;
 
 use crate::commands::Commands;
 use crate::device::FrameEncoder;
 use crate::frame::FrameIndex;
+use crate::gpu_consts::GpuConsts;
+use crate::pipeline::binding::BindingLayout;
 
 /// Type alias for the per-pass execute closure stored in [`PassData`].
 ///
@@ -38,6 +44,21 @@ enum ResourceEntry {
     Texture(wgpu::Texture, wgpu::TextureView),
 }
 
+// --- BindGroupTemplate ---
+
+/// Deferred bind-group description registered at graph-build time.
+///
+/// Records the binding layout, the slot-0 GpuConsts buffer, and the
+/// (binding, resource) pairs for user slots.  The actual [`wgpu::BindGroup`]
+/// is produced during [`CompiledGraph::resolve_bind_groups`] once every
+/// referenced transient buffer has been allocated.
+struct BindGroupTemplate {
+    label          : String,
+    layout         : Arc<BindingLayout>,
+    gpu_consts_buf : wgpu::Buffer,
+    entries        : Vec<(u32, ResourceId)>,
+}
+
 // --- ResourceMap ---
 
 /// Resolved resource handles available during pass execution.
@@ -46,7 +67,8 @@ enum ResourceEntry {
 /// Passed to each pass's execute closure via [`PassContext`] so it can look
 /// up actual GPU resources by handle rather than capturing raw wgpu types.
 pub struct ResourceMap {
-    entries: Vec<Option<ResourceEntry>>,
+    entries     : Vec<Option<ResourceEntry>>,
+    bind_groups : Vec<Option<wgpu::BindGroup>>,
 }
 
 impl ResourceMap {
@@ -130,6 +152,24 @@ impl ResourceMap {
             _ => panic!("handle (resource={}) is a buffer, not a texture", handle.resource),
         }
     }
+
+    /// Look up the resolved [`wgpu::BindGroup`] for a render-graph handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bind group has not been resolved.  Call
+    /// [`CompiledGraph::resolve_bind_groups`] after
+    /// [`allocate_transients`](CompiledGraph::allocate_transients) and
+    /// before [`execute`](CompiledGraph::execute) to populate them.
+    pub fn bind_group(&self, handle: BindGroupHandle) -> &wgpu::BindGroup {
+        self.bind_groups[handle.0 as usize]
+            .as_ref()
+            .unwrap_or_else(|| panic!(
+                "bind group handle ({}) not resolved — call \
+                 CompiledGraph::resolve_bind_groups before execute",
+                handle.0,
+            ))
+    }
 }
 
 // --- PassContext ---
@@ -183,6 +223,10 @@ pub struct RenderGraph {
     /// Imported textures bound at build time; written into the compiled
     /// [`ResourceMap`] by [`compile`](Self::compile).
     imported_textures       : Vec<(u32, wgpu::Texture)>,
+    /// Bind-group templates registered via [`create_bind_group`] and
+    /// resolved into [`wgpu::BindGroup`]s during
+    /// [`CompiledGraph::resolve_bind_groups`].
+    bind_group_templates    : Vec<BindGroupTemplate>,
 }
 
 impl Default for RenderGraph {
@@ -203,6 +247,7 @@ impl RenderGraph {
             transient_texture_descs : Vec::new(),
             imported_buffers        : Vec::new(),
             imported_textures       : Vec::new(),
+            bind_group_templates    : Vec::new(),
         }
     }
 
@@ -252,6 +297,43 @@ impl RenderGraph {
     pub fn create_texture(&mut self, name: &str, desc: TextureDesc) -> TextureHandle {
         let handle = self.alloc_texture_handle();
         self.transient_texture_descs.push((handle, desc, name.to_string()));
+        handle
+    }
+
+    /// Register a deferred bind group against `layout`, slot 0 bound to
+    /// `gpu_consts`, user slots bound to the `(binding, resource)` pairs
+    /// in `entries`.
+    ///
+    /// Returns an opaque [`BindGroupHandle`].  The actual wgpu bind group
+    /// is produced during [`CompiledGraph::resolve_bind_groups`] — the
+    /// call must happen *after*
+    /// [`allocate_transients`](CompiledGraph::allocate_transients) so all
+    /// referenced resources have backing GPU handles, and *before*
+    /// [`execute`](CompiledGraph::execute).  Inside execute closures,
+    /// look up the resolved group via
+    /// [`ResourceMap::bind_group`](ResourceMap::bind_group).
+    ///
+    /// User-slot bindings correspond 1:1 to [`BindingLayout`] entries —
+    /// every binding declared on the layout (other than slot 0) must be
+    /// supplied exactly once.  `ResourceId` may come from either a
+    /// [`BufferHandle`] or a [`TextureHandle`] (via [`From`]); the
+    /// resolver branches on the underlying [`ResourceEntry`] kind.
+    pub fn create_bind_group(
+        &mut self,
+        label      : &str,
+        layout     : &Arc<BindingLayout>,
+        gpu_consts : &GpuConsts,
+        entries    : &[(u32, ResourceId)],
+    )
+        -> BindGroupHandle
+    {
+        let handle = BindGroupHandle(self.bind_group_templates.len() as u32);
+        self.bind_group_templates.push(BindGroupTemplate {
+            label          : label.to_string(),
+            layout         : Arc::clone(layout),
+            gpu_consts_buf : gpu_consts.buffer().clone(),
+            entries        : entries.to_vec(),
+        });
         handle
     }
 
@@ -358,13 +440,19 @@ impl RenderGraph {
             entries[resource as usize] = Some(ResourceEntry::Texture(texture, view));
         }
 
+        let bind_group_count = self.bind_group_templates.len();
+        let bind_groups: Vec<Option<wgpu::BindGroup>> =
+            (0..bind_group_count).map(|_| None).collect();
+
         Ok(CompiledGraph {
             passes,
             barriers               : result.barriers,
             culled_count           : result.culled_count,
             entries,
+            bind_groups,
             transient_buffer_descs,
             transient_texture_descs,
+            bind_group_templates   : self.bind_group_templates,
         })
     }
 }
@@ -470,8 +558,10 @@ pub struct CompiledGraph {
     barriers                : Vec<Barrier>,
     culled_count            : usize,
     entries                 : Vec<Option<ResourceEntry>>,
+    bind_groups             : Vec<Option<wgpu::BindGroup>>,
     transient_buffer_descs  : Vec<(BufferHandle, BufferDesc, String)>,
     transient_texture_descs : Vec<(TextureHandle, TextureDesc, String)>,
+    bind_group_templates    : Vec<BindGroupTemplate>,
 }
 
 impl CompiledGraph {
@@ -516,6 +606,57 @@ impl CompiledGraph {
         }
     }
 
+    /// Resolve every registered bind group into a [`wgpu::BindGroup`].
+    ///
+    /// Call after [`allocate_transients`](Self::allocate_transients) — every
+    /// referenced transient must already have its backing buffer/texture
+    /// in the entries array — and before [`execute`](Self::execute).  A
+    /// template referencing a resource that is still `None` (e.g. a
+    /// transient that was culled because nothing writes it) panics with
+    /// the offending label and resource id.
+    ///
+    /// Resolved groups are looked up inside execute closures via
+    /// [`ResourceMap::bind_group`].
+    pub fn resolve_bind_groups(&mut self, device: &wgpu::Device) {
+        for (i, tpl) in self.bind_group_templates.iter().enumerate() {
+            let mut bg_entries: Vec<wgpu::BindGroupEntry> =
+                Vec::with_capacity(tpl.entries.len() + 1);
+
+            // Slot 0: GpuConsts — always present, injected by BindingLayout.
+            bg_entries.push(wgpu::BindGroupEntry {
+                binding  : BindingLayout::GPU_CONSTS_SLOT,
+                resource : tpl.gpu_consts_buf.as_entire_binding(),
+            });
+
+            // User slots: resolve each ResourceId via entries array.
+            for &(binding, res_id) in &tpl.entries {
+                let entry = self.entries[res_id.0 as usize]
+                    .as_ref()
+                    .unwrap_or_else(|| panic!(
+                        "bind group '{}' references resource {} which has \
+                         no backing GPU resource — import it, call \
+                         allocate_transients, or remove the reference",
+                        tpl.label, res_id.0,
+                    ));
+
+                let resource = match entry {
+                    ResourceEntry::Buffer(b)      => b.as_entire_binding(),
+                    ResourceEntry::Texture(_, v)  => wgpu::BindingResource::TextureView(v),
+                };
+
+                bg_entries.push(wgpu::BindGroupEntry { binding, resource });
+            }
+
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label   : Some(&tpl.label),
+                layout  : tpl.layout.wgpu_layout(),
+                entries : &bg_entries,
+            });
+
+            self.bind_groups[i] = Some(bg);
+        }
+    }
+
     /// Execute all passes in compiled order.
     ///
     /// Constructs a [`Commands`] recorder from `encoder`, then calls each
@@ -531,6 +672,7 @@ impl CompiledGraph {
             transient_buffer_descs,
             transient_texture_descs,
             entries,
+            bind_groups,
             barriers,
             ..
         } = self;
@@ -558,7 +700,7 @@ impl CompiledGraph {
             })
             .collect();
 
-        let resources = ResourceMap { entries };
+        let resources = ResourceMap { entries, bind_groups };
 
         // `barriers` is sorted non-decreasingly by `before` (compilation
         // invariant: emitted in a single forward pass over execution order).

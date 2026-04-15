@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::commands::{ColorAttachment, DepthAttachment, RasterPassDesc};
-use crate::graph::{RenderGraph, TextureHandle};
+use crate::graph::{BindGroupHandle, BufferHandle, RenderGraph, TextureHandle};
 use crate::pipeline::RenderPipeline;
 
 use super::indirect_args::IndirectArgs;
@@ -27,18 +27,21 @@ pub struct DrawArgs {}
 
 /// Register an MDI raster pass into `graph`.
 ///
-/// Reads both buffers in `indirect`, writes `color` and `depth` (both
-/// cleared at pass start), and returns the new versioned attachment
+/// Reads both buffers in `indirect`, reads every handle in `extra_reads`
+/// (the visibility list is the canonical case), writes `color` and `depth`
+/// (both cleared at pass start), and returns the new versioned attachment
 /// handles.  Dispatches via `multi_draw_indirect_count` — the draw count
 /// is read from `indirect.count` on the GPU, capped at `indirect.max_draws`.
+#[allow(clippy::too_many_arguments)]
 pub fn mdi_draw(
-    graph      : &mut RenderGraph,
-    pipeline   : &Arc<RenderPipeline>,
-    bind_group : &wgpu::BindGroup,
-    indirect   : &IndirectArgs,
-    _args      : &DrawArgs,
-    color      : TextureHandle,
-    depth      : TextureHandle,
+    graph       : &mut RenderGraph,
+    pipeline    : &Arc<RenderPipeline>,
+    bind_group  : BindGroupHandle,
+    indirect    : &IndirectArgs,
+    _args       : &DrawArgs,
+    extra_reads : &[BufferHandle],
+    color       : TextureHandle,
+    depth       : TextureHandle,
 )
     -> (TextureHandle, TextureHandle)
 {
@@ -49,13 +52,16 @@ pub fn mdi_draw(
     graph.add_pass("mdi_draw", |pass| {
         pass.read_buffer(indirect_h);
         pass.read_buffer(count_h);
+        for &h in extra_reads {
+            pass.read_buffer(h);
+        }
         let color_v = pass.write_texture(color);
         let depth_v = pass.write_texture(depth);
 
-        let pipeline   = Arc::clone(pipeline);
-        let bind_group = bind_group.clone();
+        let pipeline = Arc::clone(pipeline);
 
         pass.execute(move |ctx| {
+            let bg           = ctx.resources.bind_group(bind_group);
             let indirect_buf = ctx.resources.buffer(indirect_h);
             let count_buf    = ctx.resources.buffer(count_h);
             let color_view   = ctx.resources.texture_view(color_v);
@@ -69,7 +75,7 @@ pub fn mdi_draw(
                 },
                 |rp| {
                     rp.multi_draw_indirect_count(
-                        &pipeline, &bind_group,
+                        &pipeline, bg,
                         indirect_buf, 0,
                         count_buf,    0,
                         max_draws,

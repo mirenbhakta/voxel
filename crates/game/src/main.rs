@@ -378,6 +378,7 @@ impl ApplicationHandler for App {
                 compiled.allocate_transients(
                     &mut self.buf_pool, &mut self.tex_pool, ctx.device(),
                 );
+                compiled.resolve_bind_groups(ctx.device());
 
                 let mut fe = ctx.begin_frame();
                 let frame  = ctx.frame_index();

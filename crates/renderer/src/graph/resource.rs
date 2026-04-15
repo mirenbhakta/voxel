@@ -48,8 +48,25 @@ pub struct TextureHandle {
 /// [`From`].  Used in barrier metadata to identify the transitioning resource
 /// without distinguishing its type or version — barriers are GPU-level and
 /// care only about resource identity.
+///
+/// `ResourceId` does *not* include [`BindGroupHandle`] — bind groups are a
+/// separate index space that carries no barrier semantics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ResourceId(pub u32);
+
+// --- BindGroupHandle ---
+
+/// Opaque handle to a bind group registered with the render graph.
+///
+/// Bind groups live in their own index space (distinct from [`ResourceId`])
+/// because they are a pure output of the resolve-bind-groups step and
+/// carry no barrier or versioning semantics — every frame produces a
+/// fresh bind group from its template.
+///
+/// Passes obtain the resolved [`wgpu::BindGroup`] at execute time via
+/// [`ResourceMap::bind_group`](super::ResourceMap::bind_group).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub struct BindGroupHandle(pub(super) u32);
 
 impl From<BufferHandle> for ResourceId {
     fn from(h: BufferHandle) -> Self {

@@ -1,10 +1,14 @@
 // subchunk_cull.cs.hlsl — GPU frustum cull pass for the sub-chunk prototype.
 //
 // One thread per candidate sub-chunk (MAX_CANDIDATES = 64). Thread 0
-// initialises the indirect-args and count buffers so downstream draws start
-// from a clean slate. After the barrier, every thread tests its candidate
-// against the camera frustum and, if visible, atomically appends its index
-// to the visible list and increments the indirect draw instance count.
+// initialises the transient indirect-args buffer (pool hands back undefined
+// contents). After the barrier, every thread tests its candidate against the
+// camera frustum and, if visible, atomically appends its index to the
+// visible list and increments the indirect draw instance count.
+//
+// The draw-count buffer is a persistent constant = 1 written once at
+// SubchunkTest construction and never touched here; fanout lives in
+// instance_count on the single indirect entry.
 //
 // Binding layout (set 0) — all user bindings consecutive from 1 so the
 // wgpu-hal Vulkan compaction leaves HLSL binding N == VK binding N:
@@ -13,7 +17,6 @@
 //   2: instances    (StorageBuffer<Instance>, read-only)
 //   3: visible      (RWStorageBuffer<uint>)
 //   4: indirect     (RWStorageBuffer<uint4>, one entry = DrawIndirectArgs)
-//   5: count        (RWStorageBuffer<uint>,  one entry)
 #include "include/gpu_consts.hlsl"
 
 struct Camera {
@@ -36,7 +39,6 @@ struct Instance {
 [[vk::binding(2, 0)]] StructuredBuffer<Instance> g_instances;
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint>   g_visible;
 [[vk::binding(4, 0)]] RWStructuredBuffer<uint4>  g_indirect; // uint4 = {vertex_count, instance_count, first_vertex, first_instance}
-[[vk::binding(5, 0)]] RWStructuredBuffer<uint>   g_count;
 
 static const uint  MAX_CANDIDATES = 64u;
 static const float SUB            = 8.0;
@@ -106,17 +108,14 @@ bool frustum_visible(float3 lo, float3 hi) {
 
 [numthreads(64, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint ltid : SV_GroupIndex) {
-    // Thread 0 initialises the indirect-draw entry and draw count. This runs
-    // before any candidate test so every atomic below starts from
-    // instance_count = 0.
+    // Thread 0 initialises the indirect-draw entry. g_indirect is a graph
+    // transient — pool hands back undefined contents — so we must write the
+    // full DrawIndirectArgs here before any atomic increment.
     //
-    // g_indirect holds one DrawIndirectArgs: vertex_count=36, instance_count
-    // starts at 0 and accumulates via InterlockedAdd below.
-    // g_count is the number of draw entries (always 1 — the fanout is in
-    // instance_count, not in additional draw entries).
+    // vertex_count=36 (cube mesh baked into the VS); instance_count starts
+    // at 0 and accumulates via InterlockedAdd below.
     if (ltid == 0u) {
         g_indirect[0] = uint4(36u, 0u, 0u, 0u);
-        g_count[0]    = 1u;
     }
 
     GroupMemoryBarrierWithGroupSync();

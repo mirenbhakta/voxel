@@ -13,7 +13,6 @@
 //! - 2: instances  (StorageReadOnly, 16×MAX) — COMPUTE
 //! - 3: visible    (StorageRW, 4×MAX)        — COMPUTE
 //! - 4: indirect   (StorageRW, 16)           — COMPUTE
-//! - 5: count      (StorageRW, 4)            — COMPUTE
 //!
 //! **Render bind group** (set 0 for `subchunk.vs/.ps.hlsl`):
 //! - 0: GpuConsts  (injected)
@@ -36,7 +35,7 @@ use wgpu::util::DeviceExt;
 
 use crate::device::RendererContext;
 use crate::gpu_consts::{GpuConsts, GpuConstsData};
-use crate::graph::{RenderGraph, TextureHandle};
+use crate::graph::{BufferDesc, RenderGraph, TextureHandle};
 use crate::nodes::{CullArgs, DrawArgs, IndirectArgs, cull, mdi_draw};
 use crate::pipeline::binding::{BindEntry, BindKind, BindingLayout};
 use crate::pipeline::compute::{ComputePipeline, ComputePipelineDescriptor};
@@ -152,36 +151,36 @@ pub fn sphere_occupancy() -> SubchunkOccupancy {
 
 /// Persistent state for the sub-chunk cull + MDI draw pass.
 ///
-/// Owns both pipelines and both bind groups, plus all six persistent buffers.
-/// Camera data is updated per-frame via [`Self::write_camera`] before the
-/// render graph is built.  Instance and occupancy data are committed at
-/// construction and stay fixed for the lifetime of this object.
+/// Owns both pipelines, both binding layouts (needed for per-frame bind group
+/// registration), and all four persistent buffers.  Camera data is updated
+/// per-frame via [`Self::write_camera`] before the render graph is built.
+/// Instance and occupancy data are committed at construction and stay fixed
+/// for the lifetime of this object.
 ///
-/// The render graph imports [`Self::indirect_buf`] and [`Self::count_buf`] as
-/// persistent resources each frame (cheaply Arc-backed).
+/// The `visible` and `indirect` buffers are graph transients — allocated from
+/// the pool each frame and discarded after execute.  `count_buf` is a fixed
+/// persistent constant (holds `[1u32]`) that is never written after
+/// construction; it provides the GPU-side draw count cap.  Both bind groups
+/// are registered per frame via `graph.create_bind_group` inside
+/// [`subchunk_test`].
 pub struct SubchunkTest {
     // --- Pipelines ---
     cull_pipeline   : Arc<ComputePipeline>,
     render_pipeline : Arc<RenderPipeline>,
 
-    // --- Bind groups ---
-    cull_bind_group   : wgpu::BindGroup,
-    render_bind_group : wgpu::BindGroup,
+    // --- Binding layouts (needed for per-frame bind group registration) ---
+    cull_layout   : Arc<BindingLayout>,
+    render_layout : Arc<BindingLayout>,
 
-    // --- Persistent buffers ---
+    // --- Persistent buffers (imported into the graph each frame) ---
     camera_buf    : wgpu::Buffer,
-    // The following three buffers are retained to keep the GPU allocations
-    // alive; they are bound in the cull and render bind groups and accessed
-    // only by the GPU after construction.
-    _instance_buf : wgpu::Buffer,
-    _occ_buf      : wgpu::Buffer,
-    _visible_buf  : wgpu::Buffer,
-    indirect_buf  : wgpu::Buffer,
+    instance_buf  : wgpu::Buffer,
+    occ_buf       : wgpu::Buffer,
     count_buf     : wgpu::Buffer,
 
-    // --- GpuConsts placeholders ---
-    _gpu_consts_cull   : GpuConsts,
-    _gpu_consts_render : GpuConsts,
+    // --- GpuConsts slot-0 holders ---
+    gpu_consts_cull   : GpuConsts,
+    gpu_consts_render : GpuConsts,
 }
 
 // --- SubchunkTest ---
@@ -259,22 +258,6 @@ impl SubchunkTest {
             usage:    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        // The following buffers are cull-output; their contents are undefined
-        // until the cull shader writes them each frame.
-        let visible_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("subchunk_visible"),
-            size:               visible_size,
-            usage:              wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let indirect_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("subchunk_indirect"),
-            size:               indirect_size,
-            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
-            mapped_at_creation: false,
-        });
-
         let count_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("subchunk_count"),
             size:               count_size,
@@ -284,7 +267,12 @@ impl SubchunkTest {
             mapped_at_creation: false,
         });
 
-        // --- Cull binding layout (bindings 1-5) ---
+        // Write the fixed draw count of 1.  After this the buffer is never
+        // written again — on the CPU or the GPU — for the lifetime of this
+        // SubchunkTest.
+        ctx.queue().write_buffer(&count_buf, 0, bytemuck::bytes_of(&1u32));
+
+        // --- Cull binding layout (bindings 1-4) ---
 
         let cull_layout = Arc::new(
             BindingLayout::builder("subchunk_cull")
@@ -306,11 +294,6 @@ impl SubchunkTest {
                 .add_entry(BindEntry {
                     binding:    4,
                     kind:       BindKind::StorageBufferReadWrite { size: indirect_size },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .add_entry(BindEntry {
-                    binding:    5,
-                    kind:       BindKind::StorageBufferReadWrite { size: count_size },
                     visibility: wgpu::ShaderStages::COMPUTE,
                 })
                 .build(ctx),
@@ -397,81 +380,17 @@ impl SubchunkTest {
         let gpu_consts_cull   = GpuConsts::new(ctx, GpuConstsData::default());
         let gpu_consts_render = GpuConsts::new(ctx, GpuConstsData::default());
 
-        // --- Cull bind group ---
-
-        let cull_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("subchunk_cull_bg"),
-            layout:  cull_layout.wgpu_layout(),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding:  0,
-                    resource: gpu_consts_cull.buffer().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  1,
-                    resource: camera_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  2,
-                    resource: instance_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  3,
-                    resource: visible_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  4,
-                    resource: indirect_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  5,
-                    resource: count_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        // --- Render bind group ---
-
-        let render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label:   Some("subchunk_render_bg"),
-            layout:  render_layout.wgpu_layout(),
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding:  0,
-                    resource: gpu_consts_render.buffer().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  1,
-                    resource: camera_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  2,
-                    resource: instance_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  3,
-                    resource: visible_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding:  4,
-                    resource: occ_buf.as_entire_binding(),
-                },
-            ],
-        });
-
         Self {
             cull_pipeline,
             render_pipeline,
-            cull_bind_group,
-            render_bind_group,
+            cull_layout,
+            render_layout,
             camera_buf,
-            _instance_buf: instance_buf,
-            _occ_buf:      occ_buf,
-            _visible_buf:  visible_buf,
-            indirect_buf,
+            instance_buf,
+            occ_buf,
             count_buf,
-            _gpu_consts_cull:   gpu_consts_cull,
-            _gpu_consts_render: gpu_consts_render,
+            gpu_consts_cull,
+            gpu_consts_render,
         }
     }
 
@@ -485,25 +404,41 @@ impl SubchunkTest {
         &self.cull_pipeline
     }
 
-    pub(crate) fn cull_bind_group(&self) -> &wgpu::BindGroup {
-        &self.cull_bind_group
-    }
-
     pub(crate) fn render_pipeline(&self) -> &Arc<RenderPipeline> {
         &self.render_pipeline
     }
 
-    pub(crate) fn render_bind_group(&self) -> &wgpu::BindGroup {
-        &self.render_bind_group
+    pub(crate) fn cull_layout(&self) -> &Arc<BindingLayout> {
+        &self.cull_layout
     }
 
-    /// The persistent indirect-args buffer.  Import this as a graph resource
-    /// each frame via `graph.import_buffer(test.indirect_buf().clone())`.
-    pub(crate) fn indirect_buf(&self) -> &wgpu::Buffer {
-        &self.indirect_buf
+    pub(crate) fn render_layout(&self) -> &Arc<BindingLayout> {
+        &self.render_layout
     }
 
-    /// The persistent draw-count buffer.  Import alongside [`Self::indirect_buf`].
+    pub(crate) fn gpu_consts_cull(&self) -> &GpuConsts {
+        &self.gpu_consts_cull
+    }
+
+    pub(crate) fn gpu_consts_render(&self) -> &GpuConsts {
+        &self.gpu_consts_render
+    }
+
+    pub(crate) fn camera_buf(&self) -> &wgpu::Buffer {
+        &self.camera_buf
+    }
+
+    pub(crate) fn instance_buf(&self) -> &wgpu::Buffer {
+        &self.instance_buf
+    }
+
+    pub(crate) fn occ_buf(&self) -> &wgpu::Buffer {
+        &self.occ_buf
+    }
+
+    /// The persistent draw-count buffer.  Holds `[1u32]` and is never written
+    /// after construction.  Imported as a graph resource each frame to provide
+    /// the GPU-side draw count cap.
     pub(crate) fn count_buf(&self) -> &wgpu::Buffer {
         &self.count_buf
     }
@@ -515,9 +450,11 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// Register the sub-chunk cull + MDI draw passes into `graph`.
 ///
-/// Imports the persistent `indirect_buf` and `count_buf` as graph resources,
-/// dispatches the GPU frustum cull (1 workgroup × 64 threads), then issues a
-/// multi-draw-indirect-count raster pass that draws only the visible sub-chunks.
+/// Imports the four persistent buffers as graph resources, allocates `visible`
+/// and `indirect` as per-frame transients, registers dynamic bind groups for
+/// both passes, dispatches the GPU frustum cull (1 workgroup × 64 threads),
+/// then issues a multi-draw-indirect-count raster pass that draws only the
+/// visible sub-chunks.
 ///
 /// Returns the versioned output handles for the color and depth textures.
 pub fn subchunk_test(
@@ -528,24 +465,73 @@ pub fn subchunk_test(
 )
     -> (TextureHandle, TextureHandle)
 {
-    let indirect = graph.import_buffer(test.indirect_buf().clone());
-    let count    = graph.import_buffer(test.count_buf().clone());
-    let args     = IndirectArgs { indirect, count, max_draws: 1 };
+    // --- Import persistent buffers ---
+    let camera_h   = graph.import_buffer(test.camera_buf().clone());
+    let instance_h = graph.import_buffer(test.instance_buf().clone());
+    let occ_h      = graph.import_buffer(test.occ_buf().clone());
+    let count_h    = graph.import_buffer(test.count_buf().clone());
 
-    let args = cull(
+    // --- Allocate cull outputs as transients ---
+    let visible_size  = (4 * MAX_CANDIDATES) as u64;
+    let indirect_size = 16u64;
+
+    let visible_h = graph.create_buffer("subchunk_visible", BufferDesc {
+        size  : visible_size,
+        usage : wgpu::BufferUsages::STORAGE,
+    });
+
+    let indirect_h = graph.create_buffer("subchunk_indirect", BufferDesc {
+        size  : indirect_size,
+        usage : wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
+    });
+
+    // --- Register dynamic bind groups ---
+    let cull_bg = graph.create_bind_group(
+        "subchunk_cull_bg",
+        test.cull_layout(),
+        test.gpu_consts_cull(),
+        &[
+            (1, camera_h.into()),
+            (2, instance_h.into()),
+            (3, visible_h.into()),
+            (4, indirect_h.into()),
+        ],
+    );
+
+    let render_bg = graph.create_bind_group(
+        "subchunk_render_bg",
+        test.render_layout(),
+        test.gpu_consts_render(),
+        &[
+            (1, camera_h.into()),
+            (2, instance_h.into()),
+            (3, visible_h.into()),
+            (4, occ_h.into()),
+        ],
+    );
+
+    // --- Cull → mdi_draw chain ---
+    let indirect_in = IndirectArgs { indirect: indirect_h, count: count_h, max_draws: 1 };
+
+    let (indirect_out, extras_v) = cull(
         graph,
         test.cull_pipeline(),
-        test.cull_bind_group(),
+        cull_bg,
         &CullArgs { workgroups: [1, 1, 1] },
-        args,
+        indirect_in,
+        &[visible_h],
     );
+
+    // extras_v[0] is the versioned `visible` handle produced by cull.
+    let visible_v = extras_v[0];
 
     mdi_draw(
         graph,
         test.render_pipeline(),
-        test.render_bind_group(),
-        &args,
+        render_bg,
+        &indirect_out,
         &DrawArgs::default(),
+        &[visible_v],
         color,
         depth,
     )
