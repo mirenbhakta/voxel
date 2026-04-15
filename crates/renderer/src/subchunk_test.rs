@@ -1,8 +1,10 @@
 //! Sub-chunk bitmask DDA prototype — 64-instance cull + MDI draw pass.
 //!
 //! Rasterizes up to [`MAX_CANDIDATES`] sub-chunk bounding cubes via
-//! GPU frustum cull → multi-draw-indirect. Each sub-chunk has:
-//! - A world-space [`SubchunkInstance`] (origin + occupancy slot).
+//! GPU frustum + directional-exposure cull → multi-draw-indirect. Each
+//! sub-chunk has:
+//! - A world-space [`SubchunkInstance`] (origin + occupancy slot +
+//!   6-bit directional exposure mask).
 //! - A [`SubchunkOccupancy`] (8×8×8 bitmask, 64 bytes).
 //!
 //! # Binding layouts
@@ -92,26 +94,87 @@ const _: () = assert!(
     "TestCamera must be 64 bytes to match HLSL Camera"
 );
 
-/// Per-sub-chunk instance data: world-space origin and occupancy slot.
+/// Per-sub-chunk instance data: world-space origin plus a packed slot +
+/// exposure-mask word.
 ///
 /// Layout must match the HLSL `Instance` struct (16 bytes):
 /// ```text
-///   int3 origin   (+0)
-///   uint occ_slot (+12)
+///   int3 origin    (+0)
+///   uint slot_mask (+12)
 /// ```
+///
+/// `slot_mask` packs two fields into one `u32` so the CPU/GPU struct stays
+/// 16-aligned (no trailing vec3-alignment padding):
+/// - Low 26 bits: occupancy slot index (space for up to `1 << 26`
+///   candidates; current cap is [`MAX_CANDIDATES`]).
+/// - High 6 bits: directional exposure mask. One bit per face direction,
+///   set when any voxel in the sub-chunk has an exposed face in that
+///   direction:
+///
+/// | bit | direction |
+/// |:---:|:---------:|
+/// | 0   | -X        |
+/// | 1   | +X        |
+/// | 2   | -Y        |
+/// | 3   | +Y        |
+/// | 4   | -Z        |
+/// | 5   | +Z        |
+///
+/// The cull shader uses the mask to reject sub-chunks whose occupied
+/// voxels have no exposed faces in any camera-visible direction — a
+/// DDA-specific rejection with no analog in triangle rendering.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SubchunkInstance {
     /// Voxel-space origin of the `[origin, origin+8)` sub-chunk box.
-    pub origin:   [i32; 3],
-    /// Index into the occupancy storage buffer.
-    pub occ_slot: u32,
+    pub origin:    [i32; 3],
+    /// Low 26 bits: occupancy slot. High 6 bits: exposure mask.
+    /// Prefer [`SubchunkInstance::new`] over constructing directly.
+    pub slot_mask: u32,
 }
 
 const _: () = assert!(
     std::mem::size_of::<SubchunkInstance>() == 16,
     "SubchunkInstance must be 16 bytes to match HLSL Instance"
 );
+
+const SLOT_BITS:    u32 = 26;
+const SLOT_MASK:    u32 = (1 << SLOT_BITS) - 1;
+const EXPOSURE_MAX: u8  = (1 << 6) - 1;
+
+impl SubchunkInstance {
+    /// Build a `SubchunkInstance` from its three logical components.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds panic if `occ_slot >= 2^26` or `exposure_mask > 0x3F`
+    /// (the packed encoding cannot represent either overflow).
+    pub fn new(origin: [i32; 3], occ_slot: u32, exposure_mask: u8) -> Self {
+        debug_assert!(
+            occ_slot <= SLOT_MASK,
+            "occ_slot must fit in {SLOT_BITS} bits",
+        );
+        debug_assert!(
+            exposure_mask <= EXPOSURE_MAX,
+            "exposure_mask must fit in 6 bits",
+        );
+        Self {
+            origin,
+            slot_mask: (occ_slot & SLOT_MASK)
+                     | ((exposure_mask as u32) << SLOT_BITS),
+        }
+    }
+
+    /// Occupancy slot index (low 26 bits of `slot_mask`).
+    pub fn occ_slot(&self) -> u32 {
+        self.slot_mask & SLOT_MASK
+    }
+
+    /// 6-bit directional exposure mask (high 6 bits of `slot_mask`).
+    pub fn exposure_mask(&self) -> u8 {
+        (self.slot_mask >> SLOT_BITS) as u8
+    }
+}
 
 /// 8×8×8 occupancy stored as 8 XY planes, each a 64-bit bitmask.
 ///
@@ -145,6 +208,49 @@ pub fn sphere_occupancy() -> SubchunkOccupancy {
         }
     }
     occ
+}
+
+/// Compute the 6-bit directional exposure mask for a sub-chunk's occupancy.
+///
+/// Treats the sub-chunk as isolated — voxels outside `[0, 8)^3` are empty —
+/// so a voxel face on the outer boundary counts as exposed. Real voxel
+/// worlds would resolve exposure across sub-chunk boundaries; that's a
+/// plumbing concern for the residency control plane when it arrives.
+///
+/// Bit layout matches [`SubchunkInstance`]: 0/1 = -X/+X, 2/3 = -Y/+Y,
+/// 4/5 = -Z/+Z. A fully enclosed shape (like a sphere that doesn't touch
+/// the boundary) still lights up every bit, because each direction has at
+/// least one occupied voxel whose adjacent voxel in that direction is empty.
+pub fn occupancy_exposure(occ: &SubchunkOccupancy) -> u8 {
+    let is_set = |x: i32, y: i32, z: i32| -> bool {
+        if !(0..8).contains(&x) || !(0..8).contains(&y) || !(0..8).contains(&z) {
+            return false;
+        }
+        let bit  = (y as u32) * 8 + (x as u32);
+        let word = (z as u32) * 2 + (bit >> 5);
+        (occ.planes[word as usize] >> (bit & 31)) & 1 == 1
+    };
+
+    let mut mask = 0u8;
+    for z in 0i32..8 {
+        for y in 0i32..8 {
+            for x in 0i32..8 {
+                if !is_set(x, y, z) {
+                    continue;
+                }
+                if !is_set(x - 1, y, z) { mask |= 1 << 0; }
+                if !is_set(x + 1, y, z) { mask |= 1 << 1; }
+                if !is_set(x, y - 1, z) { mask |= 1 << 2; }
+                if !is_set(x, y + 1, z) { mask |= 1 << 3; }
+                if !is_set(x, y, z - 1) { mask |= 1 << 4; }
+                if !is_set(x, y, z + 1) { mask |= 1 << 5; }
+                if mask == EXPOSURE_MAX {
+                    return mask;
+                }
+            }
+        }
+    }
+    mask
 }
 
 // --- SubchunkTest ---

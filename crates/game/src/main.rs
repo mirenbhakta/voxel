@@ -29,7 +29,8 @@ use renderer::{FrameCount, RendererContext, RendererError};
 #[cfg(not(feature = "validation"))]
 use renderer::{
     SUBCHUNK_DEPTH_FORMAT, SUBCHUNK_MAX_CANDIDATES,
-    SubchunkInstance, SubchunkTest, TestCamera, nodes, sphere_occupancy,
+    SubchunkInstance, SubchunkTest, TestCamera, nodes,
+    occupancy_exposure, sphere_occupancy,
 };
 #[cfg(not(feature = "validation"))]
 use renderer::graph::{BufferPool, RenderGraph, TextureDesc, TexturePool};
@@ -189,18 +190,22 @@ impl ApplicationHandler for App {
         ctx.configure_surface(w, h);
 
         // Build a 4×4×4 grid of 8³ sub-chunks spanning world-space [0,32]^3.
-        // Each candidate gets a sphere occupancy.
-        let sphere     = sphere_occupancy();
-        let mut instances = [SubchunkInstance { origin: [0, 0, 0], occ_slot: 0 }; SUBCHUNK_MAX_CANDIDATES];
+        // Each candidate gets a sphere occupancy; the 6-bit directional
+        // exposure mask is derived from the occupancy itself (for a sphere,
+        // all six bits are set — the mask contributes no rejections here).
+        let sphere    = sphere_occupancy();
+        let sphere_ex = occupancy_exposure(&sphere);
+        let mut instances = [SubchunkInstance::new([0, 0, 0], 0, 0); SUBCHUNK_MAX_CANDIDATES];
         let mut occs      = [sphere; SUBCHUNK_MAX_CANDIDATES];
         for z in 0u32..4 {
             for y in 0u32..4 {
                 for x in 0u32..4 {
                     let idx = (z * 16 + y * 4 + x) as usize;
-                    instances[idx] = SubchunkInstance {
-                        origin:   [(x * 8) as i32, (y * 8) as i32, (z * 8) as i32],
-                        occ_slot: idx as u32,
-                    };
+                    instances[idx] = SubchunkInstance::new(
+                        [(x * 8) as i32, (y * 8) as i32, (z * 8) as i32],
+                        idx as u32,
+                        sphere_ex,
+                    );
                     occs[idx] = sphere;
                 }
             }

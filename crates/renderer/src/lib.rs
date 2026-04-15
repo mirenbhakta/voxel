@@ -33,5 +33,6 @@ pub use subchunk_test::{
     SubchunkOccupancy,
     SubchunkTest,
     TestCamera,
+    occupancy_exposure,
     sphere_occupancy,
 };

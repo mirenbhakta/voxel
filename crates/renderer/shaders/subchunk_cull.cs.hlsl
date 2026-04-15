@@ -1,10 +1,17 @@
-// subchunk_cull.cs.hlsl — GPU frustum cull pass for the sub-chunk prototype.
+// subchunk_cull.cs.hlsl — GPU frustum + exposure cull pass for the
+// sub-chunk prototype.
 //
 // One thread per candidate sub-chunk (MAX_CANDIDATES = 64). Thread 0
 // initialises the transient indirect-args buffer (pool hands back undefined
-// contents). After the barrier, every thread tests its candidate against the
-// camera frustum and, if visible, atomically appends its index to the
-// visible list and increments the indirect draw instance count.
+// contents). After the barrier, every thread runs two cheap rejections
+// against its candidate:
+//   1. Frustum test on the [origin, origin+8]^3 AABB.
+//   2. Directional-exposure test: if none of the sub-chunk's face-exposure
+//      bits overlap the camera-visible face directions (derived from the
+//      camera position relative to the AABB), the sub-chunk contributes no
+//      visible surface from this view and is dropped.
+// Survivors atomically append their index to the visible list and
+// increment the indirect draw instance count.
 //
 // The draw-count buffer is a persistent constant = 1 written once at
 // SubchunkTest construction and never touched here; fanout lives in
@@ -14,7 +21,8 @@
 // wgpu-hal Vulkan compaction leaves HLSL binding N == VK binding N:
 //   0: GpuConsts    (injected by BindingLayout, unused here but must be present)
 //   1: Camera       (uniform, 64 bytes)
-//   2: instances    (StorageBuffer<Instance>, read-only)
+//   2: instances    (StorageBuffer<Instance>, read-only; slot_mask carries
+//                   the 6-bit directional exposure mask in its high bits)
 //   3: visible      (RWStorageBuffer<uint>)
 //   4: indirect     (RWStorageBuffer<uint4>, one entry = DrawIndirectArgs)
 #include "include/gpu_consts.hlsl"
@@ -30,9 +38,13 @@ struct Camera {
     float  _pad1;
 };
 
+// slot_mask packs two fields:
+//   low 26 bits: occupancy slot index (unused by the cull shader itself)
+//   high  6 bits: directional exposure mask
+//                 bit 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
 struct Instance {
     int3 origin;
-    uint occ_slot;
+    uint slot_mask;
 };
 
 [[vk::binding(1, 0)]] ConstantBuffer<Camera>     g_camera;
@@ -129,6 +141,29 @@ void main(uint3 tid : SV_DispatchThreadID, uint ltid : SV_GroupIndex) {
     float3   hi   = lo + float3(SUB, SUB, SUB);
 
     if (!frustum_visible(lo, hi)) {
+        return;
+    }
+
+    // Directional-exposure rejection.
+    //
+    // A face direction d is "camera-visible" on this AABB when the camera
+    // lies on the d-facing side of the box. If the camera is between lo
+    // and hi on some axis (inside the box in that axis), both face
+    // directions of that axis can be visible. Use <= / >= for conservative
+    // inclusion at the boundary.
+    //
+    // Bit order matches SubchunkInstance: 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z.
+    float3 cam_pos  = g_camera.pos;
+    uint   relevant = 0u;
+    if (cam_pos.x <= hi.x) relevant |= 1u << 0;
+    if (cam_pos.x >= lo.x) relevant |= 1u << 1;
+    if (cam_pos.y <= hi.y) relevant |= 1u << 2;
+    if (cam_pos.y >= lo.y) relevant |= 1u << 3;
+    if (cam_pos.z <= hi.z) relevant |= 1u << 4;
+    if (cam_pos.z >= lo.z) relevant |= 1u << 5;
+
+    uint exposure = inst.slot_mask >> 26u;
+    if ((exposure & relevant) == 0u) {
         return;
     }
 

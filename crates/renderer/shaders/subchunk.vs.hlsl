@@ -33,9 +33,12 @@ struct Camera {
     float  _pad1;
 };
 
+// slot_mask packs two fields (see SubchunkInstance docs):
+//   low 26 bits: occupancy slot index (what this shader cares about)
+//   high  6 bits: directional exposure mask (consumed by the cull shader)
 struct Instance {
     int3 origin;
-    uint occ_slot;
+    uint slot_mask;
 };
 
 [[vk::binding(1, 0)]] ConstantBuffer<Camera>     g_camera;
@@ -125,6 +128,6 @@ void main(uint vid : SV_VertexID,
     sv_pos      = float4((f / g_camera.aspect) * vx, f * vy, A * vz + B, vz);
     world_pos   = w;
     inside_flag = inside ? 1.0 : 0.0;
-    occ_slot    = inst.occ_slot;
+    occ_slot    = inst.slot_mask & 0x03FFFFFFu;
     origin      = inst.origin;
 }
