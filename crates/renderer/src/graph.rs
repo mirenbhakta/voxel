@@ -29,7 +29,7 @@ use crate::commands::Commands;
 use crate::device::FrameEncoder;
 use crate::frame::FrameIndex;
 use crate::gpu_consts::GpuConsts;
-use crate::pipeline::binding::BindingLayout;
+use crate::pipeline::binding::{BindKind, BindingLayout};
 
 /// Type alias for the per-pass execute closure stored in [`PassData`].
 ///
@@ -518,6 +518,63 @@ impl<'g> PassBuilder<'g> {
         TextureHandle { resource: h.resource, version: new_version }
     }
 
+    /// Auto-record pass accesses from a bind group's layout.
+    ///
+    /// Walks each entry of the bind group's template, pairs it with the
+    /// matching [`BindEntry`](crate::pipeline::binding::BindEntry) in the
+    /// [`BindingLayout`], and records one access per entry:
+    ///
+    /// - [`BindKind::UniformBuffer`] / [`BindKind::StorageBufferReadOnly`]:
+    ///   [`Access::Read`] at the resource's current version.
+    /// - [`BindKind::StorageBufferReadWrite`]: [`Access::Write`] at a
+    ///   newly-minted version.
+    ///
+    /// The returned [`BindGroupWrites`] exposes the post-write versioned
+    /// handle for each read-write binding — needed when downstream passes
+    /// read the resource by an explicit handle (e.g. an indirect-args
+    /// buffer also bound read-write in this bind group).  Reads do not
+    /// produce entries in [`BindGroupWrites`]; callers that need the
+    /// post-read handle simply use the original.
+    ///
+    /// The slot-0 `GpuConsts` entry is never part of the template and is
+    /// skipped here — it is resolved internally at bind-group creation
+    /// and never requires barriers.
+    pub fn use_bind_group(&mut self, bg: BindGroupHandle) -> BindGroupWrites {
+        // One borrow over the template/layout to build a work list, then
+        // a second pass to record accesses without holding the borrow.
+        let work: Vec<(ResourceId, BindKind)> = {
+            let tpl = &self.graph.bind_group_templates[bg.0 as usize];
+            let layout_entries = tpl.layout.entries();
+            tpl.entries.iter().map(|&(binding, res_id)| {
+                let entry = layout_entries.iter()
+                    .find(|e| e.binding == binding)
+                    .unwrap_or_else(|| panic!(
+                        "bind group template entry at slot {binding} has no \
+                         matching layout entry — layout/template mismatch is \
+                         a programmer error",
+                    ));
+                (res_id, entry.kind)
+            }).collect()
+        };
+
+        let mut writes: Vec<(u32, u32)> = Vec::new();
+        for (res_id, kind) in work {
+            match kind {
+                BindKind::UniformBuffer { .. }
+                | BindKind::StorageBufferReadOnly { .. } => {
+                    let version = self.graph.resource_versions[res_id.0 as usize];
+                    self.record_access(res_id.0, version, Access::Read);
+                }
+                BindKind::StorageBufferReadWrite { .. } => {
+                    let new_version = self.next_version(res_id.0);
+                    self.record_access(res_id.0, new_version, Access::Write);
+                    writes.push((res_id.0, new_version));
+                }
+            }
+        }
+        BindGroupWrites { writes }
+    }
+
     /// Set the execute closure for this pass.
     ///
     /// The closure is called during [`CompiledGraph::execute`] with a
@@ -544,6 +601,51 @@ impl<'g> PassBuilder<'g> {
         let v = &mut self.graph.resource_versions[resource as usize];
         *v += 1;
         *v
+    }
+}
+
+// --- BindGroupWrites ---
+
+/// Post-[`use_bind_group`](PassBuilder::use_bind_group) lookup table for
+/// versioned write handles.
+///
+/// For every [`BindKind::StorageBufferReadWrite`] binding in the bind
+/// group, `use_bind_group` mints a new resource version and records a
+/// [`Write`](Access::Write) access.  Callers retrieve the resulting
+/// versioned handle via [`write_of`](Self::write_of) — typically to
+/// thread the output to a downstream pass that reads the same resource
+/// by an explicit handle (outside the bind group).
+///
+/// Read-only bindings do not produce entries here: the graph's version
+/// counter already resolves their read versions implicitly, and downstream
+/// reads of the same resource through another bind group pick up the
+/// latest version at pass-build time.
+pub struct BindGroupWrites {
+    /// `(resource_id, new_version)` pairs in bind-group entry order.
+    writes: Vec<(u32, u32)>,
+}
+
+impl BindGroupWrites {
+    /// Return the versioned handle produced by the bind group's
+    /// read-write binding on `h`'s resource.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `h.resource` is not bound read-write in the bind group
+    /// that produced this `BindGroupWrites`.  A typical cause is looking
+    /// up a read-only binding (the graph has no new version for it —
+    /// use the original handle), or mismatching bind groups between the
+    /// `use_bind_group` call and the `write_of` lookup.
+    pub fn write_of(&self, h: BufferHandle) -> BufferHandle {
+        let (_, version) = *self.writes.iter()
+            .find(|(r, _)| *r == h.resource)
+            .unwrap_or_else(|| panic!(
+                "BindGroupWrites::write_of: resource {} is not a read-write \
+                 binding in this bind group — check the layout kind or \
+                 ensure the correct bind group was passed to use_bind_group",
+                h.resource,
+            ));
+        BufferHandle { resource: h.resource, version }
     }
 }
 
@@ -1391,5 +1493,134 @@ mod tests {
         assert_eq!(*order.lock().unwrap(), ["writer", "reader"]);
 
         pending.release(&mut pool, &mut tex_pool);
+    }
+
+    // -- use_bind_group tests --
+
+    /// `use_bind_group` must derive Read accesses for read-only bindings
+    /// and Write accesses for read-write bindings, producing the same
+    /// barriers that manual `read_buffer` / `write_buffer` would.
+    #[test]
+    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
+    fn use_bind_group_derives_reads_and_writes() {
+        use crate::device::RendererContext;
+        use crate::frame::FrameCount;
+        use crate::gpu_consts::GpuConstsData;
+        use crate::pipeline::binding::{BindEntry, BindKind, BindingLayout};
+
+        let ctx = pollster::block_on(RendererContext::new_headless(
+            FrameCount::new(2).unwrap(),
+        ))
+        .expect("headless GPU context");
+
+        let rw_layout = Arc::new(
+            BindingLayout::builder("rw_layout")
+                .add_entry(BindEntry {
+                    binding:    1,
+                    kind:       BindKind::StorageBufferReadWrite { size: 64 },
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                })
+                .build(&ctx),
+        );
+
+        let ro_layout = Arc::new(
+            BindingLayout::builder("ro_layout")
+                .add_entry(BindEntry {
+                    binding:    1,
+                    kind:       BindKind::StorageBufferReadOnly { size: 64 },
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                })
+                .build(&ctx),
+        );
+
+        let gpu_consts = GpuConsts::new(&ctx, GpuConstsData::default());
+
+        let mut graph = RenderGraph::new();
+
+        let buf = graph.create_buffer("buf", desc());
+
+        let writer_bg = graph.create_bind_group(
+            "writer_bg", &rw_layout, &gpu_consts,
+            &[(1, buf.into())],
+        );
+        let reader_bg = graph.create_bind_group(
+            "reader_bg", &ro_layout, &gpu_consts,
+            &[(1, buf.into())],
+        );
+
+        let buf_v1 = graph.add_pass("writer", |pass| {
+            let w = pass.use_bind_group(writer_bg);
+            w.write_of(buf)
+        });
+
+        let out = graph.create_buffer("out", desc());
+        let out_v1 = graph.add_pass("reader", |pass| {
+            pass.use_bind_group(reader_bg);
+            pass.write_buffer(out)
+        });
+
+        graph.mark_output(buf_v1);
+        graph.mark_output(out_v1);
+
+        let compiled = graph.compile().unwrap();
+        assert_eq!(compiled.pass_names(), ["writer", "reader"]);
+
+        let buf_barriers: Vec<_> = compiled.barriers().iter()
+            .filter(|b| b.resource == ResourceId::from(buf))
+            .collect();
+
+        assert_eq!(buf_barriers.len(), 1);
+        assert_eq!(buf_barriers[0].src,    Access::Write);
+        assert_eq!(buf_barriers[0].dst,    Access::Read);
+        assert_eq!(buf_barriers[0].after,  0);
+        assert_eq!(buf_barriers[0].before, 1);
+    }
+
+    /// Calling `write_of` on a resource that is bound read-only is a
+    /// programmer error (no new version exists for it) and must panic
+    /// with a message that names the read-write constraint.
+    #[test]
+    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
+    #[should_panic(expected = "not a read-write binding")]
+    fn write_of_panics_on_read_only_binding() {
+        use crate::device::RendererContext;
+        use crate::frame::FrameCount;
+        use crate::gpu_consts::GpuConstsData;
+        use crate::pipeline::binding::{BindEntry, BindKind, BindingLayout};
+
+        let ctx = pollster::block_on(RendererContext::new_headless(
+            FrameCount::new(2).unwrap(),
+        ))
+        .expect("headless GPU context");
+
+        let ro_layout = Arc::new(
+            BindingLayout::builder("ro_layout")
+                .add_entry(BindEntry {
+                    binding:    1,
+                    kind:       BindKind::StorageBufferReadOnly { size: 64 },
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                })
+                .build(&ctx),
+        );
+
+        let gpu_consts = GpuConsts::new(&ctx, GpuConstsData::default());
+        let mut graph = RenderGraph::new();
+
+        let buf = graph.create_buffer("buf", desc());
+
+        let bg = graph.create_bind_group(
+            "bg", &ro_layout, &gpu_consts,
+            &[(1, buf.into())],
+        );
+
+        let out = graph.create_buffer("out", desc());
+        let out_v1 = graph.add_pass("use", |pass| {
+            let w = pass.use_bind_group(bg);
+            let _ = w.write_of(buf);
+            pass.write_buffer(out)
+        });
+
+        graph.mark_output(out_v1);
+        let _ = graph.compile();
     }
 }

@@ -1,15 +1,14 @@
 //! Cull node: register a compute pass that populates an
 //! [`IndirectArgs`] pair.
 //!
-//! Takes the pre-allocated [`IndirectArgs`] as input, writes both of its
-//! buffers, and returns the updated (versioned) [`IndirectArgs`] for the
-//! next pass to consume.  Cull does not own allocation — the outer
-//! pipeline calls [`IndirectArgs::new`] once and threads the value
-//! through.
+//! Takes the pre-allocated [`IndirectArgs`] as input and returns the
+//! updated (versioned) [`IndirectArgs`] for the next pass to consume.
+//! Cull does not own allocation — the outer pipeline calls
+//! [`IndirectArgs::new`] once and threads the value through.
 
 use std::sync::Arc;
 
-use crate::graph::{BindGroupHandle, BufferHandle, RenderGraph};
+use crate::graph::{BindGroupHandle, RenderGraph};
 use crate::pipeline::ComputePipeline;
 
 use super::indirect_args::IndirectArgs;
@@ -29,37 +28,38 @@ pub struct CullArgs {
 
 /// Register a cull compute pass into `graph`.
 ///
-/// Declares writes on `indirect.indirect` and on every handle in
-/// `extra_writes`, then dispatches the supplied compute pipeline.  Returns
-/// an updated [`IndirectArgs`] carrying the new versioned `indirect`
-/// handle for downstream passes.  `indirect.count` is passed through
-/// unchanged — when the count buffer is a fixed persistent value that the
-/// cull shader does not touch, it should not be declared as a write.
+/// Declares resource accesses automatically from `bind_group`'s
+/// [`BindingLayout`](crate::pipeline::binding::BindingLayout) — every
+/// read-only binding is registered as a read at its current version, and
+/// every read-write binding is registered as a write at a freshly-minted
+/// version.  Callers therefore do not pass separate read/write lists.
 ///
-/// `extra_writes` covers cull outputs that aren't part of `IndirectArgs`
-/// itself — the visibility list is the canonical example.  Callers receive
-/// the versioned write handles back via the returned vector so downstream
-/// passes can declare reads against the produced version.
+/// The cull output indirect buffer is identified by
+/// `indirect.indirect` — the caller is responsible for ensuring that
+/// resource is also bound **read-write** in `bind_group` (the cull shader
+/// needs storage access to write it, and the graph looks up the
+/// post-write handle via [`BindGroupWrites::write_of`](
+/// crate::graph::BindGroupWrites::write_of)).
+///
+/// `indirect.count` is passed through unchanged: when the count buffer
+/// is a fixed persistent value that the cull shader does not touch, it
+/// should not appear in `bind_group` at all, avoiding a spurious write.
 ///
 /// The cull shader is responsible for initialising the indirect args
 /// before its atomic increment — transient indirect buffers hand back
 /// undefined contents from the pool.
 pub fn cull(
-    graph        : &mut RenderGraph,
-    pipeline     : &Arc<ComputePipeline>,
-    bind_group   : BindGroupHandle,
-    args         : &CullArgs,
-    indirect     : IndirectArgs,
-    extra_writes : &[BufferHandle],
+    graph      : &mut RenderGraph,
+    pipeline   : &Arc<ComputePipeline>,
+    bind_group : BindGroupHandle,
+    args       : &CullArgs,
+    indirect   : IndirectArgs,
 )
-    -> (IndirectArgs, Vec<BufferHandle>)
+    -> IndirectArgs
 {
     graph.add_pass("cull", |pass| {
-        let indirect_v = pass.write_buffer(indirect.indirect);
-        let extra_v: Vec<BufferHandle> = extra_writes
-            .iter()
-            .map(|&h| pass.write_buffer(h))
-            .collect();
+        let writes     = pass.use_bind_group(bind_group);
+        let indirect_v = writes.write_of(indirect.indirect);
         let pipeline   = Arc::clone(pipeline);
         let workgroups = args.workgroups;
 
@@ -68,11 +68,10 @@ pub fn cull(
             ctx.commands.dispatch(&pipeline, bg, workgroups, &[]);
         });
 
-        let out = IndirectArgs {
+        IndirectArgs {
             indirect  : indirect_v,
             count     : indirect.count,
             max_draws : indirect.max_draws,
-        };
-        (out, extra_v)
+        }
     })
 }

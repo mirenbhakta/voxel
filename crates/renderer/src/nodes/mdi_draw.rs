@@ -2,14 +2,15 @@
 //! with a GPU-sourced draw count, reading the [`IndirectArgs`] produced by
 //! an earlier pass (typically [`cull`](super::cull::cull)).
 //!
-//! The graph tracks the indirect-args buffer (read), the count buffer
-//! (read), and the colour / depth attachments (written).  The render
-//! pipeline and bind group are supplied by the caller.
+//! The graph tracks bind-group resource accesses automatically (reads,
+//! since every draw-side bind group entry is read-only), plus the
+//! indirect-args and count buffers (reads, bound outside any bind group
+//! as `INDIRECT` usage) and the colour / depth attachments (writes).
 
 use std::sync::Arc;
 
 use crate::commands::{ColorAttachment, DepthAttachment, RasterPassDesc};
-use crate::graph::{BindGroupHandle, BufferHandle, RenderGraph, TextureHandle};
+use crate::graph::{BindGroupHandle, RenderGraph, TextureHandle};
 use crate::pipeline::RenderPipeline;
 
 use super::indirect_args::IndirectArgs;
@@ -27,21 +28,23 @@ pub struct DrawArgs {}
 
 /// Register an MDI raster pass into `graph`.
 ///
-/// Reads both buffers in `indirect`, reads every handle in `extra_reads`
-/// (the visibility list is the canonical case), writes `color` and `depth`
-/// (both cleared at pass start), and returns the new versioned attachment
-/// handles.  Dispatches via `multi_draw_indirect_count` — the draw count
-/// is read from `indirect.count` on the GPU, capped at `indirect.max_draws`.
-#[allow(clippy::too_many_arguments)]
+/// Declares resource accesses automatically from `bind_group`'s
+/// [`BindingLayout`](crate::pipeline::binding::BindingLayout) (typically
+/// all read-only entries for the draw side) plus explicit reads of
+/// `indirect.indirect` and `indirect.count` (these travel with `INDIRECT`
+/// usage and are not bound through the layout), and writes of `color`
+/// and `depth` (both cleared at pass start).  Returns the new versioned
+/// attachment handles.  Dispatches via `multi_draw_indirect_count` — the
+/// draw count is read from `indirect.count` on the GPU, capped at
+/// `indirect.max_draws`.
 pub fn mdi_draw(
-    graph       : &mut RenderGraph,
-    pipeline    : &Arc<RenderPipeline>,
-    bind_group  : BindGroupHandle,
-    indirect    : &IndirectArgs,
-    _args       : &DrawArgs,
-    extra_reads : &[BufferHandle],
-    color       : TextureHandle,
-    depth       : TextureHandle,
+    graph      : &mut RenderGraph,
+    pipeline   : &Arc<RenderPipeline>,
+    bind_group : BindGroupHandle,
+    indirect   : &IndirectArgs,
+    _args      : &DrawArgs,
+    color      : TextureHandle,
+    depth      : TextureHandle,
 )
     -> (TextureHandle, TextureHandle)
 {
@@ -50,11 +53,9 @@ pub fn mdi_draw(
     let max_draws  = indirect.max_draws;
 
     graph.add_pass("mdi_draw", |pass| {
+        pass.use_bind_group(bind_group);
         pass.read_buffer(indirect_h);
         pass.read_buffer(count_h);
-        for &h in extra_reads {
-            pass.read_buffer(h);
-        }
         let color_v = pass.write_texture(color);
         let depth_v = pass.write_texture(depth);
 

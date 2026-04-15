@@ -619,17 +619,13 @@ pub fn subchunk_test(
     // --- Cull → mdi_draw chain ---
     let indirect_in = IndirectArgs { indirect: indirect_h, count: count_h, max_draws: 1 };
 
-    let (indirect_out, extras_v) = cull(
+    let indirect_out = cull(
         graph,
         test.cull_pipeline(),
         cull_bg,
         &CullArgs { workgroups: [1, 1, 1] },
         indirect_in,
-        &[visible_h],
     );
-
-    // extras_v[0] is the versioned `visible` handle produced by cull.
-    let visible_v = extras_v[0];
 
     mdi_draw(
         graph,
@@ -637,7 +633,6 @@ pub fn subchunk_test(
         render_bg,
         &indirect_out,
         &DrawArgs::default(),
-        &[visible_v],
         color,
         depth,
     )
