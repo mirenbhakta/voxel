@@ -116,12 +116,16 @@ impl RasterPass<'_> {
         self.pass.draw_indirect(indirect_buf, offset);
     }
 
-    /// Record a multi-draw-indirect call.
+    /// Record a multi-draw-indirect call with a CPU-supplied draw count.
     ///
-    /// Requires `wgpu::Features::MULTI_DRAW_INDIRECT` on the device (enabled
-    /// in [`RendererContext`](crate::device::RendererContext)).  Sets `pipeline`
-    /// and `bind_group`, then issues `count` indirect draws reading parameters
-    /// from `indirect_buf` at `offset`.
+    /// Always available on wgpu 29 — emulated with repeated `draw_indirect`
+    /// on backends without native support.  `wgpu::Features::MULTI_DRAW_INDIRECT_COUNT`
+    /// (enabled in [`RendererContext`](crate::device::RendererContext)) guarantees
+    /// this call is not emulated.  Sets `pipeline` and `bind_group`, then issues
+    /// `count` indirect draws reading parameters from `indirect_buf` at `offset`.
+    ///
+    /// For GPU-sourced draw counts (the matching primitive for GPU culling),
+    /// use [`multi_draw_indirect_count`](Self::multi_draw_indirect_count).
     pub fn multi_draw_indirect(
         &mut self,
         pipeline     : &RenderPipeline,
@@ -133,6 +137,35 @@ impl RasterPass<'_> {
         self.pass.set_pipeline(pipeline.inner());
         self.pass.set_bind_group(0, bind_group, &[]);
         self.pass.multi_draw_indirect(indirect_buf, offset, count);
+    }
+
+    /// Record a multi-draw-indirect call with a GPU-sourced draw count.
+    ///
+    /// Requires `wgpu::Features::MULTI_DRAW_INDIRECT_COUNT` on the device
+    /// (enabled in [`RendererContext`](crate::device::RendererContext)).
+    /// Draws up to `max_count` entries from `indirect_buf` at `indirect_offset`,
+    /// stopping at the `u32` value read from `count_buf` at `count_offset`.
+    /// This is the matching primitive for GPU culling: the cull shader writes
+    /// both the indirect args and the count atomically, and the draw reads
+    /// them without a CPU roundtrip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn multi_draw_indirect_count(
+        &mut self,
+        pipeline        : &RenderPipeline,
+        bind_group      : &wgpu::BindGroup,
+        indirect_buf    : &wgpu::Buffer,
+        indirect_offset : u64,
+        count_buf       : &wgpu::Buffer,
+        count_offset    : u64,
+        max_count       : u32,
+    ) {
+        self.pass.set_pipeline(pipeline.inner());
+        self.pass.set_bind_group(0, bind_group, &[]);
+        self.pass.multi_draw_indirect_count(
+            indirect_buf, indirect_offset,
+            count_buf,    count_offset,
+            max_count,
+        );
     }
 
     /// Write `data` into the pipeline's immediate-data block at `offset` bytes.

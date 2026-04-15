@@ -100,7 +100,7 @@ pub fn run() {
         let buf_clone = placeholder.buffer().clone();
 
         let mut graph = RenderGraph::new();
-        let h = graph.import_buffer();
+        let h = graph.import_buffer(buf_clone);
 
         graph.add_pass("validation_noop", |builder| {
             builder.read_buffer(h);
@@ -110,7 +110,7 @@ pub fn run() {
         });
         graph.mark_output(h);
 
-        let mut compiled = match graph.compile() {
+        let compiled = match graph.compile() {
             Ok(g) => g,
             Err(e) => {
                 println!("FAIL (compile error: {e:?})");
@@ -120,8 +120,6 @@ pub fn run() {
                 return;
             }
         };
-
-        compiled.bind(h, buf_clone);
 
         // No `allocate_transients` needed — the graph has no transient
         // resources (only the one imported buffer above).

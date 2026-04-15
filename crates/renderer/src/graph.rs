@@ -56,15 +56,17 @@ impl ResourceMap {
     ///
     /// # Panics
     ///
-    /// Panics if the handle was not bound via [`CompiledGraph::bind`].
-    /// This is a programmer error (invariant: bind all imported handles
-    /// before execute).
+    /// Panics if the handle has no backing buffer.  An imported handle is
+    /// bound at build time by [`RenderGraph::import_buffer`]; a transient
+    /// is bound by [`CompiledGraph::allocate_transients`].  A miss here is
+    /// a programmer error.
     pub fn buffer(&self, handle: BufferHandle) -> &wgpu::Buffer {
         match self.entries[handle.resource as usize]
             .as_ref()
             .unwrap_or_else(|| panic!(
-                "buffer handle (resource={}) not bound — \
-                 call CompiledGraph::bind() before execute",
+                "buffer handle (resource={}) not bound — import via \
+                 RenderGraph::import_buffer or allocate via \
+                 CompiledGraph::allocate_transients",
                 handle.resource,
             ))
         {
@@ -79,13 +81,17 @@ impl ResourceMap {
     ///
     /// # Panics
     ///
-    /// Panics if the handle was not bound via [`CompiledGraph::bind_texture`].
+    /// Panics if the handle has no backing texture.  An imported handle
+    /// is bound at build time by [`RenderGraph::import_texture`]; a
+    /// transient is bound by [`CompiledGraph::allocate_transients`].  A
+    /// miss here is a programmer error.
     pub fn texture(&self, handle: TextureHandle) -> &wgpu::Texture {
         match self.entries[handle.resource as usize]
             .as_ref()
             .unwrap_or_else(|| panic!(
-                "texture handle (resource={}) not bound — \
-                 call CompiledGraph::bind_texture() before execute",
+                "texture handle (resource={}) not bound — import via \
+                 RenderGraph::import_texture or allocate via \
+                 CompiledGraph::allocate_transients",
                 handle.resource,
             ))
         {
@@ -106,13 +112,17 @@ impl ResourceMap {
     ///
     /// # Panics
     ///
-    /// Panics if the handle was not bound via [`CompiledGraph::bind_texture`].
+    /// Panics if the handle has no backing texture.  An imported handle
+    /// is bound at build time by [`RenderGraph::import_texture`]; a
+    /// transient is bound by [`CompiledGraph::allocate_transients`].  A
+    /// miss here is a programmer error.
     pub fn texture_view(&self, handle: TextureHandle) -> &wgpu::TextureView {
         match self.entries[handle.resource as usize]
             .as_ref()
             .unwrap_or_else(|| panic!(
-                "texture handle (resource={}) not bound — \
-                 call CompiledGraph::bind_texture() before execute",
+                "texture handle (resource={}) not bound — import via \
+                 RenderGraph::import_texture or allocate via \
+                 CompiledGraph::allocate_transients",
                 handle.resource,
             ))
         {
@@ -151,9 +161,11 @@ struct PassData {
 
 /// A per-frame render graph.
 ///
-/// Build a graph by calling [`import_buffer`](Self::import_buffer),
-/// [`create_buffer`](Self::create_buffer),
-/// [`create_texture`](Self::create_texture),
+/// Build a graph by calling [`import_buffer`](Self::import_buffer) /
+/// [`import_texture`](Self::import_texture) (for external, caller-owned
+/// resources, which are bound at build time),
+/// [`create_buffer`](Self::create_buffer) /
+/// [`create_texture`](Self::create_texture) (for pool-backed transients),
 /// [`add_pass`](Self::add_pass), and [`mark_output`](Self::mark_output),
 /// then [`compile`](Self::compile) it into a [`CompiledGraph`].
 pub struct RenderGraph {
@@ -165,6 +177,12 @@ pub struct RenderGraph {
     output_versions         : Vec<(u32, u32)>,
     transient_buffer_descs  : Vec<(BufferHandle, BufferDesc, String)>,
     transient_texture_descs : Vec<(TextureHandle, TextureDesc, String)>,
+    /// Imported buffers bound at build time; written into the compiled
+    /// [`ResourceMap`] by [`compile`](Self::compile).
+    imported_buffers        : Vec<(u32, wgpu::Buffer)>,
+    /// Imported textures bound at build time; written into the compiled
+    /// [`ResourceMap`] by [`compile`](Self::compile).
+    imported_textures       : Vec<(u32, wgpu::Texture)>,
 }
 
 impl Default for RenderGraph {
@@ -183,23 +201,34 @@ impl RenderGraph {
             output_versions         : Vec::new(),
             transient_buffer_descs  : Vec::new(),
             transient_texture_descs : Vec::new(),
+            imported_buffers        : Vec::new(),
+            imported_textures       : Vec::new(),
         }
     }
 
-    /// Import a persistent (application-owned) buffer into the graph.
+    /// Import a persistent (application-owned) buffer into the graph,
+    /// binding it to a version-0 handle at build time.
     ///
-    /// Returns a version-0 handle.  Passes that write to it receive a new
-    /// version from [`PassBuilder::write_buffer`].
-    pub fn import_buffer(&mut self) -> BufferHandle {
-        self.alloc_buffer_handle()
+    /// Passes that write to the returned handle receive a new version from
+    /// [`PassBuilder::write_buffer`].  The buffer is resolved directly at
+    /// execute time via [`ResourceMap::buffer`] — no post-compile bind step.
+    pub fn import_buffer(&mut self, buffer: wgpu::Buffer) -> BufferHandle {
+        let handle = self.alloc_buffer_handle();
+        self.imported_buffers.push((handle.resource, buffer));
+        handle
     }
 
-    /// Import a persistent (application-owned) texture into the graph.
+    /// Import a persistent (application-owned) texture into the graph,
+    /// binding it to a version-0 handle at build time.
     ///
-    /// Returns a version-0 handle.  Passes that write to it receive a new
-    /// version from [`PassBuilder::write_texture`].
-    pub fn import_texture(&mut self) -> TextureHandle {
-        self.alloc_texture_handle()
+    /// Passes that write to the returned handle receive a new version from
+    /// [`PassBuilder::write_texture`].  A default [`wgpu::TextureView`] is
+    /// created during [`compile`](Self::compile) and resolved at execute
+    /// time via [`ResourceMap::texture_view`].
+    pub fn import_texture(&mut self, texture: wgpu::Texture) -> TextureHandle {
+        let handle = self.alloc_texture_handle();
+        self.imported_textures.push((handle.resource, texture));
+        handle
     }
 
     /// Create a transient buffer that will be allocated from the pool.
@@ -315,12 +344,25 @@ impl RenderGraph {
             .collect();
 
         let entry_count = self.resource_count as usize;
+        let mut entries: Vec<Option<ResourceEntry>> = (0..entry_count)
+            .map(|_| None)
+            .collect();
+
+        // Pre-fill entries with build-time-bound imports.  Transient entries
+        // are filled later by [`CompiledGraph::allocate_transients`].
+        for (resource, buffer) in self.imported_buffers {
+            entries[resource as usize] = Some(ResourceEntry::Buffer(buffer));
+        }
+        for (resource, texture) in self.imported_textures {
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            entries[resource as usize] = Some(ResourceEntry::Texture(texture, view));
+        }
 
         Ok(CompiledGraph {
             passes,
             barriers               : result.barriers,
             culled_count           : result.culled_count,
-            entries                : (0..entry_count).map(|_| None).collect(),
+            entries,
             transient_buffer_descs,
             transient_texture_descs,
         })
@@ -448,37 +490,14 @@ impl CompiledGraph {
         self.culled_count
     }
 
-    /// Bind an imported buffer handle to its backing GPU buffer.
-    ///
-    /// Call once per imported handle that any live pass references,
-    /// before calling [`execute`](Self::execute).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the handle index is out of range (programmer error).
-    pub fn bind(&mut self, handle: BufferHandle, buffer: wgpu::Buffer) {
-        self.entries[handle.resource as usize] = Some(ResourceEntry::Buffer(buffer));
-    }
-
-    /// Bind an imported texture handle to its backing GPU texture.
-    ///
-    /// Creates a default [`wgpu::TextureView`] for the texture immediately.
-    /// Call once per imported texture handle before [`execute`](Self::execute).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the handle index is out of range (programmer error).
-    pub fn bind_texture(&mut self, handle: TextureHandle, texture: wgpu::Texture) {
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.entries[handle.resource as usize] = Some(ResourceEntry::Texture(texture, view));
-    }
-
     /// Allocate transient buffers and textures from their respective pools.
     ///
-    /// Call after binding all imported handles and before
+    /// Call after [`RenderGraph::compile`] and before
     /// [`execute`](Self::execute).  Each transient resource created during
     /// the build phase (and not culled) is allocated from the appropriate
-    /// pool.
+    /// pool.  Imported resources were bound at build time by
+    /// [`RenderGraph::import_buffer`] / [`RenderGraph::import_texture`] and
+    /// need no further attention.
     pub fn allocate_transients(
         &mut self,
         buf_pool : &mut BufferPool,
@@ -744,16 +763,16 @@ mod tests {
     #[test]
     fn output_buffer_with_no_writer_culls_all() {
         let mut graph = RenderGraph::new();
-        let imported = graph.import_buffer();
+        let orphan = graph.create_buffer("orphan", desc());
 
         let _buf = graph.create_buffer("unrelated_buf", desc());
         graph.add_pass("unrelated", |pass| {
             pass.write_buffer(_buf);
         });
 
-        // Nobody writes imported (version 0 has no producer), so no live pass
+        // Nobody writes orphan (version 0 has no producer), so no live pass
         // is seeded.
-        graph.mark_output(imported);
+        graph.mark_output(orphan);
 
         let compiled = graph.compile().unwrap();
         assert!(compiled.pass_names().is_empty());
@@ -814,17 +833,17 @@ mod tests {
     #[test]
     fn consecutive_reads_produce_no_barrier() {
         let mut graph = RenderGraph::new();
-        let imported = graph.import_buffer();
+        let shared = graph.create_buffer("shared", desc());
 
         let out_a = graph.create_buffer("out_a", desc());
         let out_a_v1 = graph.add_pass("reader_a", |pass| {
-            pass.read_buffer(imported);
+            pass.read_buffer(shared);
             pass.write_buffer(out_a)
         });
 
         let out_b = graph.create_buffer("out_b", desc());
         let out_b_v1 = graph.add_pass("reader_b", |pass| {
-            pass.read_buffer(imported);
+            pass.read_buffer(shared);
             pass.write_buffer(out_b)
         });
 
@@ -834,7 +853,7 @@ mod tests {
         let compiled = graph.compile().unwrap();
 
         let buf_barriers: Vec<_> = compiled.barriers().iter()
-            .filter(|b| b.resource == ResourceId::from(imported))
+            .filter(|b| b.resource == ResourceId::from(shared))
             .collect();
 
         assert!(buf_barriers.is_empty());
@@ -843,16 +862,16 @@ mod tests {
     #[test]
     fn consecutive_writes_produce_barrier() {
         let mut graph = RenderGraph::new();
-        let imported = graph.import_buffer();
+        let shared = graph.create_buffer("shared", desc());
 
-        let imported_v1 = graph.add_pass("writer_a", |pass| pass.write_buffer(imported));
+        let shared_v1 = graph.add_pass("writer_a", |pass| pass.write_buffer(shared));
 
         let out = graph.create_buffer("out", desc());
         let out_v1 = graph.add_pass("writer_b", |pass| {
-            let v2 = pass.write_buffer(imported_v1);
+            let v2 = pass.write_buffer(shared_v1);
             let ov = pass.write_buffer(out);
-            // We need writer_b to depend on imported_v1 via the write chain.
-            // write_buffer(imported_v1) returns imported_v2, but we don't use it
+            // We need writer_b to depend on shared_v1 via the write chain.
+            // write_buffer(shared_v1) returns shared_v2, but we don't use it
             // here — the WAW dependency is encoded in the graph.
             let _ = v2;
             ov
@@ -866,7 +885,7 @@ mod tests {
         assert_eq!(compiled.pass_names(), ["writer_a", "writer_b"]);
 
         let buf_barriers: Vec<_> = compiled.barriers().iter()
-            .filter(|b| b.resource == ResourceId::from(imported))
+            .filter(|b| b.resource == ResourceId::from(shared))
             .collect();
 
         assert_eq!(buf_barriers.len(), 1);
@@ -875,15 +894,15 @@ mod tests {
     }
 
     #[test]
-    fn imported_buffer_write_read_chain() {
+    fn buffer_write_read_chain() {
         let mut graph = RenderGraph::new();
-        let imported = graph.import_buffer();
+        let shared = graph.create_buffer("shared", desc());
 
-        let imported_v1 = graph.add_pass("upload", |pass| pass.write_buffer(imported));
+        let shared_v1 = graph.add_pass("upload", |pass| pass.write_buffer(shared));
 
         let out = graph.create_buffer("out", desc());
         let out_v1 = graph.add_pass("consume", |pass| {
-            pass.read_buffer(imported_v1);
+            pass.read_buffer(shared_v1);
             pass.write_buffer(out)
         });
 
@@ -893,7 +912,7 @@ mod tests {
         assert_eq!(compiled.pass_names(), ["upload", "consume"]);
 
         let buf_barriers: Vec<_> = compiled.barriers().iter()
-            .filter(|b| b.resource == ResourceId::from(imported))
+            .filter(|b| b.resource == ResourceId::from(shared))
             .collect();
 
         assert_eq!(buf_barriers.len(), 1);
@@ -907,7 +926,7 @@ mod tests {
     fn two_writes_produce_different_handles() {
         let mut graph = RenderGraph::new();
 
-        let buf = graph.import_buffer();
+        let buf = graph.create_buffer("buf", desc());
         let v1 = graph.add_pass("writer_a", |pass| pass.write_buffer(buf));
         let v2 = graph.add_pass("writer_b", |pass| pass.write_buffer(v1));
 
@@ -922,7 +941,7 @@ mod tests {
     fn reader_of_first_version_culls_second_writer() {
         let mut graph = RenderGraph::new();
 
-        let buf = graph.import_buffer();
+        let buf = graph.create_buffer("buf", desc());
 
         // writer_a writes v1.
         let v1 = graph.add_pass("writer_a", |pass| pass.write_buffer(buf));
@@ -953,7 +972,7 @@ mod tests {
     fn reader_of_second_version_keeps_both_writers_live() {
         let mut graph = RenderGraph::new();
 
-        let buf = graph.import_buffer();
+        let buf = graph.create_buffer("buf", desc());
 
         let v1 = graph.add_pass("writer_a", |pass| pass.write_buffer(buf));
         let v2 = graph.add_pass("writer_b", |pass| pass.write_buffer(v1));
@@ -997,12 +1016,12 @@ mod tests {
             mapped_at_creation: false,
         });
 
-        let mut graph = RenderGraph::new();
-        let h = graph.import_buffer();
-
         let expected = gpu_buf.clone();
         let ran = std::sync::Arc::new(AtomicBool::new(false));
         let ran_clone = ran.clone();
+
+        let mut graph = RenderGraph::new();
+        let h = graph.import_buffer(gpu_buf);
 
         let out = graph.create_buffer("out", desc());
         let h_v1 = graph.add_pass("resolve_test", |pass| {
@@ -1019,8 +1038,7 @@ mod tests {
         });
         graph.mark_output(h_v1);
 
-        let mut compiled = graph.compile().unwrap();
-        compiled.bind(h, gpu_buf);
+        let compiled = graph.compile().unwrap();
 
         let mut encoder = ctx.begin_frame();
         let frame = ctx.frame_index();
@@ -1054,19 +1072,6 @@ mod tests {
         assert_eq!(compiled.pass_names(), ["live"]);
         assert_eq!(compiled.transient_buffer_descs.len(), 1);
         assert_eq!(compiled.transient_buffer_descs[0].1.size, 512);
-    }
-
-    #[test]
-    fn no_transients_yields_empty_descs() {
-        let mut graph = RenderGraph::new();
-        let imported = graph.import_buffer();
-
-        let imported_v1 = graph.add_pass("writer", |pass| pass.write_buffer(imported));
-        graph.mark_output(imported_v1);
-
-        let compiled = graph.compile().unwrap();
-        assert!(compiled.transient_buffer_descs.is_empty());
-        assert!(compiled.transient_texture_descs.is_empty());
     }
 
     #[test]
@@ -1134,8 +1139,15 @@ mod tests {
         let mut pool = BufferPool::new();
         let mut tex_pool = TexturePool::new();
 
+        let gpu_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test_imported"),
+            size: 64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         let mut graph = RenderGraph::new();
-        let imported = graph.import_buffer();
+        let imported = graph.import_buffer(gpu_buf);
 
         let ran = std::sync::Arc::new(AtomicBool::new(false));
         let ran_clone = ran.clone();
@@ -1159,15 +1171,6 @@ mod tests {
         graph.mark_output(transient_v1);
 
         let mut compiled = graph.compile().unwrap();
-
-        // Bind imported buffer.
-        let gpu_buf = ctx.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("test_imported"),
-            size: 64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        compiled.bind(imported, gpu_buf);
 
         // Allocate transients from the pools.
         compiled.allocate_transients(&mut pool, &mut tex_pool, ctx.device());

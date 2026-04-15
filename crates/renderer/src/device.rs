@@ -71,7 +71,8 @@ impl RendererContext {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("renderer_headless_device"),
                 required_features: wgpu::Features::PASSTHROUGH_SHADERS
-                    | wgpu::Features::IMMEDIATES,
+                    | wgpu::Features::IMMEDIATES
+                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
                 required_limits: wgpu::Limits {
                     max_immediate_size: 8,
                     ..wgpu::Limits::default()
@@ -174,7 +175,8 @@ impl RendererContext {
             .request_device(&wgpu::DeviceDescriptor {
                 label            : Some("renderer_windowed_device"),
                 required_features: wgpu::Features::PASSTHROUGH_SHADERS
-                    | wgpu::Features::IMMEDIATES,
+                    | wgpu::Features::IMMEDIATES
+                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
                 required_limits  : wgpu::Limits {
                     max_immediate_size: 8,
                     ..wgpu::Limits::default()

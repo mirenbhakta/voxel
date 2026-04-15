@@ -3,8 +3,19 @@
 //!
 //! Each pool manages a free-list of reusable GPU resources keyed by their
 //! descriptor.  Resources are acquired during graph execution and returned
-//! via [`PendingRelease`] once the GPU has finished the submit that
-//! referenced them.
+//! via [`PendingRelease`] immediately after the frame's submit — no fence
+//! wait.  Pool entries may still be referenced by an in-flight GPU
+//! submission when they re-enter the free-list; wgpu's inter-submission
+//! tracker inserts the necessary barriers when the next frame reuses the
+//! same physical resource (write-after-read between frames is safe).
+//!
+//! This is the **1-frame-lifetime** path, appropriate for resources that
+//! are fully written and consumed inside a single submission (MDI indirect
+//! buffers, transient depth targets, compute scratch).  A fence-gated
+//! multi-frame variant (e.g. `create_readback_buffer`) is not yet
+//! implemented; it will be needed for shadow-ledger retirement and any
+//! CPU-readback path where the CPU must hold the GPU-written buffer alive
+//! across frames until the fence signals.
 //!
 //! Pools never shrink — they converge to steady-state over the first few
 //! frames as the graph's transient demand stabilises.
@@ -197,11 +208,17 @@ impl Default for TexturePool {
 
 // --- PendingRelease ---
 
-/// Transient resources awaiting GPU completion before they can be recycled.
+/// Transient resources to return to the pools after the frame's submit.
 ///
 /// Returned by [`CompiledGraph::execute`](super::CompiledGraph::execute).
-/// Hold this until the GPU submit that used these resources has completed,
-/// then call [`release`](Self::release) to return them to the pools.
+/// Call [`release`](Self::release) immediately after `queue.submit` (or
+/// after `surface.present`) — no fence wait is required.  wgpu's internal
+/// tracker handles cross-submission hazards when the next frame acquires
+/// the same physical resource from the pool.
+///
+/// This is the 1-frame-lifetime path only.  Resources that the CPU must
+/// hold across frames (readback / shadow-ledger retirement) need a
+/// separate fence-gated release path, not yet implemented.
 ///
 /// Dropping without calling `release` is safe (wgpu cleans up the
 /// underlying GPU resources) but wastes pool capacity — the pools will

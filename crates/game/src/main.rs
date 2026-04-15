@@ -169,7 +169,7 @@ impl ApplicationHandler for App {
                 };
 
                 let mut graph = RenderGraph::new();
-                let color = graph.import_texture();
+                let color = graph.import_texture(surface_frame.texture_clone());
                 let depth = graph.create_texture(
                     "subchunk_depth",
                     TextureDesc::new_2d(
@@ -182,7 +182,6 @@ impl ApplicationHandler for App {
                 graph.present(color_v);
 
                 let mut compiled = graph.compile().expect("render graph compile");
-                compiled.bind_texture(color, surface_frame.texture_clone());
                 compiled.allocate_transients(
                     &mut self.buf_pool, &mut self.tex_pool, ctx.device(),
                 );
