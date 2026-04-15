@@ -13,23 +13,32 @@ pub struct BufferDesc {
 
 // --- BufferHandle ---
 
-/// Opaque handle to a buffer resource in the render graph.
+/// SSA-versioned handle to a buffer resource in the render graph.
+///
+/// Each write to a resource mints a new version.  Passes declare reads against
+/// a specific version (pinning the dependency on the write that produced it)
+/// and produce a new version when they write.  The `resource` field identifies
+/// the physical resource; `version` identifies which write produced this state.
 ///
 /// Handles are [`Copy`] so pass execute closures can capture them without
-/// borrowing the graph builder.  The inner index is meaningful only to the
-/// [`RenderGraph`](super::RenderGraph) that issued it.
+/// borrowing the graph builder.  The inner fields are meaningful only to the
+/// [`RenderGraph`](super::RenderGraph) that issued the handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct BufferHandle(pub(super) u32);
+pub struct BufferHandle {
+    pub(super) resource : u32,
+    pub(super) version  : u32,
+}
 
 // --- TextureHandle ---
 
-/// Opaque handle to a texture resource in the render graph.
+/// SSA-versioned handle to a texture resource in the render graph.
 ///
-/// Handles are [`Copy`] so pass execute closures can capture them without
-/// borrowing the graph builder.  The inner index is meaningful only to the
-/// [`RenderGraph`](super::RenderGraph) that issued it.
+/// Same versioning semantics as [`BufferHandle`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct TextureHandle(pub(super) u32);
+pub struct TextureHandle {
+    pub(super) resource : u32,
+    pub(super) version  : u32,
+}
 
 // --- ResourceId ---
 
@@ -37,30 +46,31 @@ pub struct TextureHandle(pub(super) u32);
 ///
 /// Both [`BufferHandle`] and [`TextureHandle`] convert into `ResourceId` via
 /// [`From`].  Used in barrier metadata to identify the transitioning resource
-/// without distinguishing its type.
+/// without distinguishing its type or version — barriers are GPU-level and
+/// care only about resource identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct ResourceId(pub u32);
 
 impl From<BufferHandle> for ResourceId {
     fn from(h: BufferHandle) -> Self {
-        ResourceId(h.0)
+        ResourceId(h.resource)
     }
 }
 
 impl From<TextureHandle> for ResourceId {
     fn from(h: TextureHandle) -> Self {
-        ResourceId(h.0)
+        ResourceId(h.resource)
     }
 }
 
 // --- Access ---
 
-/// How a pass accesses a buffer.
+/// How a pass accesses a resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Access {
-    /// The pass reads the buffer.
+    /// The pass reads the resource.
     Read,
-    /// The pass writes (or overwrites) the buffer.
+    /// The pass writes (or overwrites) the resource.
     Write,
 }
 

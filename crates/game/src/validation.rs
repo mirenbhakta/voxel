@@ -57,12 +57,14 @@ pub fn run() {
         if buf.len() != 2 {
             println!("FAIL (expected len=2, got {})", buf.len());
             failed += 1;
-        } else {
+        }
+        else {
             buf.flush(&ctx);
             if buf.is_empty() {
                 println!("ok");
                 passed += 1;
-            } else {
+            }
+            else {
                 println!("FAIL (staging not cleared after flush)");
                 failed += 1;
             }
@@ -80,7 +82,8 @@ pub fn run() {
         if actual == expected {
             println!("ok ({expected} bytes)");
             passed += 1;
-        } else {
+        }
+        else {
             println!("FAIL (expected {expected} bytes, GPU reports {actual})");
             failed += 1;
         }
@@ -96,12 +99,12 @@ pub fn run() {
             StagedBuffer::new(&ctx, "validation_graph_placeholder", 4);
         let buf_clone = placeholder.buffer().clone();
 
-        let mut graph: RenderGraph<()> = RenderGraph::new();
+        let mut graph = RenderGraph::new();
         let h = graph.import_buffer();
 
         graph.add_pass("validation_noop", |builder| {
             builder.read_buffer(h);
-            builder.execute(move |_ctx, _encoder, _resources| {
+            builder.execute(move |_ctx| {
                 // No GPU work — just confirms the closure is called.
             });
         });
@@ -124,7 +127,8 @@ pub fn run() {
         // resources (only the one imported buffer above).
 
         let mut fe = ctx.begin_frame();
-        let _ = compiled.execute(&mut (), &mut fe);
+        let frame = ctx.frame_index();
+        let _ = compiled.execute(&mut fe, frame);
         ctx.end_frame(fe);
 
         println!("ok");

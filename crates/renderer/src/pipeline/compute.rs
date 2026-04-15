@@ -24,27 +24,19 @@
 //!
 //! ## wgpu::BindGroup leakage
 //!
-//! [`ComputePipeline::dispatch`] and [`ComputePipeline::dispatch_linear`]
+//! [`Commands::dispatch`](crate::commands::Commands::dispatch) and
+//! [`Commands::dispatch_linear`](crate::commands::Commands::dispatch_linear)
 //! accept a `&wgpu::BindGroup` directly. This is a deliberate exception to
 //! the renderer's containment discipline (principle 3) — a thin wrapper around
 //! `wgpu::BindGroup` would duplicate wgpu semantics without adding any safety
 //! property. The same exception applies to `wgpu::ShaderStages` in
 //! [`BindEntry`](crate::pipeline::binding::BindEntry), documented there.
 //!
-//! ## push_constant_bytes deferral
-//!
-//! The plan's §4.2 sketch included a `push_constant_bytes: u8` field on
-//! [`ComputePipelineDescriptor`] with a `<= 8` assertion. That field is
-//! deliberately absent here: enabling `wgpu::Features::PUSH_CONSTANTS` is a
-//! separate device-feature request that no first-pass shader uses. When the
-//! first caller needs push constants the field lands alongside the feature
-//! flag, and the `<= 8` assertion from §4.2 goes in at that point.
-//!
 //! [`GpuConstsData`]: crate::gpu_consts::GpuConstsData
 
 use std::sync::Arc;
 
-use crate::device::{FrameEncoder, RendererContext};
+use crate::device::RendererContext;
 use crate::pipeline::binding::BindingLayout;
 use crate::shader::ShaderModule;
 
@@ -66,6 +58,9 @@ pub struct ComputePipelineDescriptor<'a> {
     /// both values. Pass `None` to skip the assertion (not recommended — it
     /// exists precisely to catch `[numthreads]` / dispatch-size drift).
     pub expected_workgroup_size: Option<[u32; 3]>,
+    /// Immediate-data byte budget (previously called push constants). `0`
+    /// means the pipeline declares no immediate data.
+    pub immediate_size: u32,
 }
 
 // --- ComputePipeline ---
@@ -129,7 +124,7 @@ impl ComputePipeline {
             ctx.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(desc.label),
                 bind_group_layouts: &[Some(desc.layout.wgpu_layout())],
-                immediate_size: 0,
+                immediate_size: desc.immediate_size,
             });
 
         // Step 2b: create the compute pipeline.
@@ -164,45 +159,14 @@ impl ComputePipeline {
         &self.layout
     }
 
-    /// Record a compute dispatch into `frame`'s command encoder.
-    ///
-    /// `workgroups` is the dispatch grid in workgroups — `[x, y, z]`. To
-    /// dispatch over a flat element count, see [`Self::dispatch_linear`].
-    ///
-    /// `bind_group` leaks `wgpu::BindGroup` through this API; see module-level
-    /// documentation for the rationale.
-    pub fn dispatch(
-        &self,
-        frame: &mut FrameEncoder,
-        bind_group: &wgpu::BindGroup,
-        workgroups: [u32; 3],
-    ) {
-        let mut cpass = frame.encoder_mut().begin_compute_pass(
-            &wgpu::ComputePassDescriptor {
-                label: Some(&self.label),
-                timestamp_writes: None,
-            },
-        );
-        cpass.set_pipeline(&self.pipeline);
-        cpass.set_bind_group(0, bind_group, &[]);
-        cpass.dispatch_workgroups(workgroups[0], workgroups[1], workgroups[2]);
+    /// The debug label this pipeline was constructed with.
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
-    /// Record a 1-D compute dispatch for `count` elements.
-    ///
-    /// Computes the number of workgroups along X as `count.div_ceil(x)` where
-    /// `x` is the first component of [`Self::workgroup_size`]. Y and Z are
-    /// always 1. The shader is responsible for bounds-checking thread IDs
-    /// against `count` when `count` is not a multiple of the workgroup size.
-    pub fn dispatch_linear(
-        &self,
-        frame: &mut FrameEncoder,
-        bind_group: &wgpu::BindGroup,
-        count: u32,
-    ) {
-        let wg = self.workgroup_size[0];
-        let x = count.div_ceil(wg);
-        self.dispatch(frame, bind_group, [x, 1, 1]);
+    /// The underlying wgpu compute pipeline.
+    pub(crate) fn inner(&self) -> &wgpu::ComputePipeline {
+        &self.pipeline
     }
 }
 
@@ -254,6 +218,7 @@ mod tests {
                 shader,
                 layout: layout.clone(),
                 expected_workgroup_size: Some([64, 1, 1]),
+                immediate_size: 0,
             },
         );
 
@@ -311,6 +276,7 @@ mod tests {
                 shader,
                 layout,
                 expected_workgroup_size: Some([32, 1, 1]),
+                immediate_size: 0,
             },
         );
     }

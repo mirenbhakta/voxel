@@ -19,7 +19,9 @@ use std::sync::Arc;
 #[cfg(not(feature = "validation"))]
 use renderer::{FrameCount, RendererContext, RendererError};
 #[cfg(not(feature = "validation"))]
-use renderer::{SubchunkTest, TestCamera, sphere_occupancy};
+use renderer::{SUBCHUNK_DEPTH_FORMAT, SubchunkTest, TestCamera, nodes, sphere_occupancy};
+#[cfg(not(feature = "validation"))]
+use renderer::graph::{BufferPool, RenderGraph, TextureDesc, TexturePool};
 #[cfg(not(feature = "validation"))]
 use winit::{
     application::ApplicationHandler,
@@ -51,7 +53,9 @@ fn main() {
 struct App {
     window:        Option<Arc<Window>>,
     ctx:           Option<RendererContext>,
-    subchunk_test: Option<SubchunkTest>,
+    subchunk_test: Option<Arc<SubchunkTest>>,
+    buf_pool:      BufferPool,
+    tex_pool:      TexturePool,
 }
 
 #[cfg(not(feature = "validation"))]
@@ -95,7 +99,7 @@ impl ApplicationHandler for App {
         ctx.configure_surface(w, h);
 
         let occ  = sphere_occupancy();
-        let test = SubchunkTest::new(&ctx, &occ, w, h);
+        let test = Arc::new(SubchunkTest::new(&ctx, &occ));
         self.subchunk_test = Some(test);
 
         self.ctx = Some(ctx);
@@ -118,9 +122,6 @@ impl ApplicationHandler for App {
                 let h = size.height.max(1);
                 if let Some(ctx) = &mut self.ctx {
                     ctx.configure_surface(w, h);
-                    if let Some(test) = &mut self.subchunk_test {
-                        test.resize(ctx, w, h);
-                    }
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -128,11 +129,18 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let (Some(ctx), Some(window), Some(test)) =
-                    (&mut self.ctx, &self.window, &self.subchunk_test) else { return; };
+                let (Some(ctx), Some(window), Some(test)) = (
+                    self.ctx.as_mut(),
+                    self.window.as_ref(),
+                    self.subchunk_test.as_ref(),
+                ) else {
+                    return;
+                };
 
-                let size = window.inner_size();
-                let aspect = size.width as f32 / size.height.max(1) as f32;
+                let size   = window.inner_size();
+                let w      = size.width.max(1);
+                let h      = size.height.max(1);
+                let aspect = w as f32 / h as f32;
 
                 let camera = TestCamera {
                     pos:     [4.0, 4.0, -5.0],
@@ -145,19 +153,48 @@ impl ApplicationHandler for App {
                     _pad1:   0.0,
                 };
 
-                match ctx.acquire_frame() {
-                    Ok(frame) => {
-                        let mut fe = ctx.begin_frame();
-                        test.draw(ctx, &mut fe, &frame, &camera);
-                        ctx.end_frame(fe);
-                        frame.present();
+                test.write_camera(ctx, &camera);
+
+                let surface_frame = match ctx.acquire_frame() {
+                    Ok(f) => f,
+                    Err(RendererError::SurfaceOutdated) => {
+                        window.request_redraw();
+                        return;
                     }
-                    Err(RendererError::SurfaceOutdated) => {}
                     Err(e) => {
                         eprintln!("fatal frame error: {e}");
                         event_loop.exit();
+                        return;
                     }
-                }
+                };
+
+                let mut graph = RenderGraph::new();
+                let color = graph.import_texture();
+                let depth = graph.create_texture(
+                    "subchunk_depth",
+                    TextureDesc::new_2d(
+                        w, h,
+                        SUBCHUNK_DEPTH_FORMAT,
+                        wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    ),
+                );
+                let (color_v, _depth_v) = nodes::subchunk_test(&mut graph, test, color, depth);
+                graph.present(color_v);
+
+                let mut compiled = graph.compile().expect("render graph compile");
+                compiled.bind_texture(color, surface_frame.texture_clone());
+                compiled.allocate_transients(
+                    &mut self.buf_pool, &mut self.tex_pool, ctx.device(),
+                );
+
+                let mut fe = ctx.begin_frame();
+                let frame  = ctx.frame_index();
+                let pending = compiled.execute(&mut fe, frame);
+                ctx.end_frame(fe);
+
+                surface_frame.present();
+
+                pending.release(&mut self.buf_pool, &mut self.tex_pool);
 
                 window.request_redraw();
             }

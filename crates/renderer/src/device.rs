@@ -70,8 +70,12 @@ impl RendererContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("renderer_headless_device"),
-                required_features: wgpu::Features::PASSTHROUGH_SHADERS,
-                required_limits: wgpu::Limits::default(),
+                required_features: wgpu::Features::PASSTHROUGH_SHADERS
+                    | wgpu::Features::IMMEDIATES,
+                required_limits: wgpu::Limits {
+                    max_immediate_size: 8,
+                    ..wgpu::Limits::default()
+                },
                 ..Default::default()
             })
             .await
@@ -169,8 +173,12 @@ impl RendererContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label            : Some("renderer_windowed_device"),
-                required_features: wgpu::Features::PASSTHROUGH_SHADERS,
-                required_limits  : wgpu::Limits::default(),
+                required_features: wgpu::Features::PASSTHROUGH_SHADERS
+                    | wgpu::Features::IMMEDIATES,
+                required_limits  : wgpu::Limits {
+                    max_immediate_size: 8,
+                    ..wgpu::Limits::default()
+                },
                 ..Default::default()
             })
             .await
@@ -281,15 +289,21 @@ impl RendererContext {
         }
     }
 
-    /// The wgpu device handle. Only visible within the renderer crate —
-    /// external callers interact with the device exclusively through
-    /// primitives (`GpuConsts`, `BindingLayout`, pipelines) per principle 3
-    /// (wgpu is contained behind render abstractions).
-    pub(crate) fn device(&self) -> &wgpu::Device {
+    /// The wgpu device handle.
+    ///
+    /// Exposed publicly because the render graph's transient-pool allocation
+    /// (`CompiledGraph::allocate_transients`) takes `&wgpu::Device` and lives
+    /// above the renderer in callers such as the game crate. Every other
+    /// device use flows through renderer primitives (`GpuConsts`,
+    /// `BindingLayout`, pipelines) per principle 3 (wgpu is contained behind
+    /// render abstractions).
+    pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
 
-    /// The wgpu queue handle. Same visibility rationale as [`Self::device`].
+    /// The wgpu queue handle. `pub(crate)`: queue writes flow through the
+    /// primitives that own their buffers (e.g. `SubchunkTest::write_camera`,
+    /// `GpuConsts::upload_if_dirty`).
     pub(crate) fn queue(&self) -> &wgpu::Queue {
         &self.queue
     }
@@ -328,6 +342,16 @@ impl SurfaceFrame {
     /// construct render passes; external callers use those helpers.
     pub(crate) fn view(&self) -> &wgpu::TextureView {
         &self.view
+    }
+
+    /// A clone of the swapchain image's [`wgpu::Texture`] handle.
+    ///
+    /// The underlying wgpu handle is `Arc`-backed and cheap to clone.
+    /// Callers pass the clone to
+    /// [`CompiledGraph::bind_texture`](crate::graph::CompiledGraph::bind_texture)
+    /// so a graph pass can render into the swapchain image for this frame.
+    pub fn texture_clone(&self) -> wgpu::Texture {
+        self.texture.texture.clone()
     }
 
     /// Present the swapchain image.

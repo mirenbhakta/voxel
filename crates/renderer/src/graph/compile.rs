@@ -53,88 +53,118 @@ pub(super) struct CompileResult {
 pub enum CompileError {
     /// The dependency graph contains a cycle, preventing topological sort.
     ///
-    /// The builder API prevents cycles by construction (handles are issued
-    /// sequentially and cannot refer forward), so this variant exists only
-    /// as a defensive check in the compile algorithm.
+    /// The builder API prevents cycles by construction (write handles are
+    /// returned sequentially and cannot refer forward), so this variant exists
+    /// only as a defensive check in the compile algorithm.
     #[error("render graph contains a dependency cycle")]
     Cycle,
+}
+
+// --- PassAccess ---
+
+/// A single (resource_id, version, access) triple recorded by a pass.
+#[derive(Clone, Copy)]
+pub(super) struct PassAccess {
+    pub resource : u32,
+    pub version  : u32,
+    pub access   : Access,
 }
 
 // --- compile ---
 
 /// Compile the render graph.
 ///
-/// Accepts per-pass resource declarations and output-resource markers.
-/// Returns an execution order (after dead-pass culling), barrier metadata,
-/// and the number of culled passes.
+/// Accepts per-pass resource declarations and the set of live (resource, version)
+/// pairs that are graph outputs.  Returns an execution order (after dead-pass
+/// culling), barrier metadata, and the number of culled passes.
 ///
 /// ## Algorithm
 ///
-/// 1. **Dependency DAG** — built from resource access declarations.  For
-///    each resource, the function tracks the last writer and all readers
-///    since the last write.  Edges encode RAW, WAW, and WAR hazards.
-/// 2. **Topological sort** — Kahn's algorithm.  Fails with
+/// 1. **Producer map** — maps `(resource, version)` to the pass that wrote it.
+///    Version 0 (initial import / creation) has no producer; reads of version 0
+///    add no edge.
+/// 2. **Dependency DAG** — for each read of (R, V): add edge from producer(R, V)
+///    to the reading pass (RAW).  For each write of (R, V_new): add edges from
+///    all passes that accessed (R, V_new-1) into the writer (WAR + WAW) — this
+///    enforces physical-resource ordering even though versions are logically
+///    independent.
+/// 3. **Topological sort** — Kahn's algorithm.  Fails with
 ///    [`CompileError::Cycle`] if the graph contains a cycle.
-/// 3. **Dead-pass culling** — backward reachability from output-resource
-///    writers.  A pass is live if it transitively contributes to an output.
-///    Note: WAW-chained passes are kept alive conservatively (the
-///    superseded writer is not culled even though its output is
-///    overwritten).
-/// 4. **Barrier derivation** — walks execution order and emits a barrier
-///    whenever a resource transitions between incompatible access kinds
-///    (any transition except Read → Read).
+/// 4. **Dead-pass culling** — backward reachability from the passes that
+///    produced the output (resource, version) pairs.
+/// 5. **Barrier derivation** — walks execution order and emits a barrier
+///    whenever a resource (by identity, ignoring version) transitions between
+///    incompatible access kinds (any transition except Read → Read).
 pub(super) fn compile(
-    pass_accesses    : &[Vec<(u32, Access)>],
-    output_resources : &[ResourceId],
+    pass_accesses    : &[Vec<PassAccess>],
+    output_versions  : &[(u32, u32)],   // (resource, version) pairs
     resource_count   : usize,
 )
     -> Result<CompileResult, CompileError>
 {
     let pass_count = pass_accesses.len();
 
-    // -- 1. Build dependency DAG --
+    // -- 1. Build producer map and per-resource access tracking --
+
+    // Maps (resource, version) → producing pass index.
+    // Version 0 is never in this map (no producer).
+    let mut producer: std::collections::HashMap<(u32, u32), usize> =
+        std::collections::HashMap::new();
+
+    // Per-resource: last writer pass and all passes that accessed the previous
+    // version (for WAR + WAW dependency insertion).
+    let mut last_writer         : Vec<Option<usize>> = vec![None; resource_count];
+    let mut readers_since_write : Vec<Vec<usize>>    = vec![vec![]; resource_count];
+
+    for (pass, accesses) in pass_accesses.iter().enumerate() {
+        for &pa in accesses {
+            if pa.access == Access::Write {
+                producer.insert((pa.resource, pa.version), pass);
+            }
+        }
+    }
+
+    // -- 2. Build dependency DAG --
 
     let mut edges     : Vec<Vec<usize>> = vec![vec![]; pass_count];
     let mut in_degree : Vec<usize>      = vec![0; pass_count];
 
-    // Per-resource tracking: last writer and readers since last write.
-    let mut last_writer        : Vec<Option<usize>> = vec![None; resource_count];
-    let mut readers_since_write: Vec<Vec<usize>>    = vec![vec![]; resource_count];
+    for (pass, accesses) in pass_accesses.iter().enumerate() {
+        for &pa in accesses {
+            let r = pa.resource as usize;
 
-    for (pass, pass_access_list) in pass_accesses.iter().enumerate() {
-        // Explicit read/write declarations.
-        for &(idx, access) in pass_access_list {
-            let b = idx as usize;
-
-            match access {
+            match pa.access {
                 Access::Read => {
-                    // RAW: depend on last writer.
-                    if let Some(writer) = last_writer[b] {
+                    // RAW: depend on the pass that produced (resource, version).
+                    // Version 0 has no producer — no edge.
+                    if pa.version > 0
+                        && let Some(&writer) = producer.get(&(pa.resource, pa.version))
+                    {
                         add_edge(&mut edges, &mut in_degree, writer, pass);
                     }
 
-                    readers_since_write[b].push(pass);
+                    readers_since_write[r].push(pass);
                 }
 
                 Access::Write => {
-                    // WAW: depend on previous writer.
-                    if let Some(prev) = last_writer[b] {
-                        add_edge(&mut edges, &mut in_degree, prev, pass);
+                    // WAW: depend on the previous writer of this physical resource.
+                    if let Some(prev_writer) = last_writer[r] {
+                        add_edge(&mut edges, &mut in_degree, prev_writer, pass);
                     }
 
-                    // WAR: depend on all readers since last write.
-                    for &reader in &readers_since_write[b] {
+                    // WAR: depend on all readers of the previous version.
+                    for &reader in &readers_since_write[r] {
                         add_edge(&mut edges, &mut in_degree, reader, pass);
                     }
 
-                    last_writer[b] = Some(pass);
-                    readers_since_write[b].clear();
+                    last_writer[r] = Some(pass);
+                    readers_since_write[r].clear();
                 }
             }
         }
     }
 
-    // -- 2. Topological sort (Kahn's algorithm) --
+    // -- 3. Topological sort (Kahn's algorithm) --
 
     let mut queue = VecDeque::new();
 
@@ -162,13 +192,18 @@ pub(super) fn compile(
         return Err(CompileError::Cycle);
     }
 
-    // -- 3. Dead-pass culling --
+    // -- 4. Dead-pass culling --
 
     let mut live = vec![false; pass_count];
 
-    // Seed: last writer of each output resource is live.
-    for res in output_resources {
-        if let Some(writer) = last_writer[res.0 as usize] {
+    // Seed: the pass that produced each output (resource, version) is live.
+    for &(resource, version) in output_versions {
+        if version == 0 {
+            // Version 0 has no producer; no pass is seeded.
+            continue;
+        }
+
+        if let Some(&writer) = producer.get(&(resource, version)) {
             live[writer] = true;
         }
     }
@@ -197,10 +232,10 @@ pub(super) fn compile(
         .filter(|&i| live[i])
         .collect();
 
-    // -- 4. Barrier derivation --
+    // -- 5. Barrier derivation --
 
-    // Per-resource: last (access kind, execution-order position).
-    let mut buf_last: Vec<Option<(Access, usize)>> = vec![None; resource_count];
+    // Per-resource (by identity, version-insensitive): last (access kind, execution-order position).
+    let mut res_last: Vec<Option<(Access, usize)>> = vec![None; resource_count];
     let mut barriers = Vec::new();
 
     for (pos, &pass) in execution_order.iter().enumerate() {
@@ -208,25 +243,25 @@ pub(super) fn compile(
         // Write dominates Read when both appear on the same resource.
         let mut effective: Vec<(usize, Access)> = Vec::new();
 
-        for &(idx, access) in &pass_accesses[pass] {
-            let b = idx as usize;
+        for &pa in &pass_accesses[pass] {
+            let r = pa.resource as usize;
 
-            if let Some(entry) = effective.iter_mut().find(|(i, _)| *i == b) {
-                if access == Access::Write {
+            if let Some(entry) = effective.iter_mut().find(|(i, _)| *i == r) {
+                if pa.access == Access::Write {
                     entry.1 = Access::Write;
                 }
             }
             else {
-                effective.push((b, access));
+                effective.push((r, pa.access));
             }
         }
 
-        for &(b, access) in &effective {
-            if let Some((prev_access, prev_pos)) = buf_last[b] {
+        for &(r, access) in &effective {
+            if let Some((prev_access, prev_pos)) = res_last[r] {
                 // Read → Read needs no barrier.
                 if !(prev_access == Access::Read && access == Access::Read) {
                     barriers.push(Barrier {
-                        resource : ResourceId(b as u32),
+                        resource : ResourceId(r as u32),
                         src      : prev_access,
                         dst      : access,
                         after    : prev_pos,
@@ -235,7 +270,7 @@ pub(super) fn compile(
                 }
             }
 
-            buf_last[b] = Some((access, pos));
+            res_last[r] = Some((access, pos));
         }
     }
 
