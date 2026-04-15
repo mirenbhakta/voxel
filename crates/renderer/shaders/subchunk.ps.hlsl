@@ -1,4 +1,10 @@
-// subchunk.ps.hlsl — isolated sub-chunk ray cast using planar bitmask traversal.
+// subchunk.ps.hlsl — voxel DDA starting from the rasterized sub-chunk hull.
+//
+// The vertex stage rasterizes the [0,8]^3 sub-chunk bounding cube. Each
+// fragment corresponds to a point on the cube's surface (or, once we support
+// the camera-inside-cube case, a point inside it). The DDA starts at that
+// world-space point and marches along the camera → fragment direction — the
+// rasterizer has already done the ray-AABB entry intersection for us.
 //
 // Storage: 8 XY planes, each a 64-bit occupancy bitmask (one bit per voxel in
 // the 8×8 XY grid). Stored as 16 uint32s (2 per Z layer), packed in four
@@ -18,17 +24,6 @@
 // bindings 1 and 2 to silently read the wrong / unbound descriptors.
 #include "include/gpu_consts.hlsl"
 
-// --- Camera (binding 0) ---
-//
-// Matches Rust `TestCamera` layout (64 bytes, repr(C)):
-//   float3 pos     (+0)
-//   float  fov_y   (+12)
-//   float3 forward (+16)
-//   float  aspect  (+28)
-//   float3 right   (+32)
-//   float  _pad0   (+44)
-//   float3 up      (+48)
-//   float  _pad1   (+60)
 struct Camera {
     float3 pos;
     float  fov_y;
@@ -40,20 +35,10 @@ struct Camera {
     float  _pad1;
 };
 
-// --- SubchunkOcc (binding 1) ---
-//
-// Matches Rust `SubchunkOccupancy` layout (64 bytes, repr(C)):
-//   [u32; 16]  (stored as uint4[4] here to guarantee 16-byte element stride)
-//
-// Bit layout: plane[z*2 + (bit/32)] bit (bit%32) = voxel (x,y,z) occupied,
-// where bit = y*8+x.  word = z*2 + bit/32 selects which of the 16 u32s;
-// plane_vec[word/4][word%4] unpacks it.
 struct SubchunkOcc {
     uint4 plane[4];
 };
 
-// Slot 0 holds `g_consts` via gpu_consts.hlsl above (unused here; bound to
-// satisfy wgpu's sequential binding compaction).
 [[vk::binding(1, 0)]] ConstantBuffer<Camera>     g_camera;
 [[vk::binding(2, 0)]] ConstantBuffer<SubchunkOcc> g_occ;
 
@@ -76,20 +61,12 @@ bool get_voxel(int x, int y, int z) {
     return (val >> (bit & 31u)) & 1u;
 }
 
-// --- Ray–AABB intersection for [0,8]^3 ---
-
-bool aabb_hit(float3 ro, float3 rd, out float t0, out float t1) {
-    float3 inv = rcp(rd);
-    float3 ta  = (float3(0, 0, 0) - ro) * inv;
-    float3 tb  = (float3(8, 8, 8) - ro) * inv;
-    float3 tn  = min(ta, tb);
-    float3 tf  = max(ta, tb);
-    t0 = max(max(tn.x, tn.y), tn.z);
-    t1 = min(min(tf.x, tf.y), tf.z);
-    return t1 >= max(t0, 0.0);
-}
-
-// --- Planar bitmask traversal ---
+// --- Planar bitmask traversal from a hull entry point ---
+//
+// `ro` is the world-space entry point on the sub-chunk's surface produced
+// by the rasterizer. The ray direction is computed from the camera, so the
+// march is always "into" the cube from `ro`. We iterate one Z-layer per
+// step and stop when the layer index leaves [0, 7].
 
 struct Hit {
     bool hit;
@@ -99,9 +76,6 @@ struct Hit {
 Hit trace(float3 ro, float3 rd) {
     Hit miss;
     miss.hit = false;
-
-    float t_enter, t_exit;
-    if (!aabb_hit(ro, rd, t_enter, t_exit)) return miss;
 
     // Permute so dominant axis becomes the new "Z".
     float3 a = abs(rd);
@@ -121,11 +95,10 @@ Hit trace(float3 ro, float3 rd) {
         p_rd = rd;
     }
 
-    // Entry into sub-chunk in permuted space.
-    float  t        = max(t_enter, 0.0);
-    float3 entry    = p_ro + p_rd * t;
-    int    iz       = clamp(int(floor(entry.z)), 0, 7);
-    int    iz_step  = (p_rd.z >= 0.0) ? 1 : -1;
+    // We start at the hull, so t begins at 0.
+    float  t       = 0.0;
+    int    iz      = clamp(int(floor(p_ro.z)), 0, 7);
+    int    iz_step = (p_rd.z >= 0.0) ? 1 : -1;
 
     // t at the Z boundary between the current layer and the next.
     float z_boundary = float(iz_step > 0 ? iz + 1 : iz);
@@ -134,7 +107,7 @@ Hit trace(float3 ro, float3 rd) {
 
     [loop]
     for (int iter = 0; iter < 9; iter++) {
-        if (iz < 0 || iz > 7 || t >= t_exit)
+        if (iz < 0 || iz > 7)
             break;
 
         // Ray position at entry of this Z layer (permuted frame).
@@ -166,30 +139,24 @@ Hit trace(float3 ro, float3 rd) {
 
 // --- Pixel shader entry point ---
 
-float4 main(float4 sv_pos : SV_Position,
-            float2 uv     : TEXCOORD0) : SV_Target0 {
-    // Reconstruct world-space ray direction.
-    // uv (0,0) = top-left, (1,1) = bottom-right.
-    // Flip Y so that world +Y is up.
-    float2 ndc      = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    float  half_fov = tan(g_camera.fov_y * 0.5);
-    float3 ray_dir  = normalize(
-        g_camera.forward
-        + ndc.x * half_fov * g_camera.aspect * g_camera.right
-        + ndc.y * half_fov * g_camera.up);
+float4 main(float4 sv_pos      : SV_Position,
+            float3 world_pos   : TEXCOORD0,
+            float  inside_flag : TEXCOORD1) : SV_Target0 {
+    // Ray direction is the view ray through this pixel regardless of which
+    // face rasterized (front for outside-camera, back for inside-camera, or
+    // the near-plane-clipped edge of either) — world_pos stays colinear with
+    // the camera ray through the pixel even when clipped.
+    float3 ray_dir = normalize(world_pos - g_camera.pos);
 
-    // --- Diagnostic: visualise AABB hit vs. sphere hit ---
-    // Red   = ray misses the [0,8]^3 AABB entirely (camera not facing cube).
-    // Blue  = ray enters AABB but hits no occupied voxel (occupancy empty?).
-    // Color = voxel position / 7 when the sphere is hit.
-    // Remove this block once the sphere is confirmed visible.
-    float diag_t0, diag_t1;
-    if (!aabb_hit(g_camera.pos, ray_dir, diag_t0, diag_t1))
-        return float4(1.0, 0.0, 0.0, 1.0);
+    // Ray entry selection:
+    //   inside  → start at the camera itself; world_pos is on the far face
+    //             (or the near-plane clip edge) and is not a valid entry.
+    //   outside → start at the rasterized front-face hull point.
+    float3 ray_origin = (inside_flag > 0.5) ? g_camera.pos : world_pos;
 
-    Hit h = trace(g_camera.pos, ray_dir);
+    Hit h = trace(ray_origin, ray_dir);
     if (!h.hit)
-        return float4(0.0, 0.0, 1.0, 1.0);
+        return float4(0.0, 0.0, 1.0, 1.0); // blue: entered hull, no occupied voxel
 
     // Voxel position (0..7) mapped to RGB (0..1).
     float3 col = float3(h.voxel) / 7.0;

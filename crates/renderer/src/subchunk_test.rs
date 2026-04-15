@@ -1,5 +1,9 @@
 //! Isolated sub-chunk bitmask ray cast — prototype render pass.
 //!
+//! Rasterizes the sub-chunk's bounding cube and runs a planar-bitmask DDA
+//! inside the fragment shader, starting from the fragment's world-space hull
+//! position (the rasterizer performs the ray-AABB entry intersection for us).
+//!
 //! Self-contained: bypasses `BindingLayout` and builds its own
 //! `wgpu::RenderPipeline` directly, since `RenderPipeline` in the renderer
 //! crate defers colour targets to the DDA pipeline increment.
@@ -11,7 +15,8 @@
 //!   The SPIR-V passthrough path does not remap bindings, so the shader's
 //!   bindings must match the compacted VK bindings; skipping slot 0 causes
 //!   silent off-by-one binding reads.
-//! - Binding 1: Camera uniform (64 bytes, updated each frame via queue.write_buffer).
+//! - Binding 1: Camera uniform (64 bytes, updated each frame via queue.write_buffer,
+//!   read by both vertex and fragment stages).
 //! - Binding 2: Occupancy uniform (64 bytes, set once via `set_occupancy`).
 
 use bytemuck::{Pod, Zeroable};
@@ -103,22 +108,53 @@ pub fn sphere_occupancy() -> SubchunkOccupancy {
 /// Builds its own wgpu pipeline and bind group, independent of the
 /// renderer's `BindingLayout` / `RenderPipeline` infrastructure. A placeholder
 /// `GpuConsts` is bound at slot 0; see the module doc for why.
+///
+/// Owns its depth texture: the cube rasterization path needs depth so that
+/// overlapping sub-chunks composite correctly. The depth view lives for the
+/// lifetime of the test and is recreated on window resize via [`Self::resize`].
 pub struct SubchunkTest {
     pipeline:      wgpu::RenderPipeline,
     bind_group:    wgpu::BindGroup,
     camera_buf:    wgpu::Buffer,
     occ_buf:       wgpu::Buffer,
+    depth_view:    wgpu::TextureView,
     _gpu_consts:   GpuConsts,
 }
 
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+fn create_depth_view(ctx: &RendererContext, width: u32, height: u32) -> wgpu::TextureView {
+    let texture = ctx.device().create_texture(&wgpu::TextureDescriptor {
+        label:           Some("subchunk_test_depth"),
+        size:            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count:    1,
+        dimension:       wgpu::TextureDimension::D2,
+        format:          DEPTH_FORMAT,
+        usage:           wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats:    &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 impl SubchunkTest {
-    /// Create the test pass for the given surface format.
+    /// Create the test pass for the given surface format and initial window size.
     ///
-    /// Loads shaders, creates the bind group layout, pipelines, and the two
-    /// constant buffers (camera + occupancy).  `occ` is uploaded into the
-    /// occupancy buffer via `create_buffer_init`, which writes the bytes as
-    /// part of buffer creation and avoids any `write_buffer` ordering hazards.
-    pub fn new(ctx: &RendererContext, occ: &SubchunkOccupancy) -> Self {
+    /// Loads shaders, creates the bind group layout, pipelines, the two
+    /// constant buffers (camera + occupancy), and the depth texture. `occ` is
+    /// uploaded into the occupancy buffer via `create_buffer_init`, which
+    /// writes the bytes as part of buffer creation and avoids any
+    /// `write_buffer` ordering hazards.
+    ///
+    /// `width` and `height` are the initial dimensions of the depth texture;
+    /// they must match the swapchain size at creation time and be updated via
+    /// [`Self::resize`] on window resize events.
+    pub fn new(
+        ctx:    &RendererContext,
+        occ:    &SubchunkOccupancy,
+        width:  u32,
+        height: u32,
+    ) -> Self {
         let surface_format = ctx
             .surface_format()
             .expect("SubchunkTest requires a windowed RendererContext");
@@ -156,7 +192,7 @@ impl SubchunkTest {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding:    1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty:                 wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -189,7 +225,9 @@ impl SubchunkTest {
                 immediate_size:       0,
             });
 
-        // Render pipeline: fullscreen triangle, one colour target, no depth.
+        // Render pipeline: sub-chunk cube, CCW front faces with back-face
+        // culling (only the three camera-facing faces rasterize when the
+        // camera is outside), depth-tested with write enabled.
         let pipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label:  Some("subchunk_test_pipeline"),
@@ -201,11 +239,30 @@ impl SubchunkTest {
                     compilation_options: Default::default(),
                 },
                 primitive: wgpu::PrimitiveState {
-                    topology:  wgpu::PrimitiveTopology::TriangleList,
-                    cull_mode: None,
+                    topology:   wgpu::PrimitiveTopology::TriangleList,
+                    // wgpu's Vulkan backend flips Y via a negative viewport
+                    // height, which reverses framebuffer winding relative to
+                    // world-space winding; our cube table is outward-CCW in
+                    // world space, so Cw is the front-face rule.
+                    //
+                    // Back-face culling is on. The vertex shader swaps
+                    // triangle winding for cubes the camera is inside of
+                    // (or near-plane-close to), which inverts which side
+                    // the rasterizer treats as "front" — so inside cubes
+                    // still get fragments via their back faces, while the
+                    // common outside case still pays rasterization cost
+                    // for only 3 of the 6 cube faces.
+                    front_face: wgpu::FrontFace::Cw,
+                    cull_mode:  Some(wgpu::Face::Back),
                     ..Default::default()
                 },
-                depth_stencil: None,
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format:              DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    depth_compare:       Some(wgpu::CompareFunction::Less),
+                    stencil:             wgpu::StencilState::default(),
+                    bias:                wgpu::DepthBiasState::default(),
+                }),
                 multisample:   wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module:      &ps.inner,
@@ -262,11 +319,14 @@ impl SubchunkTest {
             ],
         });
 
+        let depth_view = create_depth_view(ctx, width.max(1), height.max(1));
+
         Self {
             pipeline,
             bind_group,
             camera_buf,
             occ_buf,
+            depth_view,
             _gpu_consts: gpu_consts,
         }
     }
@@ -277,10 +337,18 @@ impl SubchunkTest {
         ctx.queue().write_buffer(&self.occ_buf, 0, bytemuck::bytes_of(occ));
     }
 
+    /// Recreate the depth texture at the new swapchain size. Call from the
+    /// window event loop alongside `RendererContext::configure_surface`.
+    pub fn resize(&mut self, ctx: &RendererContext, width: u32, height: u32) {
+        self.depth_view = create_depth_view(ctx, width.max(1), height.max(1));
+    }
+
     /// Record the sub-chunk test render pass into `fe`.
     ///
-    /// Clears the surface to the background colour and draws a fullscreen
-    /// triangle that ray-casts through the occupancy data.
+    /// Clears the surface to the background colour, clears depth to 1.0,
+    /// and rasterizes the sub-chunk's bounding cube. The fragment shader
+    /// runs a planar-bitmask DDA starting at each fragment's world-space
+    /// hull position.
     pub fn draw(
         &self,
         ctx:    &RendererContext,
@@ -291,7 +359,6 @@ impl SubchunkTest {
         // Upload camera data for this frame.
         ctx.queue().write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(camera));
 
-        // Render pass: clear + fullscreen triangle draw.
         let mut pass = fe.encoder_mut().begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("subchunk_test_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -305,7 +372,14 @@ impl SubchunkTest {
                     store: wgpu::StoreOp::Store,
                 },
             })],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view:        &self.depth_view,
+                depth_ops:   Some(wgpu::Operations {
+                    load:  wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             occlusion_query_set:      None,
             timestamp_writes:         None,
             multiview_mask:           None,
@@ -313,6 +387,6 @@ impl SubchunkTest {
 
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.draw(0..3, 0..1);
+        pass.draw(0..36, 0..1);
     }
 }

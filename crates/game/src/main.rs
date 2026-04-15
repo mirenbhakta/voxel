@@ -90,10 +90,12 @@ impl ApplicationHandler for App {
         .expect("failed to create windowed renderer context");
 
         let size = window.inner_size();
-        ctx.configure_surface(size.width.max(1), size.height.max(1));
+        let w = size.width.max(1);
+        let h = size.height.max(1);
+        ctx.configure_surface(w, h);
 
         let occ  = sphere_occupancy();
-        let test = SubchunkTest::new(&ctx, &occ);
+        let test = SubchunkTest::new(&ctx, &occ, w, h);
         self.subchunk_test = Some(test);
 
         self.ctx = Some(ctx);
@@ -112,8 +114,13 @@ impl ApplicationHandler for App {
             // Reconfigure the swapchain whenever the window is resized.
             // `max(1)` guards against the zero-size case on minimise.
             WindowEvent::Resized(size) => {
+                let w = size.width.max(1);
+                let h = size.height.max(1);
                 if let Some(ctx) = &mut self.ctx {
-                    ctx.configure_surface(size.width.max(1), size.height.max(1));
+                    ctx.configure_surface(w, h);
+                    if let Some(test) = &mut self.subchunk_test {
+                        test.resize(ctx, w, h);
+                    }
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
