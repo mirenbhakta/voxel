@@ -4,6 +4,10 @@
 //! loop management.  The renderer is initialised lazily on the first
 //! `resumed` event so that the surface is always created from a live window.
 //!
+//! A minimal fly-camera controller (WASD + mouse look + Space/Shift for
+//! vertical) is wired in so the scene can be navigated for visual debugging.
+//! Cursor is grabbed on window creation; Escape releases it and exits.
+//!
 //! # Validation feature
 //!
 //! `cargo build --features validation` (or `cargo run --features validation`)
@@ -14,20 +18,28 @@
 // Gating them suppresses dead_code / unused_imports warnings in validation
 // builds.
 #[cfg(not(feature = "validation"))]
+use std::collections::HashSet;
+#[cfg(not(feature = "validation"))]
 use std::sync::Arc;
+#[cfg(not(feature = "validation"))]
+use std::time::Instant;
 
 #[cfg(not(feature = "validation"))]
 use renderer::{FrameCount, RendererContext, RendererError};
 #[cfg(not(feature = "validation"))]
-use renderer::{SUBCHUNK_DEPTH_FORMAT, SubchunkTest, TestCamera, nodes, sphere_occupancy};
+use renderer::{
+    SUBCHUNK_DEPTH_FORMAT, SUBCHUNK_MAX_CANDIDATES,
+    SubchunkInstance, SubchunkTest, TestCamera, nodes, sphere_occupancy,
+};
 #[cfg(not(feature = "validation"))]
 use renderer::graph::{BufferPool, RenderGraph, TextureDesc, TexturePool};
 #[cfg(not(feature = "validation"))]
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{DeviceEvent, DeviceId, ElementState, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowId},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{CursorGrabMode, Window, WindowId},
 };
 
 // ---------------------------------------------------------------------------
@@ -39,23 +51,91 @@ fn main() {
     #[cfg(not(feature = "validation"))]
     {
         let event_loop = EventLoop::new().expect("failed to create event loop");
-        let mut app = App::default();
+        let mut app = App::new();
         event_loop.run_app(&mut app).expect("event loop error");
     }
 }
 
 // ---------------------------------------------------------------------------
 
+/// Camera tuning. Units are world voxels (sub-chunks are 8 voxels wide).
+#[cfg(not(feature = "validation"))]
+const MOVE_SPEED:      f32 = 15.0;
+#[cfg(not(feature = "validation"))]
+const MOVE_SPEED_FAST: f32 = 45.0;
+#[cfg(not(feature = "validation"))]
+const MOUSE_SENS:      f32 = 0.0015;
+/// Clamp pitch just shy of ±90° so `right` (built from world-up × forward)
+/// never degenerates.
+#[cfg(not(feature = "validation"))]
+const PITCH_CLAMP:     f32 = 1.553; // ~89°
+
 /// Application state.  Fields are populated on the first `resumed` event
 /// and remain `Some` for the rest of the session.
 #[cfg(not(feature = "validation"))]
-#[derive(Default)]
 struct App {
     window:        Option<Arc<Window>>,
     ctx:           Option<RendererContext>,
     subchunk_test: Option<Arc<SubchunkTest>>,
     buf_pool:      BufferPool,
     tex_pool:      TexturePool,
+
+    // --- Camera state ---
+    pos:    [f32; 3],
+    yaw:    f32,
+    pitch:  f32,
+    keys:   HashSet<KeyCode>,
+    last_t: Option<Instant>,
+}
+
+#[cfg(not(feature = "validation"))]
+impl App {
+    fn new() -> Self {
+        Self {
+            window:        None,
+            ctx:           None,
+            subchunk_test: None,
+            buf_pool:      BufferPool::default(),
+            tex_pool:      TexturePool::default(),
+            // Starting pose: outside the 4×4×4 grid [0,32]^3, facing +Z.
+            pos:    [16.0, 16.0, -40.0],
+            yaw:    0.0,
+            pitch:  0.0,
+            keys:   HashSet::new(),
+            last_t: None,
+        }
+    }
+}
+
+/// Build an orthonormal camera basis `(forward, right, up)` from yaw + pitch.
+///
+/// Convention: `yaw = 0, pitch = 0` ⇒ `forward = (0, 0, 1)`, `right = (1, 0, 0)`,
+/// `up = (0, 1, 0)` — matches the shader's left-handed basis where
+/// `cross(right, up) = forward`. Yaw rotates around world-up (+Y); pitch tilts
+/// around the camera's right axis.
+#[cfg(not(feature = "validation"))]
+fn camera_basis(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+
+    let forward = [cp * sy, sp, cp * cy];
+
+    // right = normalize(cross(world_up, forward)) with world_up = (0, 1, 0).
+    // cross((0,1,0), (fx,fy,fz)) = (fz, 0, -fx). Normalize in the XZ plane —
+    // pitch is clamped so the length is never zero.
+    let rx  = forward[2];
+    let rz  = -forward[0];
+    let len = (rx * rx + rz * rz).sqrt();
+    let right = [rx / len, 0.0, rz / len];
+
+    // up = cross(forward, right).
+    let up = [
+        forward[1] * right[2] - forward[2] * right[1],
+        forward[2] * right[0] - forward[0] * right[2],
+        forward[0] * right[1] - forward[1] * right[0],
+    ];
+
+    (forward, right, up)
 }
 
 #[cfg(not(feature = "validation"))]
@@ -75,6 +155,16 @@ impl ApplicationHandler for App {
                 .create_window(Window::default_attributes().with_title("voxel"))
                 .expect("failed to create window"),
         );
+
+        // Try to lock the cursor for continuous mouse-look. Locked is
+        // preferred (Wayland native, some X11 compositors). Fall back to
+        // Confined on platforms that reject Locked. If both fail, mouse
+        // motion still works but the cursor escapes the window — acceptable
+        // for a debugging binary.
+        if window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+            let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+        }
+        window.set_cursor_visible(false);
 
         // Vulkan instance — no display handle needed for Vulkan on Linux.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -98,12 +188,47 @@ impl ApplicationHandler for App {
         let h = size.height.max(1);
         ctx.configure_surface(w, h);
 
-        let occ  = sphere_occupancy();
-        let test = Arc::new(SubchunkTest::new(&ctx, &occ));
+        // Build a 4×4×4 grid of 8³ sub-chunks spanning world-space [0,32]^3.
+        // Each candidate gets a sphere occupancy.
+        let sphere     = sphere_occupancy();
+        let mut instances = [SubchunkInstance { origin: [0, 0, 0], occ_slot: 0 }; SUBCHUNK_MAX_CANDIDATES];
+        let mut occs      = [sphere; SUBCHUNK_MAX_CANDIDATES];
+        for z in 0u32..4 {
+            for y in 0u32..4 {
+                for x in 0u32..4 {
+                    let idx = (z * 16 + y * 4 + x) as usize;
+                    instances[idx] = SubchunkInstance {
+                        origin:   [(x * 8) as i32, (y * 8) as i32, (z * 8) as i32],
+                        occ_slot: idx as u32,
+                    };
+                    occs[idx] = sphere;
+                }
+            }
+        }
+
+        let test = Arc::new(SubchunkTest::new(&ctx, &instances, &occs));
         self.subchunk_test = Some(test);
 
         self.ctx = Some(ctx);
         self.window = Some(window);
+    }
+
+    /// Raw device events — used for continuous relative mouse motion.
+    ///
+    /// `WindowEvent::CursorMoved` is absolute position and doesn't work once
+    /// the cursor is locked; `DeviceEvent::MouseMotion` gives deltas that
+    /// keep arriving even when the cursor is pinned.
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            self.yaw   += dx as f32 * MOUSE_SENS;
+            self.pitch -= dy as f32 * MOUSE_SENS;
+            self.pitch  = self.pitch.clamp(-PITCH_CLAMP, PITCH_CLAMP);
+        }
     }
 
     fn window_event(
@@ -128,6 +253,38 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    physical_key: PhysicalKey::Code(code),
+                    state,
+                    repeat,
+                    ..
+                },
+                ..
+            } => {
+                // Escape releases the cursor and exits — single keystroke to
+                // recover from a locked cursor is worth more than the
+                // "escape-to-release-then-click-to-re-grab" dance for a
+                // debugging binary.
+                if code == KeyCode::Escape && state == ElementState::Pressed {
+                    if let Some(window) = &self.window {
+                        let _ = window.set_cursor_grab(CursorGrabMode::None);
+                        window.set_cursor_visible(true);
+                    }
+                    event_loop.exit();
+                    return;
+                }
+
+                // Track held-key state for per-frame integration. Ignore
+                // auto-repeat — only press/release edges matter.
+                if !repeat {
+                    match state {
+                        ElementState::Pressed  => { self.keys.insert(code); }
+                        ElementState::Released => { self.keys.remove(&code); }
+                    }
+                }
+            }
+
             WindowEvent::RedrawRequested => {
                 let (Some(ctx), Some(window), Some(test)) = (
                     self.ctx.as_mut(),
@@ -137,19 +294,55 @@ impl ApplicationHandler for App {
                     return;
                 };
 
+                // Delta time. On the first frame `last_t` is None → dt = 0,
+                // which leaves the camera where resumed() placed it.
+                let now = Instant::now();
+                let dt  = match self.last_t {
+                    Some(t) => (now - t).as_secs_f32(),
+                    None    => 0.0,
+                };
+                self.last_t = Some(now);
+
+                // Integrate input into camera state.
+                let (forward, right, up) = camera_basis(self.yaw, self.pitch);
+                let speed = if self.keys.contains(&KeyCode::ShiftLeft)
+                    || self.keys.contains(&KeyCode::ShiftRight)
+                {
+                    MOVE_SPEED_FAST
+                } else {
+                    MOVE_SPEED
+                };
+                let step = speed * dt;
+
+                let mut mv = [0.0f32; 3];
+                let mut add = |v: [f32; 3], s: f32| {
+                    mv[0] += v[0] * s;
+                    mv[1] += v[1] * s;
+                    mv[2] += v[2] * s;
+                };
+                if self.keys.contains(&KeyCode::KeyW)        { add(forward,  step); }
+                if self.keys.contains(&KeyCode::KeyS)        { add(forward, -step); }
+                if self.keys.contains(&KeyCode::KeyD)        { add(right,    step); }
+                if self.keys.contains(&KeyCode::KeyA)        { add(right,   -step); }
+                if self.keys.contains(&KeyCode::Space)       { add([0.0, 1.0, 0.0],  step); }
+                if self.keys.contains(&KeyCode::ControlLeft) { add([0.0, 1.0, 0.0], -step); }
+                self.pos[0] += mv[0];
+                self.pos[1] += mv[1];
+                self.pos[2] += mv[2];
+
                 let size   = window.inner_size();
                 let w      = size.width.max(1);
                 let h      = size.height.max(1);
                 let aspect = w as f32 / h as f32;
 
                 let camera = TestCamera {
-                    pos:     [4.0, 4.0, -5.0],
+                    pos:     self.pos,
                     fov_y:   std::f32::consts::FRAC_PI_3,
-                    forward: [0.0, 0.0,  1.0],
+                    forward,
                     aspect,
-                    right:   [1.0, 0.0,  0.0],
+                    right,
                     _pad0:   0.0,
-                    up:      [0.0, 1.0,  0.0],
+                    up,
                     _pad1:   0.0,
                 };
 

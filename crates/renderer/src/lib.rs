@@ -28,6 +28,8 @@ pub use pipeline::{RenderPipeline, RenderPipelineDescriptor};
 pub use shader::{ShaderModule, ShaderSource};
 pub use subchunk_test::{
     DEPTH_FORMAT as SUBCHUNK_DEPTH_FORMAT,
+    MAX_CANDIDATES as SUBCHUNK_MAX_CANDIDATES,
+    SubchunkInstance,
     SubchunkOccupancy,
     SubchunkTest,
     TestCamera,
