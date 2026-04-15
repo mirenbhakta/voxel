@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 
-use super::resource::{Access, ResourceId};
+use super::resource::{Access, ResourceHandle, ResourceId};
 
 // --- Barrier ---
 
@@ -62,12 +62,11 @@ pub enum CompileError {
 
 // --- PassAccess ---
 
-/// A single (resource_id, version, access) triple recorded by a pass.
+/// A single (handle, access) pair recorded by a pass.
 #[derive(Clone, Copy)]
 pub(super) struct PassAccess {
-    pub resource : u32,
-    pub version  : u32,
-    pub access   : Access,
+    pub handle : ResourceHandle,
+    pub access : Access,
 }
 
 // --- compile ---
@@ -97,7 +96,7 @@ pub(super) struct PassAccess {
 ///    incompatible access kinds (any transition except Read → Read).
 pub(super) fn compile(
     pass_accesses    : &[Vec<PassAccess>],
-    output_versions  : &[(u32, u32)],   // (resource, version) pairs
+    output_versions  : &[ResourceHandle],
     resource_count   : usize,
 )
     -> Result<CompileResult, CompileError>
@@ -106,9 +105,9 @@ pub(super) fn compile(
 
     // -- 1. Build producer map and per-resource access tracking --
 
-    // Maps (resource, version) → producing pass index.
+    // Maps a versioned handle → producing pass index.
     // Version 0 is never in this map (no producer).
-    let mut producer: std::collections::HashMap<(u32, u32), usize> =
+    let mut producer: std::collections::HashMap<ResourceHandle, usize> =
         std::collections::HashMap::new();
 
     // Per-resource: last writer pass and all passes that accessed the previous
@@ -119,7 +118,7 @@ pub(super) fn compile(
     for (pass, accesses) in pass_accesses.iter().enumerate() {
         for &pa in accesses {
             if pa.access == Access::Write {
-                producer.insert((pa.resource, pa.version), pass);
+                producer.insert(pa.handle, pass);
             }
         }
     }
@@ -131,14 +130,14 @@ pub(super) fn compile(
 
     for (pass, accesses) in pass_accesses.iter().enumerate() {
         for &pa in accesses {
-            let r = pa.resource as usize;
+            let r = pa.handle.resource as usize;
 
             match pa.access {
                 Access::Read => {
-                    // RAW: depend on the pass that produced (resource, version).
+                    // RAW: depend on the pass that produced this handle.
                     // Version 0 has no producer — no edge.
-                    if pa.version > 0
-                        && let Some(&writer) = producer.get(&(pa.resource, pa.version))
+                    if pa.handle.version > 0
+                        && let Some(&writer) = producer.get(&pa.handle)
                     {
                         add_edge(&mut edges, &mut in_degree, writer, pass);
                     }
@@ -196,14 +195,14 @@ pub(super) fn compile(
 
     let mut live = vec![false; pass_count];
 
-    // Seed: the pass that produced each output (resource, version) is live.
-    for &(resource, version) in output_versions {
-        if version == 0 {
+    // Seed: the pass that produced each output handle is live.
+    for &handle in output_versions {
+        if handle.version == 0 {
             // Version 0 has no producer; no pass is seeded.
             continue;
         }
 
-        if let Some(&writer) = producer.get(&(resource, version)) {
+        if let Some(&writer) = producer.get(&handle) {
             live[writer] = true;
         }
     }
@@ -244,7 +243,7 @@ pub(super) fn compile(
         let mut effective: Vec<(usize, Access)> = Vec::new();
 
         for &pa in &pass_accesses[pass] {
-            let r = pa.resource as usize;
+            let r = pa.handle.resource as usize;
 
             if let Some(entry) = effective.iter_mut().find(|(i, _)| *i == r) {
                 if pa.access == Access::Write {

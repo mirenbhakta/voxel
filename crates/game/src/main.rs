@@ -379,15 +379,11 @@ impl ApplicationHandler for App {
                 let (color_v, _depth_v) = nodes::subchunk_test(&mut graph, test, color, depth);
                 graph.present(color_v);
 
-                let mut compiled = graph.compile().expect("render graph compile");
-                compiled.allocate_transients(
-                    &mut self.buf_pool, &mut self.tex_pool, ctx.device(),
-                );
-                compiled.resolve_bind_groups(ctx.device());
-
                 let mut fe = ctx.begin_frame();
                 let frame  = ctx.frame_index();
-                let pending = compiled.execute(&mut fe, frame);
+                let pending = graph.compile()
+                    .expect("render graph compile")
+                    .execute(&mut fe, frame, &mut self.buf_pool, &mut self.tex_pool, ctx.device());
                 ctx.end_frame(fe);
 
                 surface_frame.present();

@@ -11,6 +11,20 @@ pub struct BufferDesc {
     pub usage : wgpu::BufferUsages,
 }
 
+// --- ResourceHandle ---
+
+/// SSA-versioned resource identity: (resource_index, write_version).
+///
+/// Shared implementation detail behind [`BufferHandle`] and [`TextureHandle`].
+/// The typed wrappers preserve static buffer/texture distinction at the public
+/// API boundary; this struct centralises the field pair so handle-agnostic
+/// internals (access recording, entry indexing) touch one place.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(super) struct ResourceHandle {
+    pub(super) resource : u32,
+    pub(super) version  : u32,
+}
+
 // --- BufferHandle ---
 
 /// SSA-versioned handle to a buffer resource in the render graph.
@@ -24,10 +38,7 @@ pub struct BufferDesc {
 /// borrowing the graph builder.  The inner fields are meaningful only to the
 /// [`RenderGraph`](super::RenderGraph) that issued the handle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct BufferHandle {
-    pub(super) resource : u32,
-    pub(super) version  : u32,
-}
+pub struct BufferHandle(pub(super) ResourceHandle);
 
 // --- TextureHandle ---
 
@@ -35,10 +46,7 @@ pub struct BufferHandle {
 ///
 /// Same versioning semantics as [`BufferHandle`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct TextureHandle {
-    pub(super) resource : u32,
-    pub(super) version  : u32,
-}
+pub struct TextureHandle(pub(super) ResourceHandle);
 
 // --- ResourceId ---
 
@@ -70,13 +78,13 @@ pub struct BindGroupHandle(pub(super) u32);
 
 impl From<BufferHandle> for ResourceId {
     fn from(h: BufferHandle) -> Self {
-        ResourceId(h.resource)
+        ResourceId(h.0.resource)
     }
 }
 
 impl From<TextureHandle> for ResourceId {
     fn from(h: TextureHandle) -> Self {
-        ResourceId(h.resource)
+        ResourceId(h.0.resource)
     }
 }
 

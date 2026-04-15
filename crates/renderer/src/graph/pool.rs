@@ -61,11 +61,16 @@ impl BufferPool {
     /// Acquire a buffer matching `desc`.
     ///
     /// Returns a recycled buffer from the free-list when available,
-    /// otherwise allocates a new one from `device`.
+    /// otherwise allocates a new one from `device` with `name` as its wgpu
+    /// debug label.  Recycled buffers keep their original label — wgpu labels
+    /// are immutable and re-labelling on acquire is not supported.  When a
+    /// buffer is recycled with a different logical role, its label reflects
+    /// the name from its first allocation.
     pub fn acquire(
         &mut self,
         device : &wgpu::Device,
         desc   : &BufferDesc,
+        name   : Option<&str>,
     )
         -> wgpu::Buffer
     {
@@ -76,7 +81,7 @@ impl BufferPool {
         }
 
         device.create_buffer(&wgpu::BufferDescriptor {
-            label              : None,
+            label              : name,
             size               : desc.size,
             usage              : desc.usage,
             mapped_at_creation : false,
@@ -167,11 +172,16 @@ impl TexturePool {
     /// Acquire a texture matching `desc`.
     ///
     /// Returns a recycled texture from the free-list when available,
-    /// otherwise allocates a new one from `device`.
+    /// otherwise allocates a new one from `device` with `name` as its wgpu
+    /// debug label.  Recycled textures keep their original label — wgpu labels
+    /// are immutable and re-labelling on acquire is not supported.  When a
+    /// texture is recycled with a different logical role, its label reflects
+    /// the name from its first allocation.
     pub fn acquire(
         &mut self,
         device : &wgpu::Device,
         desc   : &TextureDesc,
+        name   : Option<&str>,
     )
         -> wgpu::Texture
     {
@@ -182,7 +192,7 @@ impl TexturePool {
         }
 
         device.create_texture(&wgpu::TextureDescriptor {
-            label           : None,
+            label           : name,
             size            : desc.size,
             mip_level_count : desc.mip_level_count,
             sample_count    : desc.sample_count,

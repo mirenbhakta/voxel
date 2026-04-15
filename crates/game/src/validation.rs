@@ -121,12 +121,11 @@ pub fn run() {
             }
         };
 
-        // No `allocate_transients` needed — the graph has no transient
-        // resources (only the one imported buffer above).
-
+        let mut buf_pool = renderer::graph::BufferPool::default();
+        let mut tex_pool = renderer::graph::TexturePool::default();
         let mut fe = ctx.begin_frame();
         let frame = ctx.frame_index();
-        let _ = compiled.execute(&mut fe, frame);
+        let _ = compiled.execute(&mut fe, frame, &mut buf_pool, &mut tex_pool, ctx.device());
         ctx.end_frame(fe);
 
         println!("ok");

@@ -22,6 +22,7 @@ pub use pool::{BufferPool, PendingRelease, TexturePool};
 pub use resource::{
     Access, BindGroupHandle, BufferDesc, BufferHandle, ResourceId, TextureDesc, TextureHandle,
 };
+use resource::ResourceHandle;
 
 use std::sync::Arc;
 
@@ -83,17 +84,17 @@ impl ResourceMap {
     /// is bound by [`CompiledGraph::allocate_transients`].  A miss here is
     /// a programmer error.
     pub fn buffer(&self, handle: BufferHandle) -> &wgpu::Buffer {
-        match self.entries[handle.resource as usize]
+        match self.entries[handle.0.resource as usize]
             .as_ref()
             .unwrap_or_else(|| panic!(
                 "buffer handle (resource={}) not bound — import via \
                  RenderGraph::import_buffer or allocate via \
                  CompiledGraph::allocate_transients",
-                handle.resource,
+                handle.0.resource,
             ))
         {
             ResourceEntry::Buffer(b) => b,
-            _ => panic!("handle (resource={}) is a texture, not a buffer", handle.resource),
+            _ => panic!("handle (resource={}) is a texture, not a buffer", handle.0.resource),
         }
     }
 
@@ -108,17 +109,17 @@ impl ResourceMap {
     /// transient is bound by [`CompiledGraph::allocate_transients`].  A
     /// miss here is a programmer error.
     pub fn texture(&self, handle: TextureHandle) -> &wgpu::Texture {
-        match self.entries[handle.resource as usize]
+        match self.entries[handle.0.resource as usize]
             .as_ref()
             .unwrap_or_else(|| panic!(
                 "texture handle (resource={}) not bound — import via \
                  RenderGraph::import_texture or allocate via \
                  CompiledGraph::allocate_transients",
-                handle.resource,
+                handle.0.resource,
             ))
         {
             ResourceEntry::Texture(t, _) => t,
-            _ => panic!("handle (resource={}) is a buffer, not a texture", handle.resource),
+            _ => panic!("handle (resource={}) is a buffer, not a texture", handle.0.resource),
         }
     }
 
@@ -139,17 +140,17 @@ impl ResourceMap {
     /// transient is bound by [`CompiledGraph::allocate_transients`].  A
     /// miss here is a programmer error.
     pub fn texture_view(&self, handle: TextureHandle) -> &wgpu::TextureView {
-        match self.entries[handle.resource as usize]
+        match self.entries[handle.0.resource as usize]
             .as_ref()
             .unwrap_or_else(|| panic!(
                 "texture handle (resource={}) not bound — import via \
                  RenderGraph::import_texture or allocate via \
                  CompiledGraph::allocate_transients",
-                handle.resource,
+                handle.0.resource,
             ))
         {
             ResourceEntry::Texture(_, v) => v,
-            _ => panic!("handle (resource={}) is a buffer, not a texture", handle.resource),
+            _ => panic!("handle (resource={}) is a buffer, not a texture", handle.0.resource),
         }
     }
 
@@ -213,8 +214,8 @@ pub struct RenderGraph {
     resource_count          : u32,
     /// Per-resource current version — incremented each time a pass writes.
     resource_versions       : Vec<u32>,
-    /// Output (resource, version) pairs seeded by mark_output / present.
-    output_versions         : Vec<(u32, u32)>,
+    /// Output resource versions seeded by mark_output / present.
+    output_versions         : Vec<ResourceHandle>,
     transient_buffer_descs  : Vec<(BufferHandle, BufferDesc, String)>,
     transient_texture_descs : Vec<(TextureHandle, TextureDesc, String)>,
     /// Imported buffers bound at build time; written into the compiled
@@ -259,7 +260,7 @@ impl RenderGraph {
     /// execute time via [`ResourceMap::buffer`] — no post-compile bind step.
     pub fn import_buffer(&mut self, buffer: wgpu::Buffer) -> BufferHandle {
         let handle = self.alloc_buffer_handle();
-        self.imported_buffers.push((handle.resource, buffer));
+        self.imported_buffers.push((handle.0.resource, buffer));
         handle
     }
 
@@ -272,7 +273,7 @@ impl RenderGraph {
     /// time via [`ResourceMap::texture_view`].
     pub fn import_texture(&mut self, texture: wgpu::Texture) -> TextureHandle {
         let handle = self.alloc_texture_handle();
-        self.imported_textures.push((handle.resource, texture));
+        self.imported_textures.push((handle.0.resource, texture));
         handle
     }
 
@@ -342,7 +343,7 @@ impl RenderGraph {
     /// The pass that wrote `handle`'s version — and all passes it
     /// transitively depends on — will not be culled during compilation.
     pub fn mark_output(&mut self, handle: BufferHandle) {
-        self.output_versions.push((handle.resource, handle.version));
+        self.output_versions.push(handle.0);
     }
 
     /// Mark a texture version as the frame output (swapchain present target).
@@ -351,7 +352,7 @@ impl RenderGraph {
     /// signals which texture the frame loop should present after submit.
     /// Mechanically it seeds dead-pass culling, just as `mark_output` does.
     pub fn present(&mut self, handle: TextureHandle) {
-        self.output_versions.push((handle.resource, handle.version));
+        self.output_versions.push(handle.0);
     }
 
     /// Declare a new pass.
@@ -401,18 +402,18 @@ impl RenderGraph {
             .flat_map(|&i| {
                 pass_accesses[i].iter()
                     .filter(|pa| pa.access == Access::Write)
-                    .map(|pa| pa.resource)
+                    .map(|pa| pa.handle.resource)
             })
             .collect();
 
         let transient_buffer_descs: Vec<(BufferHandle, BufferDesc, String)> =
             self.transient_buffer_descs.into_iter()
-                .filter(|(h, _, _)| live_writes.contains(&h.resource))
+                .filter(|(h, _, _)| live_writes.contains(&h.0.resource))
                 .collect();
 
         let transient_texture_descs: Vec<(TextureHandle, TextureDesc, String)> =
             self.transient_texture_descs.into_iter()
-                .filter(|(h, _, _)| live_writes.contains(&h.resource))
+                .filter(|(h, _, _)| live_writes.contains(&h.0.resource))
                 .collect();
 
         // Reorder passes into execution order, dropping culled passes.
@@ -467,12 +468,12 @@ impl RenderGraph {
 
     fn alloc_buffer_handle(&mut self) -> BufferHandle {
         let resource = self.alloc_resource();
-        BufferHandle { resource, version: 0 }
+        BufferHandle(ResourceHandle { resource, version: 0 })
     }
 
     fn alloc_texture_handle(&mut self) -> TextureHandle {
         let resource = self.alloc_resource();
-        TextureHandle { resource, version: 0 }
+        TextureHandle(ResourceHandle { resource, version: 0 })
     }
 }
 
@@ -491,7 +492,7 @@ impl<'g> PassBuilder<'g> {
     ///
     /// Pins a dependency on the pass that produced this version.
     pub fn read_buffer(&mut self, h: BufferHandle) {
-        self.record_access(h.resource, h.version, Access::Read);
+        self.record_read(h.0);
     }
 
     /// Declare that this pass writes a buffer, minting a new version.
@@ -499,23 +500,19 @@ impl<'g> PassBuilder<'g> {
     /// Returns the new versioned handle.  Downstream passes that want to
     /// observe this write must use the returned handle.
     pub fn write_buffer(&mut self, h: BufferHandle) -> BufferHandle {
-        let new_version = self.next_version(h.resource);
-        self.record_access(h.resource, new_version, Access::Write);
-        BufferHandle { resource: h.resource, version: new_version }
+        BufferHandle(self.record_write(h.0))
     }
 
     /// Declare that this pass reads the specific texture version in `h`.
     pub fn read_texture(&mut self, h: TextureHandle) {
-        self.record_access(h.resource, h.version, Access::Read);
+        self.record_read(h.0);
     }
 
     /// Declare that this pass writes a texture, minting a new version.
     ///
     /// Returns the new versioned handle.
     pub fn write_texture(&mut self, h: TextureHandle) -> TextureHandle {
-        let new_version = self.next_version(h.resource);
-        self.record_access(h.resource, new_version, Access::Write);
-        TextureHandle { resource: h.resource, version: new_version }
+        TextureHandle(self.record_write(h.0))
     }
 
     /// Auto-record pass accesses from a bind group's layout.
@@ -563,11 +560,17 @@ impl<'g> PassBuilder<'g> {
                 BindKind::UniformBuffer { .. }
                 | BindKind::StorageBufferReadOnly { .. } => {
                     let version = self.graph.resource_versions[res_id.0 as usize];
-                    self.record_access(res_id.0, version, Access::Read);
+                    self.record_access(
+                        ResourceHandle { resource: res_id.0, version },
+                        Access::Read,
+                    );
                 }
                 BindKind::StorageBufferReadWrite { .. } => {
                     let new_version = self.next_version(res_id.0);
-                    self.record_access(res_id.0, new_version, Access::Write);
+                    self.record_access(
+                        ResourceHandle { resource: res_id.0, version: new_version },
+                        Access::Write,
+                    );
                     writes.push((res_id.0, new_version));
                 }
             }
@@ -589,10 +592,20 @@ impl<'g> PassBuilder<'g> {
         self.graph.passes[self.pass_index].execute_fn = Some(Box::new(f));
     }
 
-    fn record_access(&mut self, resource: u32, version: u32, access: Access) {
+    fn record_read(&mut self, h: ResourceHandle) {
+        self.record_access(h, Access::Read);
+    }
+
+    fn record_write(&mut self, h: ResourceHandle) -> ResourceHandle {
+        let new_version = self.next_version(h.resource);
+        let new_handle = ResourceHandle { resource: h.resource, version: new_version };
+        self.record_access(new_handle, Access::Write);
+        new_handle
+    }
+
+    fn record_access(&mut self, handle: ResourceHandle, access: Access) {
         self.graph.passes[self.pass_index].accesses.push(compile::PassAccess {
-            resource,
-            version,
+            handle,
             access,
         });
     }
@@ -638,14 +651,14 @@ impl BindGroupWrites {
     /// `use_bind_group` call and the `write_of` lookup.
     pub fn write_of(&self, h: BufferHandle) -> BufferHandle {
         let (_, version) = *self.writes.iter()
-            .find(|(r, _)| *r == h.resource)
+            .find(|(r, _)| *r == h.0.resource)
             .unwrap_or_else(|| panic!(
                 "BindGroupWrites::write_of: resource {} is not a read-write \
                  binding in this bind group — check the layout kind or \
                  ensure the correct bind group was passed to use_bind_group",
-                h.resource,
+                h.0.resource,
             ));
-        BufferHandle { resource: h.resource, version }
+        BufferHandle(ResourceHandle { resource: h.0.resource, version })
     }
 }
 
@@ -684,42 +697,41 @@ impl CompiledGraph {
 
     /// Allocate transient buffers and textures from their respective pools.
     ///
-    /// Call after [`RenderGraph::compile`] and before
-    /// [`execute`](Self::execute).  Each transient resource created during
-    /// the build phase (and not culled) is allocated from the appropriate
-    /// pool.  Imported resources were bound at build time by
-    /// [`RenderGraph::import_buffer`] / [`RenderGraph::import_texture`] and
-    /// need no further attention.
-    pub fn allocate_transients(
+    /// Each transient resource created during the build phase (and not culled)
+    /// is allocated from the appropriate pool.  Imported resources were bound
+    /// at build time by [`RenderGraph::import_buffer`] /
+    /// [`RenderGraph::import_texture`] and need no further attention.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a transient descriptor references a resource index out of
+    /// range, which is a compiler bug.
+    fn allocate_transients(
         &mut self,
         buf_pool : &mut BufferPool,
         tex_pool : &mut TexturePool,
         device   : &wgpu::Device,
     ) {
-        for &(handle, ref desc, _) in &self.transient_buffer_descs {
-            let buffer = buf_pool.acquire(device, desc);
-            self.entries[handle.resource as usize] = Some(ResourceEntry::Buffer(buffer));
+        for (handle, desc, name) in &self.transient_buffer_descs {
+            let buffer = buf_pool.acquire(device, desc, Some(name.as_str()));
+            self.entries[handle.0.resource as usize] = Some(ResourceEntry::Buffer(buffer));
         }
 
-        for &(handle, ref desc, _) in &self.transient_texture_descs {
-            let texture = tex_pool.acquire(device, desc);
+        for (handle, desc, name) in &self.transient_texture_descs {
+            let texture = tex_pool.acquire(device, desc, Some(name.as_str()));
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            self.entries[handle.resource as usize] = Some(ResourceEntry::Texture(texture, view));
+            self.entries[handle.0.resource as usize] = Some(ResourceEntry::Texture(texture, view));
         }
     }
 
     /// Resolve every registered bind group into a [`wgpu::BindGroup`].
     ///
-    /// Call after [`allocate_transients`](Self::allocate_transients) — every
+    /// Called after [`allocate_transients`](Self::allocate_transients) — every
     /// referenced transient must already have its backing buffer/texture
-    /// in the entries array — and before [`execute`](Self::execute).  A
-    /// template referencing a resource that is still `None` (e.g. a
-    /// transient that was culled because nothing writes it) panics with
-    /// the offending label and resource id.
-    ///
-    /// Resolved groups are looked up inside execute closures via
-    /// [`ResourceMap::bind_group`].
-    pub fn resolve_bind_groups(&mut self, device: &wgpu::Device) {
+    /// in the entries array.  A template referencing a resource that is still
+    /// `None` (e.g. a transient that was culled because nothing writes it)
+    /// panics with the offending label and resource id.
+    fn resolve_bind_groups(&mut self, device: &wgpu::Device) {
         for (i, tpl) in self.bind_group_templates.iter().enumerate() {
             let mut bg_entries: Vec<wgpu::BindGroupEntry> =
                 Vec::with_capacity(tpl.entries.len() + 1);
@@ -761,14 +773,27 @@ impl CompiledGraph {
 
     /// Execute all passes in compiled order.
     ///
-    /// Constructs a [`Commands`] recorder from `encoder`, then calls each
-    /// pass's execute closure sequentially with a [`PassContext`].
+    /// Allocates transient resources from the pools, resolves bind groups, then
+    /// constructs a [`Commands`] recorder from `encoder` and calls each pass's
+    /// execute closure sequentially with a [`PassContext`].
     ///
     /// Returns a [`PendingRelease`] holding the transient resources.
     /// The caller must hold it until the GPU has completed the submit
     /// containing this frame's commands, then call
     /// [`PendingRelease::release`] to return the resources to the pools.
-    pub fn execute(self, encoder: &mut FrameEncoder, frame: FrameIndex) -> PendingRelease {
+    pub fn execute(
+        mut self,
+        encoder  : &mut FrameEncoder,
+        frame    : FrameIndex,
+        buf_pool : &mut BufferPool,
+        tex_pool : &mut TexturePool,
+        device   : &wgpu::Device,
+    )
+        -> PendingRelease
+    {
+        self.allocate_transients(buf_pool, tex_pool, device);
+        self.resolve_bind_groups(device);
+
         let Self {
             passes,
             transient_buffer_descs,
@@ -781,8 +806,8 @@ impl CompiledGraph {
 
         // Clone transient resource arcs before ResourceMap takes ownership.
         let transient_buffers: Vec<wgpu::Buffer> = transient_buffer_descs.iter()
-            .filter_map(|&(handle, _, _)| {
-                if let Some(ResourceEntry::Buffer(b)) = entries[handle.resource as usize].as_ref() {
+            .filter_map(|(handle, _, _)| {
+                if let Some(ResourceEntry::Buffer(b)) = entries[handle.0.resource as usize].as_ref() {
                     Some(b.clone())
                 }
                 else {
@@ -792,8 +817,8 @@ impl CompiledGraph {
             .collect();
 
         let transient_textures: Vec<wgpu::Texture> = transient_texture_descs.iter()
-            .filter_map(|&(handle, _, _)| {
-                if let Some(ResourceEntry::Texture(t, _)) = entries[handle.resource as usize].as_ref() {
+            .filter_map(|(handle, _, _)| {
+                if let Some(ResourceEntry::Texture(t, _)) = entries[handle.0.resource as usize].as_ref() {
                     Some(t.clone())
                 }
                 else {
@@ -1175,10 +1200,10 @@ mod tests {
         let v2 = graph.add_pass("writer_b", |pass| pass.write_buffer(v1));
 
         // Different versions, same resource.
-        assert_eq!(v1.resource, buf.resource);
-        assert_eq!(v2.resource, buf.resource);
-        assert_ne!(v1.version, v2.version);
-        assert_ne!(v1.version, buf.version);
+        assert_eq!(v1.0.resource, buf.0.resource);
+        assert_eq!(v2.0.resource, buf.0.resource);
+        assert_ne!(v1.0.version, v2.0.version);
+        assert_ne!(v1.0.version, buf.0.version);
     }
 
     #[test]
@@ -1284,9 +1309,11 @@ mod tests {
 
         let compiled = graph.compile().unwrap();
 
+        let mut buf_pool = BufferPool::new();
+        let mut tex_pool = TexturePool::new();
         let mut encoder = ctx.begin_frame();
         let frame = ctx.frame_index();
-        let _pending = compiled.execute(&mut encoder, frame);
+        let _pending = compiled.execute(&mut encoder, frame, &mut buf_pool, &mut tex_pool, ctx.device());
         ctx.end_frame(encoder);
 
         assert!(ran.load(Ordering::SeqCst), "execute closure must have run");
@@ -1333,13 +1360,13 @@ mod tests {
         let d = BufferDesc { size: 128, usage: wgpu::BufferUsages::STORAGE };
 
         // First acquire creates a fresh buffer.
-        let buf = pool.acquire(ctx.device(), &d);
+        let buf = pool.acquire(ctx.device(), &d, None);
         assert_eq!(buf.size(), 128);
 
         // Release and re-acquire: same buffer returned (Arc identity).
         let reference = buf.clone();
         pool.release(buf);
-        let buf2 = pool.acquire(ctx.device(), &d);
+        let buf2 = pool.acquire(ctx.device(), &d, None);
         assert_eq!(buf2, reference);
     }
 
@@ -1358,12 +1385,12 @@ mod tests {
         let d_small = BufferDesc { size: 64, usage: wgpu::BufferUsages::STORAGE };
         let d_large = BufferDesc { size: 256, usage: wgpu::BufferUsages::STORAGE };
 
-        let buf_small = pool.acquire(ctx.device(), &d_small);
+        let buf_small = pool.acquire(ctx.device(), &d_small, None);
         let ref_small = buf_small.clone();
         pool.release(buf_small);
 
         // Different size — should get a new buffer, not the recycled one.
-        let buf_large = pool.acquire(ctx.device(), &d_large);
+        let buf_large = pool.acquire(ctx.device(), &d_large, None);
         assert_ne!(buf_large, ref_small);
         assert_eq!(buf_large.size(), 256);
     }
@@ -1414,14 +1441,11 @@ mod tests {
         });
         graph.mark_output(transient_v1);
 
-        let mut compiled = graph.compile().unwrap();
-
-        // Allocate transients from the pools.
-        compiled.allocate_transients(&mut pool, &mut tex_pool, ctx.device());
+        let compiled = graph.compile().unwrap();
 
         let mut encoder = ctx.begin_frame();
         let frame = ctx.frame_index();
-        let pending = compiled.execute(&mut encoder, frame);
+        let pending = compiled.execute(&mut encoder, frame, &mut pool, &mut tex_pool, ctx.device());
         ctx.end_frame(encoder);
 
         assert!(ran.load(Ordering::SeqCst), "pass closure must have run");
@@ -1432,7 +1456,7 @@ mod tests {
         let recycled = pool.acquire(ctx.device(), &BufferDesc {
             size: 1024,
             usage: wgpu::BufferUsages::STORAGE,
-        });
+        }, None);
         assert_eq!(recycled.size(), 1024);
     }
 
@@ -1475,17 +1499,15 @@ mod tests {
 
         graph.mark_output(out_v1);
 
-        let mut compiled = graph.compile().unwrap();
+        let compiled = graph.compile().unwrap();
         assert_eq!(compiled.barriers().len(), 1);
         assert_eq!(compiled.barriers()[0].src, Access::Write);
         assert_eq!(compiled.barriers()[0].dst, Access::Read);
         assert_eq!(compiled.barriers()[0].before, 1);
 
-        compiled.allocate_transients(&mut pool, &mut tex_pool, ctx.device());
-
         let mut encoder = ctx.begin_frame();
         let frame = ctx.frame_index();
-        let pending = compiled.execute(&mut encoder, frame);
+        let pending = compiled.execute(&mut encoder, frame, &mut pool, &mut tex_pool, ctx.device());
         ctx.end_frame(encoder);
 
         // Both closures must have run in the declared order; barrier emission
