@@ -50,6 +50,15 @@ struct SubchunkOcc {
 [[vk::binding(1, 0)]] ConstantBuffer<Camera>        g_camera;
 [[vk::binding(4, 0)]] StructuredBuffer<SubchunkOcc> g_occ_array;
 
+// Must match the VS projection. Kept in sync by hand — if you change these,
+// update `subchunk.vs.hlsl` too. Used to project the voxel-hit position back
+// to NDC depth so fragments write the actual hit depth instead of the
+// rasterized hull depth. The inside-cube case rasterizes the back face (far
+// from the camera), so writing hull depth would lose depth-sort battles
+// against neighbouring cubes' front faces.
+static const float NEAR_PLANE = 0.1;
+static const float FAR_PLANE  = 1000.0;
+
 // --- Occupancy lookup ---
 
 uint pick_word(uint4 v, uint idx) {
@@ -84,8 +93,9 @@ bool get_voxel(int x, int y, int z, uint occ_slot) {
 // viewed along a non-primary axis.
 
 struct Hit {
-    bool hit;
-    int3 voxel;
+    bool   hit;
+    int3   voxel;
+    float3 pos; // hit position in the sub-chunk's local [0, 8]^3 frame
 };
 
 Hit trace(float3 ro, float3 rd, uint occ_slot) {
@@ -130,25 +140,37 @@ Hit trace(float3 ro, float3 rd, uint occ_slot) {
 
     // Test the entry cell first — the ray starts inside it.
     if (get_voxel(vox.x, vox.y, vox.z, occ_slot)) {
-        Hit h; h.hit = true; h.voxel = vox; return h;
+        Hit h; h.hit = true; h.voxel = vox; h.pos = ro; return h;
     }
 
     // 8 cells × 3 axes = 24 step bound.
+    //
+    // `t_entry` is the ray parameter at which we crossed INTO the current
+    // voxel — i.e., the min of `t_next` BEFORE the axis step that produced it.
+    // Using it to compute the hit position (`ro + t_entry * rd`) gives the
+    // true entry point of the occupied voxel along the ray, which the pixel
+    // shader projects back to NDC depth.
+    float t_entry = 0.0;
+
     [loop]
     for (int i = 0; i < 24; i++) {
         if (t_next.x < t_next.y) {
             if (t_next.x < t_next.z) {
+                t_entry   = t_next.x;
                 vox.x    += step.x;
                 t_next.x += t_delta.x;
             } else {
+                t_entry   = t_next.z;
                 vox.z    += step.z;
                 t_next.z += t_delta.z;
             }
         } else {
             if (t_next.y < t_next.z) {
+                t_entry   = t_next.y;
                 vox.y    += step.y;
                 t_next.y += t_delta.y;
             } else {
+                t_entry   = t_next.z;
                 vox.z    += step.z;
                 t_next.z += t_delta.z;
             }
@@ -158,7 +180,7 @@ Hit trace(float3 ro, float3 rd, uint occ_slot) {
             break;
 
         if (get_voxel(vox.x, vox.y, vox.z, occ_slot)) {
-            Hit h; h.hit = true; h.voxel = vox; return h;
+            Hit h; h.hit = true; h.voxel = vox; h.pos = ro + t_entry * rd; return h;
         }
     }
 
@@ -167,11 +189,23 @@ Hit trace(float3 ro, float3 rd, uint occ_slot) {
 
 // --- Pixel shader entry point ---
 
-float4 main(float4                   sv_pos      : SV_Position,
-            float3                   world_pos   : TEXCOORD0,
-            float                    inside_flag : TEXCOORD1,
-            nointerpolation uint     occ_slot    : TEXCOORD2,
-            nointerpolation int3     origin      : TEXCOORD3) : SV_Target0 {
+struct PSOutput {
+    float4 color : SV_Target0;
+    // Overriding SV_Depth with the actual voxel-hit depth — rather than the
+    // rasterized hull depth — is what keeps the inside-cube path correct.
+    // The inside path rasterizes the cube's BACK faces (far from the camera),
+    // so using hull depth would lose depth-sort battles against neighbouring
+    // cubes' front faces and voxels near the camera would vanish or be
+    // overdrawn by adjacent sub-chunks. The outside path benefits too: depth
+    // now matches the true voxel surface instead of the front-face bias.
+    float  depth : SV_Depth;
+};
+
+PSOutput main(float4                   sv_pos      : SV_Position,
+              float3                   world_pos   : TEXCOORD0,
+              float                    inside_flag : TEXCOORD1,
+              nointerpolation uint     occ_slot    : TEXCOORD2,
+              nointerpolation int3     origin      : TEXCOORD3) {
     // Ray direction is the view ray through this pixel regardless of which
     // face rasterized (front for outside-camera, back for inside-camera, or
     // the near-plane-clipped edge of either) — world_pos stays colinear with
@@ -196,10 +230,24 @@ float4 main(float4                   sv_pos      : SV_Position,
         // front-face depth — otherwise the hull of a near sub-chunk would
         // depth-occlude hits in the sub-chunks behind it.
         discard;
-        return float4(0.0, 0.0, 0.0, 0.0);
+        // Unreachable; DXC still wants a return value.
+        PSOutput o0;
+        o0.color = float4(0.0, 0.0, 0.0, 0.0);
+        o0.depth = 1.0;
+        return o0;
     }
 
-    // Voxel position (0..7) mapped to RGB (0..1).
-    float3 col = float3(h.voxel) / 7.0;
-    return float4(col, 1.0);
+    // Project the hit position back to the VS's NDC z. Must match the VS
+    // formula exactly, else z-fighting. Clamp `vz` to NEAR_PLANE to cover the
+    // degenerate case where the camera stands inside an occupied voxel
+    // (hit at t=0 → world hit == camera.pos → vz == 0 → 1/vz blowup).
+    float3 hit_world = h.pos + float3(origin);
+    float  vz        = max(dot(hit_world - g_camera.pos, g_camera.forward), NEAR_PLANE);
+    float  A         = FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
+    float  B         = -NEAR_PLANE * FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
+
+    PSOutput o;
+    o.color = float4(float3(h.voxel) / 7.0, 1.0);
+    o.depth = A + B / vz;
+    return o;
 }
