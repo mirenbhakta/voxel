@@ -201,17 +201,24 @@ PSOutput main(float4                   sv_pos      : SV_Position,
               float3                   world_pos   : TEXCOORD0,
               float                    inside_flag : TEXCOORD1,
               nointerpolation uint     occ_slot    : TEXCOORD2,
-              nointerpolation int3     origin      : TEXCOORD3) {
+              nointerpolation int3     origin      : TEXCOORD3,
+              nointerpolation float    voxel_size  : TEXCOORD4) {
     // Ray direction is the view ray through this pixel regardless of which
     // face rasterized (front for outside-camera, back for inside-camera, or
     // the near-plane-clipped edge of either) — world_pos stays colinear with
     // the camera ray through the pixel even when clipped.
+    //
+    // Direction vectors are scale-invariant under uniform scaling, so ray_dir
+    // is valid in both world and sub-chunk local frames; only origins get
+    // divided by voxel_size below.
     float3 ray_dir = normalize(world_pos - g_camera.pos);
 
     // Convert world-space position and camera origin to the sub-chunk's local
-    // [0, 8]^3 frame. Ray direction is unchanged (direction-only).
-    float3 local_origin = world_pos - float3(origin);
-    float3 local_cam    = g_camera.pos - float3(origin);
+    // [0, 8]^3 voxel-index frame: translate by -origin, then scale by
+    // 1/voxel_size so one local unit = one voxel regardless of LOD level.
+    float  inv_vs       = 1.0 / voxel_size;
+    float3 local_origin = (world_pos     - float3(origin)) * inv_vs;
+    float3 local_cam    = (g_camera.pos  - float3(origin)) * inv_vs;
 
     // Ray entry selection:
     //   inside  → start at the camera's local position; world_pos is on the
@@ -233,14 +240,16 @@ PSOutput main(float4                   sv_pos      : SV_Position,
         return o0;
     }
 
+    // Scale local hit back to world space.
+    float3 hit_world = h.pos * voxel_size + float3(origin);
+
     // Project the hit position back to the VS's NDC z. Must match the VS
-    // formula exactly, else z-fighting. Clamp `vz` to NEAR_PLANE to cover the
-    // degenerate case where the camera stands inside an occupied voxel
-    // (hit at t=0 → world hit == camera.pos → vz == 0 → 1/vz blowup).
-    float3 hit_world = h.pos + float3(origin);
-    float  vz        = max(dot(hit_world - g_camera.pos, g_camera.forward), NEAR_PLANE);
-    float  A         = FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
-    float  B         = -NEAR_PLANE * FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
+    // formula exactly, else z-fighting. Clamp `vz` to NEAR_PLANE to cover
+    // the degenerate case where the camera stands inside an occupied voxel
+    // (hit at t=0 → world hit == camera.pos → vz == 0).
+    float  vz = max(dot(hit_world - g_camera.pos, g_camera.forward), NEAR_PLANE);
+    float  A  = FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
+    float  B  = -NEAR_PLANE * FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
 
     PSOutput o;
     o.color = float4(float3(h.voxel) / 7.0, 1.0);

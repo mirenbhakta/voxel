@@ -29,6 +29,8 @@ pub use shader::{ShaderModule, ShaderSource};
 pub use subchunk::{
     DEPTH_FORMAT as SUBCHUNK_DEPTH_FORMAT,
     MAX_CANDIDATES as SUBCHUNK_MAX_CANDIDATES,
+    MAX_LEVELS as SUBCHUNK_MAX_LEVELS,
+    LodMaskUniform,
     SubchunkCamera,
     SubchunkInstance,
     SubchunkOccupancy,

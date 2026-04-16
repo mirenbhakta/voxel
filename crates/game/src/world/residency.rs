@@ -24,6 +24,17 @@
 //! all in one frame) and the asynchronous GPU staging/readback path
 //! (requests dispatched this frame, completions arriving 1–2 frames
 //! later).
+//!
+//! # Cross-level corner derivation
+//!
+//! Each level's shell is anchored at a grid-vertex "origin corner" rather
+//! than a containing sub-chunk. To keep shells nested across levels, all
+//! corners coincide in world space: the coarsest level picks an anchor by
+//! rounding the camera to its own grid, and every finer level shifts that
+//! anchor into its own coord system by a factor of `2^(coarsest - level)`.
+//! Consequence: all levels' shells jump at the coarsest level's cadence
+//! (every half-extent of camera motion), which keeps coarser shells from
+//! slipping relative to finer ones.
 
 #![allow(dead_code)]
 
@@ -96,6 +107,10 @@ pub struct EvictEntry<T> {
 /// [`SlotId`].
 pub struct Residency<T> {
     levels:          Vec<LevelState<T>>,
+    /// Highest level among `levels`; drives the shared corner derivation.
+    /// All finer levels' corners are bit-shifted copies of the coarsest's,
+    /// so corners coincide in world space across the cascade.
+    coarsest_level:  Level,
     next_request_id: u64,
     new_requests:    Vec<PrepRequest>,
     pending:         HashMap<RequestId, PendingEntry>,
@@ -107,19 +122,32 @@ impl<T> Residency<T> {
     /// Issues an initial batch of prep requests covering every resident
     /// sub-chunk at every level. These are immediately available via
     /// [`Residency::take_prep_requests`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `levels` is empty — the coarsest level drives the anchor
+    /// derivation and is required.
     pub fn new(levels: &[LevelConfig], initial_camera: [f32; 3]) -> Self {
+        assert!(!levels.is_empty(), "Residency requires at least one level");
+
+        let coarsest_level = levels
+            .iter()
+            .map(|c| c.level)
+            .max()
+            .expect("levels non-empty");
+
         let level_states: Vec<LevelState<T>> = levels
             .iter()
             .map(|cfg| {
-                let center = camera_coord_at(cfg.level, initial_camera);
+                let corner = compute_corner(coarsest_level, cfg.level, initial_camera);
                 let dims   = [
-                    2 * cfg.radius[0] + 1,
-                    2 * cfg.radius[1] + 1,
-                    2 * cfg.radius[2] + 1,
+                    2 * cfg.radius[0],
+                    2 * cfg.radius[1],
+                    2 * cfg.radius[2],
                 ];
                 LevelState {
                     level: cfg.level,
-                    shell: Shell::new(cfg.radius, center),
+                    shell: Shell::new(cfg.radius, corner),
                     pool:  SlotPool::new(dims),
                 }
             })
@@ -127,6 +155,7 @@ impl<T> Residency<T> {
 
         let mut r = Self {
             levels:          level_states,
+            coarsest_level,
             next_request_id: 0,
             new_requests:    Vec::new(),
             pending:         HashMap::new(),
@@ -146,17 +175,21 @@ impl<T> Residency<T> {
 
     /// Recenter every level against `world_pos` and return evicted slots.
     ///
-    /// Levels that didn't cross a sub-chunk boundary produce no diff —
-    /// coarser levels are inherently slower to change. Pending prep requests
-    /// for evicted coords are cancelled; completions that arrive later for
-    /// those ids are silently dropped.
+    /// All corners derive from the coarsest level's anchor, so finer levels
+    /// inherit its cadence: no level rolls until camera motion crosses the
+    /// coarsest's half-extent boundary. On a jump, finer levels shift by a
+    /// larger coord delta (in their own grids) but in world units all
+    /// levels move together by one coarsest half-extent. Pending prep
+    /// requests for evicted coords are cancelled; completions that arrive
+    /// later for those ids are silently dropped.
     pub fn update_camera(&mut self, world_pos: [f32; 3]) -> Vec<EvictEntry<T>> {
         let mut evictions = Vec::new();
 
+        let coarsest = self.coarsest_level;
         for level_idx in 0..self.levels.len() {
             let level      = self.levels[level_idx].level;
-            let new_center = camera_coord_at(level, world_pos);
-            let diff       = self.levels[level_idx].shell.recenter(new_center);
+            let new_corner = compute_corner(coarsest, level, world_pos);
+            let diff       = self.levels[level_idx].shell.recenter(new_corner);
 
             for coord in &diff.removed {
                 let slot = self.levels[level_idx].pool.slot_id(*coord);
@@ -222,10 +255,12 @@ impl<T> Residency<T> {
         self.levels.len()
     }
 
-    /// Current camera-aligned center for `level`, in that level's sub-chunk
-    /// grid.
-    pub fn center(&self, level: Level) -> Option<SubchunkCoord> {
-        self.level_state(level).map(|s| s.shell.center())
+    /// Current anchor corner for `level`, in that level's sub-chunk grid.
+    ///
+    /// Corners coincide in world space across every resident level — the
+    /// coarsest picks the anchor, finer levels are bit-shifted copies.
+    pub fn corner(&self, level: Level) -> Option<SubchunkCoord> {
+        self.level_state(level).map(|s| s.shell.corner())
     }
 
     /// Read the stored payload at `(level, coord)`, if any.
@@ -282,16 +317,33 @@ struct PendingEntry {
     coord: SubchunkCoord,
 }
 
-// --- camera coord derivation ---
+// --- corner derivation ---
 
-/// Convert a world-space position (meters) to a sub-chunk coord at `level`.
-fn camera_coord_at(level: Level, world_pos: [f32; 3]) -> SubchunkCoord {
-    let extent = level.subchunk_extent_m();
-    SubchunkCoord::new(
-        (world_pos[0] / extent).floor() as i32,
-        (world_pos[1] / extent).floor() as i32,
-        (world_pos[2] / extent).floor() as i32,
-    )
+/// Anchor corner for `level`, derived from the camera position through
+/// the coarsest level's grid.
+///
+/// The coarsest level picks the nearest grid vertex to the camera by
+/// rounding `world_pos / extent_coarsest`. Finer levels' corners are the
+/// same world point expressed in their own coord system: shift left by
+/// `coarsest.0 - level.0` to convert (each step down doubles the coord
+/// since sub-chunk extent halves).
+///
+/// Rounding the coarsest and deriving the rest by shift guarantees:
+/// - all corners coincide in world space (no cross-level drift);
+/// - `L_n` shell boundaries land on `L_(n+1)` sub-chunk boundaries when
+///   radii are even, so the "fully inside finer shell" cull test can
+///   express an integer number of coarser cells rather than straddling.
+fn compute_corner(coarsest: Level, level: Level, world_pos: [f32; 3]) -> SubchunkCoord {
+    debug_assert!(
+        level.0 <= coarsest.0,
+        "level {level:?} must be finer-or-equal to coarsest {coarsest:?}",
+    );
+    let coarsest_extent = coarsest.subchunk_extent_m();
+    let kx = (world_pos[0] / coarsest_extent).round() as i32;
+    let ky = (world_pos[1] / coarsest_extent).round() as i32;
+    let kz = (world_pos[2] / coarsest_extent).round() as i32;
+    let shift = (coarsest.0 - level.0) as u32;
+    SubchunkCoord::new(kx << shift, ky << shift, kz << shift)
 }
 
 // --- Tests ---
@@ -310,47 +362,52 @@ mod tests {
     fn new_issues_request_per_resident() {
         let cfg = single_level(Level::ZERO, [1, 1, 1]);
         let r   = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
-        // 3×3×3 shell → 27 initial requests.
-        assert_eq!(r.pending_request_count(), 27);
+        // 2×2×2 shell → 8 initial requests.
+        assert_eq!(r.pending_request_count(), 8);
     }
 
     #[test]
     fn new_seeds_requests_for_all_levels() {
         let cfg = vec![
-            LevelConfig { level: Level::ZERO, radius: [1, 1, 1] }, // 27
-            LevelConfig { level: Level(1),    radius: [0, 0, 0] }, // 1
+            LevelConfig { level: Level::ZERO, radius: [2, 2, 2] }, // 64
+            LevelConfig { level: Level(1),    radius: [1, 1, 1] }, // 8
         ];
         let r = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
-        assert_eq!(r.pending_request_count(), 28);
+        assert_eq!(r.pending_request_count(), 72);
     }
 
     #[test]
     fn take_prep_requests_drains_once() {
-        let cfg     = single_level(Level::ZERO, [0, 0, 0]);
+        let cfg     = single_level(Level::ZERO, [1, 1, 1]);
         let mut r   = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
         let first   = r.take_prep_requests();
         let second  = r.take_prep_requests();
-        assert_eq!(first.len(),  1);
+        assert_eq!(first.len(),  8);
         assert_eq!(second.len(), 0);
-        assert_eq!(r.pending_request_count(), 1, "request still in-flight after drain");
+        assert_eq!(r.pending_request_count(), 8, "requests still in-flight after drain");
     }
 
     // -- complete_prep --
 
     #[test]
     fn complete_prep_commits_to_pool() {
-        let cfg     = single_level(Level::ZERO, [0, 0, 0]);
+        let cfg     = single_level(Level::ZERO, [1, 1, 1]);
         let mut r   = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
-        let req     = r.take_prep_requests()[0];
+        // Pick a request for a known-resident coord: anchor at (0,0,0)
+        // makes the shell occupy {-1, 0}³, so (0,0,0) is in it.
+        let reqs    = r.take_prep_requests();
+        let req     = reqs.iter()
+            .find(|r| r.coord == SubchunkCoord::new(0, 0, 0))
+            .expect("(0,0,0) should be resident in shell anchored at origin");
 
         r.complete_prep(req.id, OccupancySummary::Full, 42);
         assert_eq!(r.get(Level::ZERO, SubchunkCoord::new(0, 0, 0)), Some(&42));
-        assert_eq!(r.pending_request_count(), 0);
+        assert_eq!(r.pending_request_count(), 7);
     }
 
     #[test]
     fn complete_prep_unknown_id_is_dropped() {
-        let cfg     = single_level(Level::ZERO, [0, 0, 0]);
+        let cfg     = single_level(Level::ZERO, [1, 1, 1]);
         let mut r   = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
         r.complete_prep(RequestId(9999), OccupancySummary::Mixed, 1);
         assert_eq!(r.get(Level::ZERO, SubchunkCoord::new(0, 0, 0)), None);
@@ -360,96 +417,113 @@ mod tests {
 
     #[test]
     fn small_motion_within_level_cell_is_noop() {
-        // L0 sub-chunk extent is 8 m. Moving 4 m stays in the same L0 cell.
-        let cfg     = single_level(Level::ZERO, [0, 0, 0]);
+        // Coarsest = L0. Anchor = round(pos/8). Anchor jumps at pos=4
+        // (the vertex midpoint). Motion of 2 m keeps round(2/8) = 0.
+        let cfg     = single_level(Level::ZERO, [1, 1, 1]);
         let mut r   = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
         let _       = r.take_prep_requests();
 
-        let evictions = r.update_camera([4.0, 0.0, 0.0]);
+        let evictions = r.update_camera([2.0, 0.0, 0.0]);
         assert!(evictions.is_empty());
         assert!(r.take_prep_requests().is_empty());
     }
 
     #[test]
     fn crossing_level_cell_boundary_triggers_diff() {
-        let cfg     = single_level(Level::ZERO, [0, 0, 0]);
+        let cfg     = single_level(Level::ZERO, [1, 1, 1]);
         let mut r   = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
         let _       = r.take_prep_requests();
 
-        // Move past 8 m on X — crosses an L0 boundary.
-        let evictions = r.update_camera([9.0, 0.0, 0.0]);
-        // Shell radius 0 → center moves, old coord evicts, new coord enqueues.
+        // Move past 4 m on X — crosses an anchor-vertex midpoint at L0.
+        let evictions = r.update_camera([5.0, 0.0, 0.0]);
+        // No prep completed yet → no evicted data to return, but shell rolled.
         assert_eq!(evictions.len(), 0, "no pool data yet (prep never completed)");
         let reqs = r.take_prep_requests();
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].coord, SubchunkCoord::new(1, 0, 0));
+        // Anchor moved from (0,0,0) to (1,0,0); 2r=2 shell → 4-coord face per axis
+        // rolls in, 4-coord face rolls out.
+        assert_eq!(reqs.len(), 4);
+        for req in &reqs {
+            assert_eq!(req.coord.x, 1);
+        }
     }
 
     #[test]
-    fn coarser_level_ignores_sub_boundary_motion() {
-        // L0 = 8 m sub-chunks; L2 = 32 m. Moving 9 m crosses L0 but not L2.
+    fn coarser_level_drives_cadence_for_all_levels() {
+        // Coarsest = L2 (32 m, half-extent = 16 m). Moving 9 m doesn't move
+        // the L2 anchor → finer levels also hold (their corners derive from
+        // L2's). At 17 m motion the L2 anchor would shift.
         let cfg = vec![
-            LevelConfig { level: Level::ZERO, radius: [0, 0, 0] },
-            LevelConfig { level: Level(2),    radius: [0, 0, 0] },
+            LevelConfig { level: Level::ZERO, radius: [1, 1, 1] },
+            LevelConfig { level: Level(2),    radius: [1, 1, 1] },
         ];
         let mut r = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
         let _     = r.take_prep_requests();
 
         r.update_camera([9.0, 0.0, 0.0]);
         let reqs = r.take_prep_requests();
-        assert_eq!(reqs.len(), 1, "only L0 should produce new work");
-        assert_eq!(reqs[0].level, Level::ZERO);
+        assert!(reqs.is_empty(), "no level should move before L2 anchor jumps");
     }
 
     #[test]
     fn eviction_returns_stored_data() {
-        let cfg     = single_level(Level::ZERO, [0, 0, 0]);
+        let cfg     = single_level(Level::ZERO, [1, 1, 1]);
         let mut r   = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
-        let req     = r.take_prep_requests()[0];
-        r.complete_prep(req.id, OccupancySummary::Full, 77);
+        let reqs    = r.take_prep_requests();
+        // Prepare the coord that will roll out: (-1, 0, 0) is resident at
+        // anchor=(0,0,0) but leaves when anchor moves to (1,0,0).
+        let target  = reqs.iter()
+            .find(|r| r.coord == SubchunkCoord::new(-1, 0, 0))
+            .expect("(-1,0,0) should be resident initially");
+        r.complete_prep(target.id, OccupancySummary::Full, 77);
 
-        // Move out of (0,0,0).
-        let evictions = r.update_camera([9.0, 0.0, 0.0]);
-        assert_eq!(evictions.len(), 1);
-        assert_eq!(evictions[0].coord, SubchunkCoord::new(0, 0, 0));
-        assert_eq!(evictions[0].level, Level::ZERO);
-        assert_eq!(evictions[0].data,  77);
+        // Cross the anchor-vertex midpoint at x = 4.
+        let evictions = r.update_camera([5.0, 0.0, 0.0]);
+        // Eviction face is the 2×2 slab at x = -1.
+        let target_evict = evictions.iter()
+            .find(|e| e.coord == SubchunkCoord::new(-1, 0, 0))
+            .expect("(-1,0,0) should evict");
+        assert_eq!(target_evict.level, Level::ZERO);
+        assert_eq!(target_evict.data,  77);
     }
 
     // -- cancellation on eviction --
 
     #[test]
     fn eviction_cancels_pending_request() {
-        let cfg     = single_level(Level::ZERO, [0, 0, 0]);
+        let cfg     = single_level(Level::ZERO, [1, 1, 1]);
         let mut r   = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
-        let req     = r.take_prep_requests()[0];
+        let reqs    = r.take_prep_requests();
+        let target  = reqs.iter()
+            .find(|r| r.coord == SubchunkCoord::new(-1, 0, 0))
+            .expect("(-1,0,0) should be in the initial shell");
 
         // Evict before completing. The request should be cancelled.
-        r.update_camera([9.0, 0.0, 0.0]);
-        let _ = r.take_prep_requests(); // discard the new (1,0,0) request
+        r.update_camera([5.0, 0.0, 0.0]);
+        let _ = r.take_prep_requests(); // discard the new requests
 
         // Completing the stale id is a no-op — the coord is long gone from
         // the shell and the request was cancelled.
-        r.complete_prep(req.id, OccupancySummary::Full, 999);
-        assert_eq!(r.get(Level::ZERO, SubchunkCoord::new(0, 0, 0)), None);
+        r.complete_prep(target.id, OccupancySummary::Full, 999);
+        assert_eq!(r.get(Level::ZERO, SubchunkCoord::new(-1, 0, 0)), None);
     }
 
     #[test]
     fn completion_after_coord_rolled_out_is_dropped() {
         // Same shape as above but exercise the "shell no longer contains"
         // guard even if cancellation somehow leaked the id.
-        let cfg     = single_level(Level::ZERO, [1, 0, 0]);
+        let cfg     = single_level(Level::ZERO, [1, 1, 1]);
         let mut r   = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
         let reqs    = r.take_prep_requests();
-        // Pick the request for (1, 0, 0) — will roll out when camera jumps far.
-        let target  = reqs.iter().find(|r| r.coord == SubchunkCoord::new(1, 0, 0)).unwrap();
+        let target  = reqs.iter()
+            .find(|r| r.coord == SubchunkCoord::new(0, 0, 0))
+            .expect("(0,0,0) should be in the initial shell");
         let target_id = target.id;
 
         r.update_camera([1000.0, 0.0, 0.0]);
         let _ = r.take_prep_requests();
 
         r.complete_prep(target_id, OccupancySummary::Full, 123);
-        assert_eq!(r.get(Level::ZERO, SubchunkCoord::new(1, 0, 0)), None);
+        assert_eq!(r.get(Level::ZERO, SubchunkCoord::new(0, 0, 0)), None);
     }
 
     // -- end-to-end sanity --
@@ -457,8 +531,8 @@ mod tests {
     #[test]
     fn full_sync_roundtrip_populates_all_levels() {
         let cfg = vec![
-            LevelConfig { level: Level::ZERO, radius: [1, 1, 1] },
-            LevelConfig { level: Level(1),    radius: [0, 0, 0] },
+            LevelConfig { level: Level::ZERO, radius: [2, 2, 2] },
+            LevelConfig { level: Level(1),    radius: [1, 1, 1] },
         ];
         let mut r = Residency::<u32>::new(&cfg, [0.0, 0.0, 0.0]);
 
@@ -468,43 +542,54 @@ mod tests {
         }
         assert_eq!(r.pending_request_count(), 0);
 
-        // Every resident at every level is now readable.
-        for level_idx in 0..r.level_count() {
-            let level = if level_idx == 0 { Level::ZERO } else { Level(1) };
-            let coords: Vec<_> = match level.0 {
-                0 => {
-                    let mut v = Vec::new();
-                    for dz in -1..=1i32 {
-                        for dy in -1..=1i32 {
-                            for dx in -1..=1i32 {
-                                v.push(SubchunkCoord::new(dx, dy, dz));
-                            }
-                        }
-                    }
-                    v
-                }
-                _ => vec![SubchunkCoord::new(0, 0, 0)],
-            };
-            for c in coords {
-                assert!(r.get(level, c).is_some(), "missing {c:?} at {level:?}");
-            }
+        // Every resident at every level is now readable. Shell at
+        // anchor=(0,0,0), r=2 spans x ∈ [-2, 1]; at r=1 spans x ∈ [-1, 0].
+        let sample_coords = [
+            (Level::ZERO, SubchunkCoord::new(-2, -2, -2)),
+            (Level::ZERO, SubchunkCoord::new( 1,  1,  1)),
+            (Level::ZERO, SubchunkCoord::new( 0,  0,  0)),
+            (Level(1),    SubchunkCoord::new(-1, -1, -1)),
+            (Level(1),    SubchunkCoord::new( 0,  0,  0)),
+        ];
+        for (level, coord) in sample_coords {
+            assert!(r.get(level, coord).is_some(), "missing {coord:?} at {level:?}");
         }
     }
 
-    // -- camera coord derivation --
+    // -- corner derivation --
 
     #[test]
-    fn camera_coord_scales_with_level() {
-        // At L0 (8 m), world x=16 is sub-chunk 2. At L1 (16 m), it's 1.
+    fn compute_corner_aligns_across_levels() {
+        // Coarsest = L1 (16 m). Anchor = round(16.5 / 16) = 1 (L1 coord).
+        // L0 corner = 1 << 1 = 2 (L0 coord). In world: L1 anchor = 16,
+        // L0 anchor = 16 — same point.
         let pos = [16.5, 0.0, 0.0];
-        assert_eq!(camera_coord_at(Level::ZERO, pos), SubchunkCoord::new(2, 0, 0));
-        assert_eq!(camera_coord_at(Level(1),    pos), SubchunkCoord::new(1, 0, 0));
+        assert_eq!(compute_corner(Level(1), Level(1), pos), SubchunkCoord::new(1, 0, 0));
+        assert_eq!(compute_corner(Level(1), Level(0), pos), SubchunkCoord::new(2, 0, 0));
     }
 
     #[test]
-    fn camera_coord_negative_floors_toward_minus_infinity() {
-        // At L0 (8 m), x=-0.5 floors to sub-chunk -1, not 0.
-        let pos = [-0.5, 0.0, 0.0];
-        assert_eq!(camera_coord_at(Level::ZERO, pos), SubchunkCoord::new(-1, 0, 0));
+    fn compute_corner_rounds_halves_away_from_zero() {
+        // Coarsest = L0 (8 m). Anchor flips at the vertex midpoint x = 4.
+        // f32::round rounds half away from zero, so x = 4.0 rounds to 1,
+        // x = -4.0 rounds to -1.
+        assert_eq!(
+            compute_corner(Level::ZERO, Level::ZERO, [ 4.0, 0.0, 0.0]),
+            SubchunkCoord::new(1, 0, 0),
+        );
+        assert_eq!(
+            compute_corner(Level::ZERO, Level::ZERO, [-4.0, 0.0, 0.0]),
+            SubchunkCoord::new(-1, 0, 0),
+        );
+    }
+
+    #[test]
+    fn compute_corner_finer_is_shift_of_coarsest() {
+        // Coarsest = L2, coarser coord = 3. Finer corners = 3<<1 = 6 (L1),
+        // 3<<2 = 12 (L0). World: all three anchors at 3*32 = 96.
+        let pos = [96.0, 0.0, 0.0];
+        assert_eq!(compute_corner(Level(2), Level(2), pos), SubchunkCoord::new(3, 0, 0));
+        assert_eq!(compute_corner(Level(2), Level(1), pos), SubchunkCoord::new(6, 0, 0));
+        assert_eq!(compute_corner(Level(2), Level(0), pos), SubchunkCoord::new(12, 0, 0));
     }
 }

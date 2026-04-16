@@ -512,16 +512,73 @@ fn storage_buffer_size_from_struct(module: &Module, struct_id: Word) -> Option<u
     runtime_array_stride(module, last_member).map(|s| s as u64)
 }
 
-/// Return the byte size of a SPIR-V scalar type (`OpTypeInt` or
-/// `OpTypeFloat`). Returns `None` for any other type — callers treat that as
-/// "size couldn't be computed".
+/// Return the byte size of a SPIR-V type.
+///
+/// Supported shapes:
+/// - `OpTypeInt` / `OpTypeFloat` — bit-width literal / 8.
+/// - `OpTypeVector` — `component_count * element_size`.
+/// - `OpTypeMatrix` — `column_count * column_size`.
+/// - `OpTypeArray` — `length * ArrayStride` when the array has an
+///   `ArrayStride` decoration (present in DXC `-fvk-use-dx-layout` output
+///   for struct-member arrays), else `length * element_size`.
+///
+/// Returns `None` for any other type — callers treat that as "size couldn't
+/// be computed".
 fn member_byte_size(module: &Module, type_id: Word) -> Option<u32> {
     let inst = find_type_any(module, type_id)?;
 
     match inst.class.opcode {
         Op::TypeInt | Op::TypeFloat => as_lit(inst.operands.first()).map(|w| w / 8),
+
+        Op::TypeVector => {
+            // Operands: [component_type, component_count].
+            let element_type    = as_id(inst.operands.first())?;
+            let component_count = as_lit(inst.operands.get(1))?;
+            let element_size    = member_byte_size(module, element_type)?;
+            Some(component_count * element_size)
+        }
+
+        Op::TypeMatrix => {
+            // Operands: [column_type, column_count].
+            let column_type  = as_id(inst.operands.first())?;
+            let column_count = as_lit(inst.operands.get(1))?;
+            let column_size  = member_byte_size(module, column_type)?;
+            Some(column_count * column_size)
+        }
+
+        Op::TypeArray => {
+            // Operands: [element_type, length_constant_id].
+            let element_type = as_id(inst.operands.first())?;
+            let length_const = as_id(inst.operands.get(1))?;
+            let length       = find_constant_u32(module, length_const)?;
+
+            if let Some(stride) = array_stride_decoration(module, type_id) {
+                Some(length * stride)
+            }
+            else {
+                let element_size = member_byte_size(module, element_type)?;
+                Some(length * element_size)
+            }
+        }
+
         _ => None,
     }
+}
+
+/// Resolve an `OpConstant` (int-typed) to its u32 literal value.
+fn find_constant_u32(module: &Module, const_id: Word) -> Option<u32> {
+    let inst = find_type_any(module, const_id)?;
+    if inst.class.opcode != Op::Constant {
+        return None;
+    }
+    as_lit(inst.operands.first())
+}
+
+/// Find the `ArrayStride` decoration on a type id, if any.
+fn array_stride_decoration(module: &Module, type_id: Word) -> Option<u32> {
+    decorates(module)
+        .find(|(t, d, _)| *t == type_id && *d == Decoration::ArrayStride)
+        .and_then(|(_, _, extras)| as_lit(extras.first()))
 }
 
 // --- Tests ---

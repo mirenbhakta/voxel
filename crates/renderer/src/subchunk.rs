@@ -57,9 +57,17 @@ const SUBCHUNK_CS_SPV: &[u8] =
 // --- Constants ---
 
 /// Maximum number of candidate sub-chunks the cull pass handles in one
-/// dispatch. Baked into the cull shader's workgroup size (`[64, 1, 1]`)
+/// dispatch. Baked into the cull shader's workgroup size (`[256, 1, 1]`)
 /// and into the `instance_buf` / `occ_buf` allocations.
-pub const MAX_CANDIDATES: usize = 64;
+///
+/// Sized to accommodate several LOD levels' shells simultaneously; each
+/// level of a 3³ clipmap contributes 27 slots, so 256 holds ~9 levels
+/// worth of tight-radius residency.
+pub const MAX_CANDIDATES: usize = 256;
+
+/// Maximum LOD levels supported by the pipeline. Matches the 4-bit level
+/// field packed into [`SubchunkInstance::slot_mask`].
+pub const MAX_LEVELS: usize = 16;
 
 /// Depth format used by the sub-chunk pipeline's `DepthStencilState`.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -108,25 +116,26 @@ const _: () = assert!(
 ///   uint slot_mask (+12)
 /// ```
 ///
-/// `slot_mask` packs two fields into one `u32` so the struct stays
+/// `slot_mask` packs three fields into one `u32` so the struct stays
 /// 16-aligned on both sides:
-/// - Low 26 bits: occupancy slot index.
-/// - High 6 bits: directional exposure mask, one bit per face:
+/// - bits 0-21 (22 bits): occupancy slot index — up to 4 M slots.
+/// - bits 22-25 (4 bits): LOD level — voxel edge = `1 << level` metres.
+/// - bits 26-31 (6 bits): directional exposure mask, one bit per face.
 ///
-/// | bit | direction |
-/// |:---:|:---------:|
-/// | 0   | -X        |
-/// | 1   | +X        |
-/// | 2   | -Y        |
-/// | 3   | +Y        |
-/// | 4   | -Z        |
-/// | 5   | +Z        |
+/// | bit (within exposure) | direction |
+/// |:---------------------:|:---------:|
+/// | 0                     | -X        |
+/// | 1                     | +X        |
+/// | 2                     | -Y        |
+/// | 3                     | +Y        |
+/// | 4                     | -Z        |
+/// | 5                     | +Z        |
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SubchunkInstance {
     pub origin:    [i32; 3],
-    /// Low 26 bits: occupancy slot. High 6 bits: exposure mask.
-    /// Prefer [`SubchunkInstance::new`] over constructing directly.
+    /// Packed (slot, level, exposure). Prefer [`SubchunkInstance::new`]
+    /// over constructing directly.
     pub slot_mask: u32,
 }
 
@@ -135,23 +144,32 @@ const _: () = assert!(
     "SubchunkInstance must be 16 bytes to match HLSL Instance"
 );
 
-const SLOT_BITS:    u32 = 26;
-const SLOT_MASK:    u32 = (1 << SLOT_BITS) - 1;
-const EXPOSURE_MAX: u8  = (1 << 6) - 1;
+const SLOT_BITS:      u32 = 22;
+const SLOT_MASK:      u32 = (1 << SLOT_BITS) - 1;
+const LEVEL_BITS:     u32 = 4;
+const LEVEL_SHIFT:    u32 = SLOT_BITS;
+const LEVEL_MAX:      u8  = (1 << LEVEL_BITS) - 1;
+const EXPOSURE_BITS:  u32 = 6;
+const EXPOSURE_SHIFT: u32 = SLOT_BITS + LEVEL_BITS;
+const EXPOSURE_MAX:   u8  = (1 << EXPOSURE_BITS) - 1;
 
 impl SubchunkInstance {
-    /// Build an instance from its three logical components.
+    /// Build an instance from its four logical components.
     ///
     /// # Panics
     ///
-    /// Debug builds panic if `occ_slot >= 2^26` or `exposure_mask > 0x3F`.
-    pub fn new(origin: [i32; 3], occ_slot: u32, exposure_mask: u8) -> Self {
+    /// Debug builds panic if `occ_slot >= 2^22`, `level > 15`, or
+    /// `exposure_mask > 0x3F` — the packed encoding cannot represent any
+    /// of those overflows.
+    pub fn new(origin: [i32; 3], occ_slot: u32, level: u8, exposure_mask: u8) -> Self {
         debug_assert!(occ_slot      <= SLOT_MASK,    "occ_slot must fit in {SLOT_BITS} bits");
+        debug_assert!(level         <= LEVEL_MAX,    "level must fit in {LEVEL_BITS} bits");
         debug_assert!(exposure_mask <= EXPOSURE_MAX, "exposure_mask must fit in 6 bits");
         Self {
             origin,
             slot_mask: (occ_slot & SLOT_MASK)
-                     | ((exposure_mask as u32) << SLOT_BITS),
+                     | ((level         as u32) << LEVEL_SHIFT)
+                     | ((exposure_mask as u32) << EXPOSURE_SHIFT),
         }
     }
 
@@ -159,10 +177,54 @@ impl SubchunkInstance {
         self.slot_mask & SLOT_MASK
     }
 
+    pub fn level(&self) -> u8 {
+        ((self.slot_mask >> LEVEL_SHIFT) & ((1 << LEVEL_BITS) - 1)) as u8
+    }
+
     pub fn exposure_mask(&self) -> u8 {
-        (self.slot_mask >> SLOT_BITS) as u8
+        (self.slot_mask >> EXPOSURE_SHIFT) as u8
     }
 }
+
+// --- LodMaskUniform ---
+
+/// Per-level LOD-cascade mask data.
+///
+/// For each level `N`, `mask_lo[N]` / `mask_hi[N]` describe the world-space
+/// AABB that level `N` should defer to (the next-finer configured level's
+/// shell). Sub-chunks at level `N` fully inside this box are dropped by
+/// the cull pass; fragments at level `N` whose DDA hit lands inside are
+/// discarded by the pixel shader — so each world point is rendered by
+/// exactly one level.
+///
+/// - `mask_lo[N].xyz` — shell lower bound (world units).
+/// - `mask_hi[N].xyz` — shell upper bound (world units).
+/// - `mask_hi[N].w`   — `1.0` when the entry is active, `0.0` when level
+///   `N` has no finer level to defer to (level 0, or any unconfigured
+///   level).
+///
+/// Size: `2 * 16 * 16 = 512` bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct LodMaskUniform {
+    pub mask_lo: [[f32; 4]; MAX_LEVELS],
+    pub mask_hi: [[f32; 4]; MAX_LEVELS],
+}
+
+impl LodMaskUniform {
+    /// All entries inactive. Sub-chunks at every level render everywhere.
+    pub fn inactive() -> Self {
+        Self {
+            mask_lo: [[0.0; 4]; MAX_LEVELS],
+            mask_hi: [[0.0; 4]; MAX_LEVELS],
+        }
+    }
+}
+
+const _: () = assert!(
+    std::mem::size_of::<LodMaskUniform>() == 512,
+    "LodMaskUniform layout must match HLSL LodMask (512 bytes)"
+);
 
 // --- SubchunkOccupancy ---
 
@@ -255,6 +317,7 @@ pub struct WorldRenderer {
     instance_buf: wgpu::Buffer,
     occ_buf:      wgpu::Buffer,
     count_buf:    wgpu::Buffer,
+    lod_mask_buf: wgpu::Buffer,
 }
 
 impl WorldRenderer {
@@ -294,6 +357,7 @@ impl WorldRenderer {
         let instance_size = (std::mem::size_of::<SubchunkInstance>() * MAX_CANDIDATES) as u64;
         let occ_size      = (std::mem::size_of::<SubchunkOccupancy>() * MAX_CANDIDATES) as u64;
         let count_size    = 4u64;
+        let lod_mask_size = std::mem::size_of::<LodMaskUniform>() as u64;
 
         // --- Persistent buffers ---
 
@@ -331,12 +395,25 @@ impl WorldRenderer {
         // entry whose `instance_count` fans out to the visible candidates.
         ctx.queue().write_buffer(&count_buf, 0, bytemuck::bytes_of(&1u32));
 
+        let lod_mask_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("subchunk_lod_mask"),
+            size:               lod_mask_size,
+            usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Start with every level inactive — every sub-chunk renders — until
+        // the caller populates the cascade. Keeps the buffer well-defined
+        // before the first `write_lod_mask`.
+        ctx.queue()
+            .write_buffer(&lod_mask_buf, 0, bytemuck::bytes_of(&LodMaskUniform::inactive()));
+
         // --- Pipelines ---
 
         let cull_pipeline = Arc::new(ComputePipeline::new(ctx, ComputePipelineDescriptor {
             label:                   "subchunk_cull",
             shader:                  cs,
-            expected_workgroup_size: Some([64, 1, 1]),
+            expected_workgroup_size: Some([256, 1, 1]),
             immediate_size:          0,
         }));
 
@@ -374,6 +451,7 @@ impl WorldRenderer {
             instance_buf,
             occ_buf,
             count_buf,
+            lod_mask_buf,
         }
     }
 
@@ -413,6 +491,14 @@ impl WorldRenderer {
         ctx.queue().write_buffer(&self.occ_buf, offset, occ_bytes);
     }
 
+    /// Overwrite the LOD cascade uniform.
+    ///
+    /// Call once per frame before building the render graph, after
+    /// residency has recentered its shells.
+    pub fn write_lod_mask(&self, ctx: &RendererContext, mask: &LodMaskUniform) {
+        ctx.queue().write_buffer(&self.lod_mask_buf, 0, bytemuck::bytes_of(mask));
+    }
+
     pub(crate) fn cull_pipeline(&self) -> &Arc<ComputePipeline> {
         &self.cull_pipeline
     }
@@ -435,6 +521,10 @@ impl WorldRenderer {
 
     pub(crate) fn count_buf(&self) -> &wgpu::Buffer {
         &self.count_buf
+    }
+
+    pub(crate) fn lod_mask_buf(&self) -> &wgpu::Buffer {
+        &self.lod_mask_buf
     }
 }
 
@@ -460,6 +550,7 @@ pub fn subchunk_world(
     let instance_h = graph.import_buffer(renderer.instance_buf().clone());
     let occ_h      = graph.import_buffer(renderer.occ_buf().clone());
     let count_h    = graph.import_buffer(renderer.count_buf().clone());
+    let lod_mask_h = graph.import_buffer(renderer.lod_mask_buf().clone());
 
     let visible_size  = (4 * MAX_CANDIDATES) as u64;
     let indirect_size = 16u64;
@@ -482,6 +573,7 @@ pub fn subchunk_world(
             (0, camera_h.into()),
             (1, instance_h.into()),
             (2, visible_h.into()),
+            (3, lod_mask_h.into()),
         ],
     );
 

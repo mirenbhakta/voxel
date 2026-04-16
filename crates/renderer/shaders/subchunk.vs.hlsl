@@ -34,9 +34,10 @@ struct Camera {
     float  _pad1;
 };
 
-// slot_mask packs two fields (see SubchunkInstance docs):
-//   low 26 bits: occupancy slot index (what this shader cares about)
-//   high  6 bits: directional exposure mask (consumed by the cull shader)
+// slot_mask packs three fields (see SubchunkInstance docs):
+//   bits  0-21: occupancy slot index (22 bits)  — selects entry in g_occ_array
+//   bits 22-25: LOD level (4 bits)              — voxel_size = 1 << level
+//   bits 26-31: directional exposure mask (6 b) — consumed by the cull shader
 struct Instance {
     int3 origin;
     uint slot_mask;
@@ -86,17 +87,24 @@ void main(uint vid : SV_VertexID,
           out float3                   world_pos   : TEXCOORD0,
           out float                    inside_flag : TEXCOORD1,
           out nointerpolation uint     occ_slot    : TEXCOORD2,
-          out nointerpolation int3     origin      : TEXCOORD3) {
+          out nointerpolation int3     origin      : TEXCOORD3,
+          out nointerpolation float    voxel_size  : TEXCOORD4) {
     // Look up which candidate this instance corresponds to.
     uint     slot = g_visible[iid];
     Instance inst = g_instances[slot];
 
+    // Per-instance LOD scale: voxel edge length in world units.
+    // At L0 voxel_size = 1, cube_extent = 8. Each level doubles both.
+    uint  lvl         = (inst.slot_mask >> 22u) & 0xFu;
+    float vox_size    = float(1u << lvl);
+    float cube_extent = 8.0 * vox_size;
+
     // Uniform per-cube: is the camera inside (or near-plane-close to) this
-    // sub-chunk's [origin, origin+8]^3 box? Evaluated 36 times per draw
-    // rather than per-fragment to keep the fragment stage branchless beyond a
-    // single select.
+    // sub-chunk's [origin, origin + cube_extent]^3 box? Evaluated 36 times
+    // per draw rather than per-fragment to keep the fragment stage branchless
+    // beyond a single select.
     float3 lo     = float3(inst.origin);
-    float3 hi     = lo + float3(8.0, 8.0, 8.0);
+    float3 hi     = lo + float3(cube_extent, cube_extent, cube_extent);
     float3 margin = float3(INSIDE_MARGIN, INSIDE_MARGIN, INSIDE_MARGIN);
     bool inside   = all(g_camera.pos > lo - margin)
                  && all(g_camera.pos < hi + margin);
@@ -111,7 +119,7 @@ void main(uint vid : SV_VertexID,
     uint vid_eff = inside ? ((vid / 3u) * 3u + flipped) : vid;
 
     float3 unit = CUBE_VERTS[vid_eff];
-    float3 w    = unit * 8.0 + float3(inst.origin);
+    float3 w    = unit * cube_extent + float3(inst.origin);
 
     // View-space coordinates via the camera basis. forward is the look
     // direction so view-space z is +forward for points in front of the camera.
@@ -129,6 +137,7 @@ void main(uint vid : SV_VertexID,
     sv_pos      = float4((f / g_camera.aspect) * vx, f * vy, A * vz + B, vz);
     world_pos   = w;
     inside_flag = inside ? 1.0 : 0.0;
-    occ_slot    = inst.slot_mask & 0x03FFFFFFu;
+    occ_slot    = inst.slot_mask & 0x003FFFFFu;
     origin      = inst.origin;
+    voxel_size  = vox_size;
 }

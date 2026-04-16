@@ -22,6 +22,8 @@ use renderer::{FrameCount, RendererContext, RendererError};
 use renderer::{SUBCHUNK_DEPTH_FORMAT, SubchunkCamera, nodes};
 use renderer::graph::{BufferPool, RenderGraph, TextureDesc, TexturePool};
 
+use crate::world::coord::Level;
+use crate::world::residency::LevelConfig;
 use crate::world_view::WorldView;
 use winit::{
     application::ApplicationHandler,
@@ -73,6 +75,13 @@ struct App {
     pitch:  f32,
     keys:   HashSet<KeyCode>,
     last_t: Option<Instant>,
+
+    // --- Debug toggles ---
+    /// When `true`, `WorldView::update` is skipped so residency (and the
+    /// resulting GPU state) stays frozen. The camera still moves, which
+    /// lets you orbit around the frozen content to inspect LOD artefacts
+    /// from multiple angles. Toggled by `L`.
+    lod_frozen: bool,
 }
 
 impl App {
@@ -83,13 +92,15 @@ impl App {
             world_view: None,
             buf_pool:   BufferPool::default(),
             tex_pool:   TexturePool::default(),
-            // Starting pose: camera outside the initial 3³ L0 shell
-            // ([-8, 16]^3 voxel extent), looking toward +Z.
+            // Starting pose: camera outside the initial L0 shell,
+            // looking toward +Z. At radius 2 the L0 shell world AABB is
+            // `[-16, 16]³` centered on the origin anchor vertex.
             pos:    [4.0, 4.0, -40.0],
             yaw:    0.0,
             pitch:  0.0,
             keys:   HashSet::new(),
             last_t: None,
+            lod_frozen: false,
         }
     }
 }
@@ -174,9 +185,23 @@ impl ApplicationHandler for App {
         ctx.configure_surface(w, h);
 
         // Bring up the residency-driven world view. Populates the GPU's
-        // instance and occupancy buffers from the initial L0 shell around
-        // the camera before the first render.
-        let world_view = WorldView::new(&ctx, self.pos);
+        // instance and occupancy buffers from the initial multi-level
+        // shells around the camera before the first render.
+        //
+        // Three levels at radius 2 → 3 × 64 = 192 resident sub-chunks
+        // (fits in the 256 MAX_CANDIDATES budget). Coverage (world
+        // widths, centered on the shared anchor vertex): L0 32 m,
+        // L1 64 m, L2 128 m. Radii must be even so each level's shell
+        // aligns to an integer cluster of next-coarser sub-chunks —
+        // that's what lets the cull's "fully inside finer shell" test
+        // cull an exact 2×2×2 = 8 sub-chunks per coarser level instead
+        // of straddling boundaries.
+        let configs = [
+            LevelConfig { level: Level::ZERO, radius: [2, 2, 2] },
+            LevelConfig { level: Level(1),    radius: [2, 2, 2] },
+            LevelConfig { level: Level(2),    radius: [2, 2, 2] },
+        ];
+        let world_view = WorldView::new(&ctx, &configs, self.pos);
         self.world_view = Some(world_view);
 
         self.ctx    = Some(ctx);
@@ -243,6 +268,16 @@ impl ApplicationHandler for App {
                     }
                     event_loop.exit();
                     return;
+                }
+
+                // L toggles LOD-streaming freeze. Residency stops updating
+                // so the camera can orbit without mutating what's loaded.
+                if code == KeyCode::KeyL && state == ElementState::Pressed && !repeat {
+                    self.lod_frozen = !self.lod_frozen;
+                    eprintln!(
+                        "lod streaming {}",
+                        if self.lod_frozen { "frozen" } else { "resumed" },
+                    );
                 }
 
                 // Track held-key state for per-frame integration. Ignore
@@ -319,13 +354,19 @@ impl ApplicationHandler for App {
                 // Drive residency off the current camera position before
                 // uploading per-frame GPU state. `update` handles evictions,
                 // prep synthesis, slot uploads, and instance-list rebuild.
-                world_view.update(ctx, self.pos);
-                if world_view.evicted_last_update() > 0 {
-                    eprintln!(
-                        "evicted {} sub-chunks (total {})",
-                        world_view.evicted_last_update(),
-                        world_view.evicted_total(),
-                    );
+                // When LOD is frozen, skip the residency update — camera
+                // still moves for rendering, but sub-chunk contents stay
+                // put so the hole / artefact being inspected does not roll
+                // away under the camera.
+                if !self.lod_frozen {
+                    world_view.update(ctx, self.pos);
+                    if world_view.evicted_last_update() > 0 {
+                        eprintln!(
+                            "evicted {} sub-chunks (total {})",
+                            world_view.evicted_last_update(),
+                            world_view.evicted_total(),
+                        );
+                    }
                 }
                 world_view.renderer().write_camera(ctx, &camera);
 

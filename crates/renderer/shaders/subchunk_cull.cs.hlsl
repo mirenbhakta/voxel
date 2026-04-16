@@ -1,11 +1,11 @@
 // subchunk_cull.cs.hlsl — GPU frustum + exposure cull pass for the
-// sub-chunk prototype.
+// sub-chunk pipeline.
 //
-// One thread per candidate sub-chunk (MAX_CANDIDATES = 64). Thread 0
+// One thread per candidate sub-chunk (MAX_CANDIDATES = 256). Thread 0
 // initialises the transient indirect-args buffer (pool hands back undefined
 // contents). After the barrier, every thread runs two cheap rejections
 // against its candidate:
-//   1. Frustum test on the [origin, origin+8]^3 AABB.
+//   1. Frustum test on the [origin, origin + 8*voxel_size]^3 AABB.
 //   2. Directional-exposure test: if none of the sub-chunk's face-exposure
 //      bits overlap the camera-visible face directions (derived from the
 //      camera position relative to the AABB), the sub-chunk contributes no
@@ -13,8 +13,10 @@
 // Survivors atomically append their index to the visible list and
 // increment the indirect draw instance count.
 //
-// The draw-count buffer is a persistent constant = 1 written once at
-// SubchunkTest construction and never touched here; fanout lives in
+// `slot_mask` packs slot / level / exposure; see subchunk.vs.hlsl for the
+// bit layout. Level is needed here for the per-instance cube extent.
+//
+// The draw-count buffer is a persistent constant = 1; fanout lives in
 // instance_count on the single indirect entry.
 //
 // Binding layout:
@@ -24,9 +26,11 @@
 // path does not remap — so HLSL binding numbers must equal their ordinal
 // position within the reflected set):
 //   0: Camera       (uniform, 64 bytes)
-//   1: instances    (StorageBuffer<Instance>, read-only; slot_mask carries
-//                   the 6-bit directional exposure mask in its high bits)
+//   1: instances    (StorageBuffer<Instance>, read-only)
 //   2: visible      (RWStorageBuffer<uint>)
+//   3: lod_mask     (uniform, 512 bytes) — per-level finer-shell AABB;
+//                   sub-chunks whose AABB is fully inside their level's
+//                   mask entry are dropped (the finer level renders them).
 //
 // Set 1 — owned by the cull node; the indirect-args bind group is built
 // from this pipeline's reflected set-1 layout, not supplied by the caller:
@@ -43,24 +47,35 @@ struct Camera {
     float  _pad1;
 };
 
-// slot_mask packs two fields:
-//   low 26 bits: occupancy slot index (unused by the cull shader itself)
-//   high  6 bits: directional exposure mask
+// slot_mask packs three fields:
+//   bits  0-21: occupancy slot index (22 bits, unused by the cull shader)
+//   bits 22-25: LOD level (4 bits)            — used here for extent
+//   bits 26-31: directional exposure mask (6) — used here for rejection
 //                 bit 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
 struct Instance {
     int3 origin;
     uint slot_mask;
 };
 
+// Per-level finer-shell AABB. Layout mirrors Rust `LodMaskUniform`:
+// `lo[N].xyz` and `hi[N].xyz` describe the world-space box that level N
+// should defer to (the next-finer configured level's shell). `hi[N].w` is
+// an active flag — `0` for level 0 and for any unconfigured level.
+struct LodMask {
+    float4 lo[16];
+    float4 hi[16];
+};
+
 [[vk::binding(0, 0)]] ConstantBuffer<Camera>     g_camera;
 [[vk::binding(1, 0)]] StructuredBuffer<Instance> g_instances;
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint>   g_visible;
+[[vk::binding(3, 0)]] ConstantBuffer<LodMask>    g_lod_mask;
 [[vk::binding(0, 1)]] RWStructuredBuffer<uint4>  g_indirect; // uint4 = {vertex_count, instance_count, first_vertex, first_instance}
 
-static const uint  MAX_CANDIDATES = 64u;
-static const float SUB            = 8.0;
-static const float NEAR_PLANE     = 0.1;
-static const float FAR_PLANE      = 1000.0;
+static const uint  MAX_CANDIDATES   = 256u;
+static const float SUBCHUNK_VOXELS  = 8.0;   // voxels per sub-chunk edge (level-invariant)
+static const float NEAR_PLANE       = 0.1;
+static const float FAR_PLANE        = 1000.0;
 
 // AABB frustum test.
 //
@@ -123,7 +138,7 @@ bool frustum_visible(float3 lo, float3 hi) {
     return true;
 }
 
-[numthreads(64, 1, 1)]
+[numthreads(256, 1, 1)]
 void main(uint3 tid : SV_DispatchThreadID, uint ltid : SV_GroupIndex) {
     // Thread 0 initialises the indirect-draw entry. g_indirect is a graph
     // transient — pool hands back undefined contents — so we must write the
@@ -141,12 +156,28 @@ void main(uint3 tid : SV_DispatchThreadID, uint ltid : SV_GroupIndex) {
         return;
     }
 
-    Instance inst = g_instances[tid.x];
-    float3   lo   = float3(inst.origin);
-    float3   hi   = lo + float3(SUB, SUB, SUB);
+    Instance inst         = g_instances[tid.x];
+    uint     level        = (inst.slot_mask >> 22u) & 0xFu;
+    float    voxel_size   = float(1u << level);
+    float    cube_extent  = SUBCHUNK_VOXELS * voxel_size;
+    float3   lo           = float3(inst.origin);
+    float3   hi           = lo + float3(cube_extent, cube_extent, cube_extent);
 
     if (!frustum_visible(lo, hi)) {
         return;
+    }
+
+    // LOD cascade rejection: if this sub-chunk's AABB is fully inside the
+    // next-finer level's shell, a finer-level instance is rendering every
+    // fragment we would produce — drop without emission. Partial overlaps
+    // proceed; the pixel shader handles the partial-coverage discard.
+    float4 mask_hi_v = g_lod_mask.hi[level];
+    if (mask_hi_v.w > 0.5) {
+        float3 mask_lo = g_lod_mask.lo[level].xyz;
+        float3 mask_hi = mask_hi_v.xyz;
+        if (all(lo >= mask_lo) && all(hi <= mask_hi)) {
+            return;
+        }
     }
 
     // Directional-exposure rejection.
