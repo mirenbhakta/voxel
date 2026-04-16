@@ -17,7 +17,9 @@
 // SubchunkTest construction and never touched here; fanout lives in
 // instance_count on the single indirect entry.
 //
-// Binding layout (set 0) — all user bindings consecutive from 1 so the
+// Binding layout:
+//
+// Set 0 — caller-supplied bindings, all consecutive from 1 so the
 // wgpu-hal Vulkan compaction leaves HLSL binding N == VK binding N:
 //   0: GpuConsts    (declared in include/gpu_consts.hlsl; pipeline reflection
 //                   asserts this slot is the GpuConsts uniform — unused here)
@@ -25,7 +27,9 @@
 //   2: instances    (StorageBuffer<Instance>, read-only; slot_mask carries
 //                   the 6-bit directional exposure mask in its high bits)
 //   3: visible      (RWStorageBuffer<uint>)
-//   4: indirect     (RWStorageBuffer<uint4>, one entry = DrawIndirectArgs)
+//
+// Set 1 — cull-internal binding, owned by the cull node, not the caller:
+//   0: indirect     (RWStorageBuffer<uint4>, one entry = DrawIndirectArgs)
 #include "include/gpu_consts.hlsl"
 
 struct Camera {
@@ -51,7 +55,7 @@ struct Instance {
 [[vk::binding(1, 0)]] ConstantBuffer<Camera>     g_camera;
 [[vk::binding(2, 0)]] StructuredBuffer<Instance> g_instances;
 [[vk::binding(3, 0)]] RWStructuredBuffer<uint>   g_visible;
-[[vk::binding(4, 0)]] RWStructuredBuffer<uint4>  g_indirect; // uint4 = {vertex_count, instance_count, first_vertex, first_instance}
+[[vk::binding(0, 1)]] RWStructuredBuffer<uint4>  g_indirect; // uint4 = {vertex_count, instance_count, first_vertex, first_instance}
 
 static const uint  MAX_CANDIDATES = 64u;
 static const float SUB            = 8.0;

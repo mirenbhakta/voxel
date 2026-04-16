@@ -191,15 +191,19 @@ pub struct Commands<'a> {
 impl Commands<'_> {
     /// Record a compute dispatch.
     ///
+    /// `bind_groups` is bound in order — `bind_groups[0]` is set 0,
+    /// `bind_groups[1]` is set 1, and so on.  Callers that only need a
+    /// single bind group pass `&[bg]`.
+    ///
     /// `workgroups` is the dispatch grid in workgroups — `[x, y, z]`.
     /// `immediates` is the immediate-data payload; pass `&[]` if the pipeline
     /// declares no immediate data.
     pub fn dispatch(
         &mut self,
-        pipeline   : &ComputePipeline,
-        bind_group : &wgpu::BindGroup,
-        workgroups : [u32; 3],
-        immediates : &[u8],
+        pipeline    : &ComputePipeline,
+        bind_groups : &[&wgpu::BindGroup],
+        workgroups  : [u32; 3],
+        immediates  : &[u8],
     ) {
         let mut cpass = self.encoder.begin_compute_pass(
             &wgpu::ComputePassDescriptor {
@@ -208,7 +212,9 @@ impl Commands<'_> {
             },
         );
         cpass.set_pipeline(pipeline.inner());
-        cpass.set_bind_group(0, bind_group, &[]);
+        for (i, bg) in bind_groups.iter().enumerate() {
+            cpass.set_bind_group(i as u32, *bg, &[]);
+        }
         if !immediates.is_empty() {
             cpass.set_immediates(0, immediates);
         }
@@ -219,28 +225,33 @@ impl Commands<'_> {
     ///
     /// Computes workgroups-X as `count.div_ceil(x)` where `x` is the first
     /// component of [`ComputePipeline::workgroup_size`].  Y and Z are 1.
+    ///
+    /// `bind_groups` is bound in order — each group is bound at its slice
+    /// index, so `[bg0, bg1]` sets group 0 and group 1.
     /// `immediates` is the immediate-data payload; pass `&[]` if the pipeline
     /// declares no immediate data.
     pub fn dispatch_linear(
         &mut self,
-        pipeline   : &ComputePipeline,
-        bind_group : &wgpu::BindGroup,
-        count      : u32,
-        immediates : &[u8],
+        pipeline    : &ComputePipeline,
+        bind_groups : &[&wgpu::BindGroup],
+        count       : u32,
+        immediates  : &[u8],
     ) {
         let wg = pipeline.workgroup_size()[0];
         let x  = count.div_ceil(wg);
-        self.dispatch(pipeline, bind_group, [x, 1, 1], immediates);
+        self.dispatch(pipeline, bind_groups, [x, 1, 1], immediates);
     }
 
     /// Record an indirect compute dispatch.
     ///
+    /// `bind_groups` is bound in order — each group is bound at its slice
+    /// index, so `[bg0, bg1]` sets group 0 and group 1.
     /// `immediates` is the immediate-data payload; pass `&[]` if the pipeline
     /// declares no immediate data.
     pub fn dispatch_indirect(
         &mut self,
         pipeline     : &ComputePipeline,
-        bind_group   : &wgpu::BindGroup,
+        bind_groups  : &[&wgpu::BindGroup],
         indirect_buf : &wgpu::Buffer,
         offset       : u64,
         immediates   : &[u8],
@@ -252,7 +263,9 @@ impl Commands<'_> {
             },
         );
         cpass.set_pipeline(pipeline.inner());
-        cpass.set_bind_group(0, bind_group, &[]);
+        for (i, bg) in bind_groups.iter().enumerate() {
+            cpass.set_bind_group(i as u32, *bg, &[]);
+        }
         if !immediates.is_empty() {
             cpass.set_immediates(0, immediates);
         }

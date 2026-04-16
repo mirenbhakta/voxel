@@ -59,6 +59,11 @@ pub struct ShaderModule {
     /// `(binding_slot, kind)` pairs sorted by slot. Visibility is populated
     /// by the pipeline constructor that consumes this `ShaderModule`.
     pub bind_entries        : Vec<(u32, BindKind)>,
+    /// All descriptor-set-1 bindings reflected from the shader, as
+    /// `(binding_slot, kind)` pairs sorted by slot. Empty for shaders that
+    /// declare no set-1 resources. Visibility is populated by the pipeline
+    /// constructor that consumes this `ShaderModule`.
+    pub set1_bind_entries   : Vec<(u32, BindKind)>,
     /// The shader stage of this module's entry point.
     pub stage               : wgpu::ShaderStages,
 }
@@ -105,17 +110,21 @@ impl ShaderModule {
             );
         }
 
-        let inner       = create_wgpu_module(ctx, label, ShaderSource::Spirv(spv_bytes));
-        let bind_entries = reflected.entries.into_iter()
+        let inner            = create_wgpu_module(ctx, label, ShaderSource::Spirv(spv_bytes));
+        let bind_entries     = reflected.entries.into_iter()
+            .map(|e| (e.binding, e.kind))
+            .collect();
+        let set1_bind_entries = reflected.set1_entries.into_iter()
             .map(|e| (e.binding, e.kind))
             .collect();
 
         Ok(Self {
             inner,
-            entry_point     : entry_point.to_owned(),
-            workgroup_size  : reflected.workgroup_size,
+            entry_point       : entry_point.to_owned(),
+            workgroup_size    : reflected.workgroup_size,
             gpu_consts_byte_size: reflected.gpu_consts_byte_size,
             bind_entries,
+            set1_bind_entries,
             stage,
         })
     }

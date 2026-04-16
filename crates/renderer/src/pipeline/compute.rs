@@ -71,11 +71,13 @@ pub struct ComputePipelineDescriptor<'a> {
 ///
 /// See module-level documentation.
 pub struct ComputePipeline {
-    pipeline     : wgpu::ComputePipeline,
-    bg_layout    : wgpu::BindGroupLayout,
-    bind_entries : Vec<BindEntry>,
-    workgroup_size: [u32; 3],
-    label        : String,
+    pipeline          : wgpu::ComputePipeline,
+    bg_layout         : wgpu::BindGroupLayout,
+    bind_entries      : Vec<BindEntry>,
+    bg_layout_1       : Option<wgpu::BindGroupLayout>,
+    set1_bind_entries : Vec<BindEntry>,
+    workgroup_size    : [u32; 3],
+    label             : String,
 }
 
 // --- ComputePipeline ---
@@ -142,7 +144,7 @@ impl ComputePipeline {
             ),
         }
 
-        // Step 3: build BindEntry list and wgpu::BindGroupLayout.
+        // Step 3: build BindEntry list and wgpu::BindGroupLayout for set 0.
         let mut bind_entries: Vec<BindEntry> = desc.shader.bind_entries.iter()
             .map(|&(binding, kind)| BindEntry {
                 binding,
@@ -167,13 +169,50 @@ impl ComputePipeline {
                 entries: &wgpu_entries,
             });
 
+        // Build set-1 BindEntry list and wgpu::BindGroupLayout, if the shader
+        // declares any set-1 resources.
+        let mut set1_bind_entries: Vec<BindEntry> = desc.shader.set1_bind_entries.iter()
+            .map(|&(binding, kind)| BindEntry {
+                binding,
+                kind,
+                visibility: desc.shader.stage,
+            })
+            .collect();
+        set1_bind_entries.sort_by_key(|e| e.binding);
+
+        let bg_layout_1: Option<wgpu::BindGroupLayout> = if set1_bind_entries.is_empty() {
+            None
+        }
+        else {
+            let wgpu_set1_entries: Vec<wgpu::BindGroupLayoutEntry> =
+                set1_bind_entries.iter()
+                    .map(|e| wgpu::BindGroupLayoutEntry {
+                        binding   : e.binding,
+                        visibility: e.visibility,
+                        ty        : bind_kind_to_wgpu_ty(e.kind),
+                        count     : None,
+                    })
+                    .collect();
+
+            Some(ctx.device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label  : Some(desc.label),
+                entries: &wgpu_set1_entries,
+            }))
+        };
+
         // Step 4: create the wgpu pipeline.
-        let pipeline_layout =
+        let pipeline_layout = {
+            let bg_layouts: Vec<Option<&wgpu::BindGroupLayout>> = match &bg_layout_1 {
+                Some(l) => vec![Some(&bg_layout), Some(l)],
+                None    => vec![Some(&bg_layout)],
+            };
+
             ctx.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label             : Some(desc.label),
-                bind_group_layouts: &[Some(&bg_layout)],
+                bind_group_layouts: &bg_layouts,
                 immediate_size    : desc.immediate_size,
-            });
+            })
+        };
 
         let pipeline =
             ctx.device().create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -191,6 +230,8 @@ impl ComputePipeline {
             pipeline,
             bg_layout,
             bind_entries,
+            bg_layout_1,
+            set1_bind_entries,
             workgroup_size: workgroup_size.unwrap_or([1, 1, 1]),
             label: desc.label.to_string(),
         }
@@ -220,6 +261,14 @@ impl PipelineBindLayout for ComputePipeline {
 
     fn bind_entries(&self) -> &[BindEntry] {
         &self.bind_entries
+    }
+
+    fn bg_layout_set1(&self) -> Option<&wgpu::BindGroupLayout> {
+        self.bg_layout_1.as_ref()
+    }
+
+    fn bind_entries_set1(&self) -> &[BindEntry] {
+        &self.set1_bind_entries
     }
 }
 

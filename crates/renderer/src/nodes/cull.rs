@@ -34,12 +34,9 @@ pub struct CullArgs {
 /// a freshly-minted version.  Callers therefore do not pass separate
 /// read/write lists.
 ///
-/// The cull output indirect buffer is identified by
-/// `indirect.indirect` — the caller is responsible for ensuring that
-/// resource is also bound **read-write** in `bind_group` (the cull shader
-/// needs storage access to write it, and the graph looks up the
-/// post-write handle via [`BindGroupWrites::write_of`](
-/// crate::graph::BindGroupWrites::write_of)).
+/// The cull node owns the indirect-buffer binding internally via a set-1
+/// bind group built from the pipeline's reflected set-1 layout — callers do
+/// not include the indirect buffer in their `bind_group`.
 ///
 /// `indirect.count` is passed through unchanged: when the count buffer
 /// is a fixed persistent value that the cull shader does not touch, it
@@ -57,15 +54,22 @@ pub fn cull(
 )
     -> IndirectArgs
 {
+    let internal_bg = graph.create_internal_bind_group(
+        "cull_internal",
+        pipeline.as_ref(),
+        &[(0, indirect.indirect.into())],
+    );
+
     graph.add_pass("cull", |pass| {
-        let writes     = pass.use_bind_group(bind_group);
-        let indirect_v = writes.write_of(indirect.indirect);
+        pass.use_bind_group(bind_group);
+        let indirect_v = pass.write_buffer(indirect.indirect);
         let pipeline   = Arc::clone(pipeline);
         let workgroups = args.workgroups;
 
         pass.execute(move |ctx| {
-            let bg = ctx.resources.bind_group(bind_group);
-            ctx.commands.dispatch(&pipeline, bg, workgroups, &[]);
+            let ext_bg = ctx.resources.bind_group(bind_group);
+            let int_bg = ctx.resources.bind_group(internal_bg);
+            ctx.commands.dispatch(&pipeline, &[ext_bg, int_bg], workgroups, &[]);
         });
 
         IndirectArgs {

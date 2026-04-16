@@ -28,6 +28,20 @@ pub trait PipelineBindLayout {
     /// All descriptor-set-0 binding entries, sorted by slot, with visibility
     /// populated for the pipeline's stage(s).
     fn bind_entries(&self) -> &[BindEntry];
+
+    /// The wgpu bind group layout for descriptor set 1, if the pipeline
+    /// declares any set-1 resources.  `None` by default — only
+    /// [`ComputePipeline`] overrides this when the shader has set-1 bindings.
+    fn bg_layout_set1(&self) -> Option<&wgpu::BindGroupLayout> {
+        None
+    }
+
+    /// All descriptor-set-1 binding entries, sorted by slot, with visibility
+    /// populated for the pipeline's stage(s).  Empty by default — only
+    /// [`ComputePipeline`] overrides this when the shader has set-1 bindings.
+    fn bind_entries_set1(&self) -> &[BindEntry] {
+        &[]
+    }
 }
 
 // --- bind_kind_to_wgpu_ty ---

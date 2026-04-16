@@ -2,8 +2,8 @@
 //!
 //! Exposes [`reflect_spirv`] which parses a SPIR-V binary, locates a named
 //! entry point, and returns [`Reflected`] — the workgroup size, the
-//! uniform-buffer byte size at slot 0, and the full descriptor-set-0 entry
-//! list.
+//! uniform-buffer byte size at slot 0, the full descriptor-set-0 entry list,
+//! and the descriptor-set-1 entry list.
 //!
 //! The implementation uses `rspirv`'s data-representation layer (`rspirv::dr`)
 //! and scans the module's `entry_points`, `execution_modes`, `annotations`,
@@ -20,10 +20,10 @@ use crate::pipeline::binding::BindKind;
 
 // --- ReflectedEntry ---
 
-/// A single binding reflected from a SPIR-V descriptor set 0 variable.
+/// A single binding reflected from a SPIR-V descriptor set variable.
 #[derive(Debug, Clone)]
 pub struct ReflectedEntry {
-    /// The `[[vk::binding(N, 0)]]` slot number.
+    /// The `[[vk::binding(N, S)]]` slot number within its descriptor set.
     pub binding : u32,
     /// Classification of the resource accessed at this slot.
     pub kind    : BindKind,
@@ -47,6 +47,9 @@ pub struct Reflected {
     pub gpu_consts_byte_size: Option<u32>,
     /// All bindings in descriptor set 0, sorted by binding number.
     pub entries             : Vec<ReflectedEntry>,
+    /// All bindings in descriptor set 1, sorted by binding number.
+    /// Empty for shaders that declare no set-1 resources.
+    pub set1_entries        : Vec<ReflectedEntry>,
 }
 
 // --- Public API ---
@@ -80,11 +83,15 @@ pub fn entry_point_stage(spv: &[u8], entry_point: &str)
 pub fn reflect_spirv(spv: &[u8], entry_point: &str)
     -> Result<Reflected, RendererError>
 {
-    let module          = parse_module(spv)?;
-    let ep              = find_entry_point(&module, entry_point)?;
-    let workgroup_size  = find_workgroup_size(&module, ep.fn_id, entry_point)?;
-    let mut entries     = reflect_set0_entries(&module)?;
+    let module         = parse_module(spv)?;
+    let ep             = find_entry_point(&module, entry_point)?;
+    let workgroup_size = find_workgroup_size(&module, ep.fn_id, entry_point)?;
+
+    let mut entries      = reflect_set_entries(&module, 0)?;
     entries.sort_by_key(|e| e.binding);
+
+    let mut set1_entries = reflect_set_entries(&module, 1)?;
+    set1_entries.sort_by_key(|e| e.binding);
 
     let gpu_consts_byte_size = entries.iter()
         .find(|e| e.binding == 0)
@@ -93,7 +100,7 @@ pub fn reflect_spirv(spv: &[u8], entry_point: &str)
             _ => None,
         });
 
-    Ok(Reflected { workgroup_size, gpu_consts_byte_size, entries })
+    Ok(Reflected { workgroup_size, gpu_consts_byte_size, entries, set1_entries })
 }
 
 // --- Error helper ---
@@ -312,17 +319,17 @@ fn extract_literal_bit32(
     ))
 }
 
-// --- Descriptor set 0 reflection ---
+// --- Descriptor set reflection ---
 
 /// Walk all `module.annotations` to find every variable decorated with
-/// `DescriptorSet = 0`, then classify each one into a [`ReflectedEntry`].
-fn reflect_set0_entries(module: &Module)
+/// `DescriptorSet = set`, then classify each one into a [`ReflectedEntry`].
+fn reflect_set_entries(module: &Module, set: u32)
     -> Result<Vec<ReflectedEntry>, RendererError>
 {
-    let set0_bindings = collect_set0_bindings(module);
-    let mut entries   = Vec::with_capacity(set0_bindings.len());
+    let bindings  = collect_set_bindings(module, set);
+    let mut entries = Vec::with_capacity(bindings.len());
 
-    for (var_id, binding) in set0_bindings {
+    for (var_id, binding) in bindings {
         let kind = classify_var(module, var_id, binding)?;
         entries.push(ReflectedEntry { binding, kind });
     }
@@ -331,15 +338,15 @@ fn reflect_set0_entries(module: &Module)
 }
 
 /// Collect `(var_id, binding)` for every variable that has both
-/// `OpDecorate DescriptorSet 0` and `OpDecorate Binding N`.
-fn collect_set0_bindings(module: &Module) -> Vec<(Word, u32)> {
-    let mut set0_vars  : Vec<Word>         = Vec::new();
-    let mut binding_map: Vec<(Word, u32)>  = Vec::new();
+/// `OpDecorate DescriptorSet <set>` and `OpDecorate Binding N`.
+fn collect_set_bindings(module: &Module, set: u32) -> Vec<(Word, u32)> {
+    let mut set_vars   : Vec<Word>        = Vec::new();
+    let mut binding_map: Vec<(Word, u32)> = Vec::new();
 
     for (target, deco, extras) in decorates(module) {
         match deco {
-            Decoration::DescriptorSet if as_lit(extras.first()) == Some(0) => {
-                set0_vars.push(target);
+            Decoration::DescriptorSet if as_lit(extras.first()) == Some(set) => {
+                set_vars.push(target);
             }
             Decoration::Binding => {
                 if let Some(n) = as_lit(extras.first()) {
@@ -351,7 +358,7 @@ fn collect_set0_bindings(module: &Module) -> Vec<(Word, u32)> {
     }
 
     binding_map.into_iter()
-        .filter(|(id, _)| set0_vars.contains(id))
+        .filter(|(id, _)| set_vars.contains(id))
         .collect()
 }
 
@@ -989,6 +996,103 @@ mod tests {
         w.push(0x00010038);
 
         w.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// Build a SPIR-V compute shader with a read-write storage buffer on
+    /// `(set=1, binding=0)` and no set-0 resources beyond the mandatory
+    /// GpuConsts uniform.
+    ///
+    /// IDs: %1=void, %2=voidfn, %3=main, %4=label,
+    ///      %5=uint, %6=rta, %7=struct, %8=ptr, %9=var. Bound=10.
+    fn compute_spirv_with_set1_storage_rw(x: u32, y: u32, z: u32) -> Vec<u8> {
+        let mut w: Vec<u32> = Vec::new();
+
+        // Header (bound = 10)
+        w.extend_from_slice(&[0x07230203, 0x00010100, 0x00000000, 0x0000000A, 0x00000000]);
+
+        // OpCapability Shader
+        w.extend_from_slice(&[0x00020011, 0x00000001]);
+
+        // OpMemoryModel Logical GLSL450
+        w.extend_from_slice(&[0x0003000E, 0x00000000, 0x00000001]);
+
+        // OpEntryPoint GLCompute %3 "main"
+        w.extend_from_slice(&[0x0005000F, 0x00000005, 0x00000003, 0x6E69616D, 0x00000000]);
+
+        // OpExecutionMode %3 LocalSize x y z
+        w.extend_from_slice(&[0x00060010, 0x00000003, 0x00000011, x, y, z]);
+
+        // --- Annotations ---
+
+        // Storage buffer on set=1, binding=0:
+        // OpDecorate %9 DescriptorSet 1
+        w.extend_from_slice(&[0x00040047, 0x00000009, 0x00000022, 0x00000001]);
+        // OpDecorate %9 Binding 0
+        w.extend_from_slice(&[0x00040047, 0x00000009, 0x00000021, 0x00000000]);
+        // OpDecorate %7 Block
+        w.extend_from_slice(&[0x00030047, 0x00000007, 0x00000002]);
+        // OpDecorate %6 ArrayStride 4
+        w.extend_from_slice(&[0x00040047, 0x00000006, 0x00000006, 0x00000004]);
+
+        // --- Types ---
+
+        // %1 = OpTypeVoid
+        w.extend_from_slice(&[0x00020013, 0x00000001]);
+        // %2 = OpTypeFunction %1
+        w.extend_from_slice(&[0x00030021, 0x00000002, 0x00000001]);
+        // %5 = OpTypeInt 32 0
+        w.extend_from_slice(&[0x00040015, 0x00000005, 0x00000020, 0x00000000]);
+        // %6 = OpTypeRuntimeArray %5
+        w.extend_from_slice(&[0x0003001D, 0x00000006, 0x00000005]);
+        // %7 = OpTypeStruct %6
+        w.extend_from_slice(&[0x0003001E, 0x00000007, 0x00000006]);
+        // %8 = OpTypePointer StorageBuffer %7  (StorageBuffer=12=0xC)
+        w.extend_from_slice(&[0x00040020, 0x00000008, 0x0000000C, 0x00000007]);
+        // %9 = OpVariable %8 StorageBuffer
+        w.extend_from_slice(&[0x0004003B, 0x00000008, 0x00000009, 0x0000000C]);
+
+        // --- Function ---
+
+        // %3 = OpFunction %1 None %2
+        w.extend_from_slice(&[0x00050036, 0x00000001, 0x00000003, 0x00000000, 0x00000002]);
+        // %4 = OpLabel
+        w.extend_from_slice(&[0x000200F8, 0x00000004]);
+        // OpReturn
+        w.push(0x000100FD);
+        // OpFunctionEnd
+        w.push(0x00010038);
+
+        w.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// A set-1 storage-rw binding appears in `set1_entries` and not in
+    /// `entries` (set 0).
+    #[test]
+    fn reflect_spirv_set1_binding_appears_only_in_set1_entries() {
+        let spv = compute_spirv_with_set1_storage_rw(64, 1, 1);
+        let reflected = reflect_spirv(&spv, "main")
+            .expect("reflect_spirv should succeed on a shader with a set-1 binding");
+
+        assert!(
+            reflected.entries.is_empty(),
+            "set-0 entries should be empty; got {:?}",
+            reflected.entries,
+        );
+
+        assert_eq!(
+            reflected.set1_entries.len(), 1,
+            "expected exactly 1 set-1 entry",
+        );
+        assert_eq!(reflected.set1_entries[0].binding, 0);
+        assert!(
+            matches!(
+                reflected.set1_entries[0].kind,
+                BindKind::StorageBufferReadWrite { size: 4 },
+            ),
+            "set-1 slot 0 should be StorageBufferReadWrite {{ size: 4 }}, \
+             got {:?}",
+            reflected.set1_entries[0].kind,
+        );
     }
 
     /// A 2-binding shader (uniform at 0, storage-rw at 1) reflects the correct

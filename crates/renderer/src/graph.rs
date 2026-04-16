@@ -48,8 +48,8 @@ enum ResourceEntry {
 
 /// Deferred bind-group description registered at graph-build time.
 ///
-/// Records the pipeline's reflected bind entries, the slot-0 GpuConsts buffer,
-/// and the (binding, resource) pairs for user slots.  The actual
+/// Records the pipeline's reflected bind entries, the slot-0 GpuConsts buffer
+/// (if present), and the (binding, resource) pairs for user slots.  The actual
 /// [`wgpu::BindGroup`] is produced during
 /// [`CompiledGraph::resolve_bind_groups`] once every referenced transient
 /// buffer has been allocated.
@@ -57,7 +57,9 @@ struct BindGroupTemplate {
     label          : String,
     bg_layout      : wgpu::BindGroupLayout,
     bind_entries   : Vec<BindEntry>,
-    gpu_consts_buf : wgpu::Buffer,
+    /// `Some` for externally-composed bind groups (set 0 always has GpuConsts).
+    /// `None` for cull-internal bind groups (set 1 has no GpuConsts slot).
+    gpu_consts_buf : Option<wgpu::Buffer>,
     entries        : Vec<(u32, ResourceId)>,
 }
 
@@ -334,7 +336,43 @@ impl RenderGraph {
             label          : label.to_string(),
             bg_layout      : pipeline.bg_layout().clone(),
             bind_entries   : pipeline.bind_entries().to_vec(),
-            gpu_consts_buf : gpu_consts.buffer().clone(),
+            gpu_consts_buf : Some(gpu_consts.buffer().clone()),
+            entries        : entries.to_vec(),
+        });
+        handle
+    }
+
+    /// Register a cull-internal bind group against `pipeline`'s set-1
+    /// reflected layout.
+    ///
+    /// For render-graph nodes that own a dedicated descriptor set in their
+    /// pipeline (such as the cull node's indirect-buffer binding on set 1) —
+    /// not for externally-composed bind groups.  There is no GpuConsts slot
+    /// in a set-1 bind group.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pipeline` does not declare a set-1 layout — check that the
+    /// shader has `[[vk::binding(N, 1)]]` entries.
+    pub fn create_internal_bind_group(
+        &mut self,
+        label    : &str,
+        pipeline : &dyn PipelineBindLayout,
+        entries  : &[(u32, ResourceId)],
+    )
+        -> BindGroupHandle
+    {
+        let handle = BindGroupHandle(self.bind_group_templates.len() as u32);
+        self.bind_group_templates.push(BindGroupTemplate {
+            label          : label.to_string(),
+            bg_layout      : pipeline.bg_layout_set1()
+                .expect(
+                    "create_internal_bind_group: pipeline does not declare set 1 \
+                     — check shader has [[vk::binding(N, 1)]] entries",
+                )
+                .clone(),
+            bind_entries   : pipeline.bind_entries_set1().to_vec(),
+            gpu_consts_buf : None,
             entries        : entries.to_vec(),
         });
         handle
@@ -734,14 +772,18 @@ impl CompiledGraph {
     /// panics with the offending label and resource id.
     fn resolve_bind_groups(&mut self, device: &wgpu::Device) {
         for (i, tpl) in self.bind_group_templates.iter().enumerate() {
+            let has_consts = tpl.gpu_consts_buf.is_some();
             let mut bg_entries: Vec<wgpu::BindGroupEntry> =
-                Vec::with_capacity(tpl.entries.len() + 1);
+                Vec::with_capacity(tpl.entries.len() + usize::from(has_consts));
 
-            // Slot 0: GpuConsts — always present, asserted by pipeline construction.
-            bg_entries.push(wgpu::BindGroupEntry {
-                binding  : GpuConsts::SLOT,
-                resource : tpl.gpu_consts_buf.as_entire_binding(),
-            });
+            // Slot 0: GpuConsts — present for externally-composed set-0 bind
+            // groups; absent for cull-internal set-1 bind groups.
+            if let Some(consts_buf) = &tpl.gpu_consts_buf {
+                bg_entries.push(wgpu::BindGroupEntry {
+                    binding  : GpuConsts::SLOT,
+                    resource : consts_buf.as_entire_binding(),
+                });
+            }
 
             // User slots: resolve each ResourceId via entries array.
             for &(binding, res_id) in &tpl.entries {

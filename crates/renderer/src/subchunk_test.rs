@@ -529,7 +529,6 @@ pub fn subchunk_test(
             (1, camera_h.into()),
             (2, instance_h.into()),
             (3, visible_h.into()),
-            (4, indirect_h.into()),
         ],
     );
 
