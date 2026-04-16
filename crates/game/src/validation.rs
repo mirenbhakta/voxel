@@ -1,8 +1,8 @@
 //! GPU primitive validation suite.
 //!
-//! Enabled via `--features validation`.  Runs a series of checks against
-//! real GPU hardware and prints a human-readable report suitable for bug
-//! reports.  Exits with code 0 on full pass, 1 on any failure.
+//! Run via `game --validate`.  Executes a series of checks against real GPU
+//! hardware and prints a human-readable report suitable for bug reports.
+//! Exits with code 0 on full pass, 1 on any failure.
 //!
 //! # What is validated
 //!

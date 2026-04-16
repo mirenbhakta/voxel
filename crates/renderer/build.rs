@@ -20,7 +20,7 @@
 //! without the Vulkan SDK. It is *not* a loadable shader module; anyone who
 //! tries to pass the placeholder through `create_shader_module_passthrough`
 //! at runtime will fail loudly, which is the intended behaviour for CI.
-//! The game crate's validation feature adds a higher-level check that
+//! The game crate's `--validate` mode adds a higher-level check that
 //! pattern-matches this sentinel and prints an actionable message.
 
 use std::ffi::OsStr;

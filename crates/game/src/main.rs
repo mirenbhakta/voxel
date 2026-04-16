@@ -8,33 +8,23 @@
 //! vertical) is wired in so the scene can be navigated for visual debugging.
 //! Cursor is grabbed on window creation; Escape releases it and exits.
 //!
-//! # Validation feature
+//! # Validation mode
 //!
-//! `cargo build --features validation` (or `cargo run --features validation`)
-//! runs a GPU validation suite against real hardware and exits, rather than
-//! opening a window.  Useful for bug reports and CI on GPU-capable machines.
+//! Run `game --validate` (e.g. `cargo run -- --validate`) to execute a GPU
+//! validation suite against real hardware and exit, rather than opening a
+//! window.  Useful for bug reports and CI on GPU-capable machines.
 
-// Windowed-path imports are only needed when the validation feature is off.
-// Gating them suppresses dead_code / unused_imports warnings in validation
-// builds.
-#[cfg(not(feature = "validation"))]
 use std::collections::HashSet;
-#[cfg(not(feature = "validation"))]
 use std::sync::Arc;
-#[cfg(not(feature = "validation"))]
 use std::time::Instant;
 
-#[cfg(not(feature = "validation"))]
 use renderer::{FrameCount, RendererContext, RendererError};
-#[cfg(not(feature = "validation"))]
 use renderer::{
     SUBCHUNK_DEPTH_FORMAT, SUBCHUNK_MAX_CANDIDATES,
     SubchunkInstance, SubchunkTest, TestCamera, nodes,
     occupancy_exposure, sphere_occupancy,
 };
-#[cfg(not(feature = "validation"))]
 use renderer::graph::{BufferPool, RenderGraph, TextureDesc, TexturePool};
-#[cfg(not(feature = "validation"))]
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, KeyEvent, WindowEvent},
@@ -43,37 +33,33 @@ use winit::{
     window::{CursorGrabMode, Window, WindowId},
 };
 
+mod validation;
+
 // ---------------------------------------------------------------------------
 
 fn main() {
-    #[cfg(feature = "validation")]
-    validation::run();
-
-    #[cfg(not(feature = "validation"))]
-    {
-        let event_loop = EventLoop::new().expect("failed to create event loop");
-        let mut app = App::new();
-        event_loop.run_app(&mut app).expect("event loop error");
+    if std::env::args().any(|a| a == "--validate") {
+        validation::run();
+        return;
     }
+
+    let event_loop = EventLoop::new().expect("failed to create event loop");
+    let mut app = App::new();
+    event_loop.run_app(&mut app).expect("event loop error");
 }
 
 // ---------------------------------------------------------------------------
 
 /// Camera tuning. Units are world voxels (sub-chunks are 8 voxels wide).
-#[cfg(not(feature = "validation"))]
 const MOVE_SPEED:      f32 = 15.0;
-#[cfg(not(feature = "validation"))]
 const MOVE_SPEED_FAST: f32 = 45.0;
-#[cfg(not(feature = "validation"))]
 const MOUSE_SENS:      f32 = 0.0015;
 /// Clamp pitch just shy of ±90° so `right` (built from world-up × forward)
 /// never degenerates.
-#[cfg(not(feature = "validation"))]
 const PITCH_CLAMP:     f32 = 1.553; // ~89°
 
 /// Application state.  Fields are populated on the first `resumed` event
 /// and remain `Some` for the rest of the session.
-#[cfg(not(feature = "validation"))]
 struct App {
     window:        Option<Arc<Window>>,
     ctx:           Option<RendererContext>,
@@ -89,7 +75,6 @@ struct App {
     last_t: Option<Instant>,
 }
 
-#[cfg(not(feature = "validation"))]
 impl App {
     fn new() -> Self {
         Self {
@@ -114,7 +99,6 @@ impl App {
 /// `up = (0, 1, 0)` — matches the shader's left-handed basis where
 /// `cross(right, up) = forward`. Yaw rotates around world-up (+Y); pitch tilts
 /// around the camera's right axis.
-#[cfg(not(feature = "validation"))]
 fn camera_basis(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
     let (sy, cy) = yaw.sin_cos();
     let (sp, cp) = pitch.sin_cos();
@@ -139,7 +123,6 @@ fn camera_basis(yaw: f32, pitch: f32) -> ([f32; 3], [f32; 3], [f32; 3]) {
     (forward, right, up)
 }
 
-#[cfg(not(feature = "validation"))]
 impl ApplicationHandler for App {
     /// Called when the OS grants the application an active event loop.
     ///
@@ -395,8 +378,3 @@ impl ApplicationHandler for App {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "validation")]
-mod validation;
