@@ -28,7 +28,8 @@
 //                   the 6-bit directional exposure mask in its high bits)
 //   2: visible      (RWStorageBuffer<uint>)
 //
-// Set 1 — cull-internal binding, owned by the cull node, not the caller:
+// Set 1 — owned by the cull node; the indirect-args bind group is built
+// from this pipeline's reflected set-1 layout, not supplied by the caller:
 //   0: indirect     (RWStorageBuffer<uint4>, one entry = DrawIndirectArgs)
 
 struct Camera {

@@ -76,7 +76,7 @@ pub fn mdi_draw(
                 },
                 |rp| {
                     rp.multi_draw_indirect_count(
-                        &pipeline, bg,
+                        &pipeline, &[bg],
                         indirect_buf, 0,
                         count_buf,    0,
                         max_draws,

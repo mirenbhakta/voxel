@@ -57,8 +57,10 @@ struct BindGroupTemplate {
     label          : String,
     bg_layout      : wgpu::BindGroupLayout,
     bind_entries   : Vec<BindEntry>,
-    /// `Some` for externally-composed bind groups (set 0 always has GpuConsts).
-    /// `None` for cull-internal bind groups (set 1 has no GpuConsts slot).
+    /// `Some` when the graph auto-wires a [`GpuConsts`] buffer into the
+    /// reserved set-0 slot for externally-composed bind groups.  `None` when
+    /// the caller supplies every slot — notably for set-N bind groups (N > 0)
+    /// owned by a node.
     gpu_consts_buf : Option<wgpu::Buffer>,
     entries        : Vec<(u32, ResourceId)>,
 }
@@ -351,19 +353,18 @@ impl RenderGraph {
         handle
     }
 
-    /// Register a cull-internal bind group against `pipeline`'s set-1
-    /// reflected layout.
+    /// Register a bind group against `pipeline`'s set-1 reflected layout.
     ///
     /// For render-graph nodes that own a dedicated descriptor set in their
-    /// pipeline (such as the cull node's indirect-buffer binding on set 1) —
-    /// not for externally-composed bind groups.  There is no GpuConsts slot
-    /// in a set-1 bind group.
+    /// pipeline (e.g. cull's indirect-buffer binding, or a raster node's
+    /// per-draw storage).  Set-1 bind groups are fully caller-composed —
+    /// there is no reserved GpuConsts slot.
     ///
     /// # Panics
     ///
     /// Panics if `pipeline` does not declare a set-1 layout — check that the
     /// shader has `[[vk::binding(N, 1)]]` entries.
-    pub fn create_internal_bind_group(
+    pub fn create_bind_group_set1(
         &mut self,
         label    : &str,
         pipeline : &dyn PipelineBindLayout,
@@ -376,7 +377,7 @@ impl RenderGraph {
             label          : label.to_string(),
             bg_layout      : pipeline.bg_layout_set1()
                 .expect(
-                    "create_internal_bind_group: pipeline does not declare set 1 \
+                    "create_bind_group_set1: pipeline does not declare set 1 \
                      — check shader has [[vk::binding(N, 1)]] entries",
                 )
                 .clone(),
@@ -847,7 +848,7 @@ impl CompiledGraph {
                 Vec::with_capacity(tpl.entries.len() + usize::from(has_consts));
 
             // Slot 0: GpuConsts — present for externally-composed set-0 bind
-            // groups; absent for cull-internal set-1 bind groups.
+            // groups; absent for caller-composed set-N bind groups.
             if let Some(consts_buf) = &tpl.gpu_consts_buf {
                 bg_entries.push(wgpu::BindGroupEntry {
                     binding  : GpuConsts::SLOT,

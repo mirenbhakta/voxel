@@ -57,76 +57,47 @@ pub struct RenderPipelineDescriptor<'a> {
 ///
 /// [`ComputePipeline`]: crate::pipeline::compute::ComputePipeline
 pub struct RenderPipeline {
-    pipeline     : wgpu::RenderPipeline,
-    bg_layout    : wgpu::BindGroupLayout,
-    bind_entries : Vec<BindEntry>,
-    label        : String,
+    pipeline          : wgpu::RenderPipeline,
+    bg_layout         : wgpu::BindGroupLayout,
+    bind_entries      : Vec<BindEntry>,
+    bg_layout_1       : Option<wgpu::BindGroupLayout>,
+    set1_bind_entries : Vec<BindEntry>,
+    label             : String,
 }
 
 impl RenderPipeline {
     /// Construct a new `RenderPipeline` from `desc`.
     ///
-    /// 1. Merges VS and PS bind entries by slot (kind must match; visibility
-    ///    is unioned).
-    /// 2. Builds `wgpu::BindGroupLayout` from the merged entries.
+    /// 1. Merges VS and PS bind entries by slot, for each declared descriptor
+    ///    set (kind must match; visibility is unioned).
+    /// 2. Builds `wgpu::BindGroupLayout`s from the merged entries — one per
+    ///    non-empty set.
     /// 3. Creates the wgpu render pipeline.
     ///
     /// # Panics
     ///
-    /// Panics if VS and PS entries at the same slot have different kinds.
+    /// Panics if VS and PS entries at the same slot within a set have
+    /// different kinds.
     pub fn new(ctx: &RendererContext, desc: RenderPipelineDescriptor<'_>) -> Self {
-        // Step 1: merge VS and PS entries.
-        // Map: binding → (kind, visibility).
-        let mut merged: Vec<(u32, BindKind, wgpu::ShaderStages)> = Vec::new();
-
-        let add_entries = |merged: &mut Vec<(u32, BindKind, wgpu::ShaderStages)>,
-                           entries: &[(u32, BindKind)],
-                           stage: wgpu::ShaderStages,
-                           shader_label: &str|
-        {
-            for &(binding, kind) in entries {
-                if let Some(existing) = merged.iter_mut().find(|(b, _, _)| *b == binding) {
-                    // Check kind matches.
-                    let existing_kind_discriminant =
-                        std::mem::discriminant(&existing.1);
-                    let new_kind_discriminant = std::mem::discriminant(&kind);
-
-                    if existing_kind_discriminant != new_kind_discriminant {
-                        panic!(
-                            "pipeline `{}`: shader `{}` binding {} kind {:?} \
-                             conflicts with other stage's kind {:?} at the same slot",
-                            shader_label, shader_label, binding, kind, existing.1,
-                        );
-                    }
-
-                    existing.2 |= stage;
-                }
-                else {
-                    merged.push((binding, kind, stage));
-                }
-            }
-        };
-
-        add_entries(
-            &mut merged,
+        // Step 1: merge VS and PS entries, per set.
+        let bind_entries = merge_raster_entries(
             &desc.vertex.bind_entries,
-            desc.vertex.stage,
-            desc.label,
-        );
-        add_entries(
-            &mut merged,
             &desc.fragment.bind_entries,
+            desc.vertex.stage,
             desc.fragment.stage,
             desc.label,
         );
 
-        merged.sort_by_key(|(b, _, _)| *b);
+        let set1_bind_entries = merge_raster_entries(
+            &desc.vertex.set1_bind_entries,
+            &desc.fragment.set1_bind_entries,
+            desc.vertex.stage,
+            desc.fragment.stage,
+            desc.label,
+        );
 
-        // Step 2: build BindEntry list and wgpu::BindGroupLayout.
-        let bind_entries: Vec<BindEntry> = merged.iter()
-            .map(|&(binding, kind, visibility)| BindEntry { binding, kind, visibility })
-            .collect();
-
+        // Step 2: build the set-0 BGL (always present) and the set-1 BGL
+        // (only when the shaders declare set-1 resources).
         let wgpu_entries: Vec<wgpu::BindGroupLayoutEntry> = bind_entries.iter()
             .map(|e| wgpu::BindGroupLayoutEntry {
                 binding   : e.binding,
@@ -142,13 +113,39 @@ impl RenderPipeline {
                 entries: &wgpu_entries,
             });
 
+        let bg_layout_1: Option<wgpu::BindGroupLayout> = if set1_bind_entries.is_empty() {
+            None
+        }
+        else {
+            let wgpu_set1_entries: Vec<wgpu::BindGroupLayoutEntry> =
+                set1_bind_entries.iter()
+                    .map(|e| wgpu::BindGroupLayoutEntry {
+                        binding   : e.binding,
+                        visibility: e.visibility,
+                        ty        : bind_kind_to_wgpu_ty(e.kind),
+                        count     : None,
+                    })
+                    .collect();
+
+            Some(ctx.device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label  : Some(desc.label),
+                entries: &wgpu_set1_entries,
+            }))
+        };
+
         // Step 3: create the wgpu render pipeline.
-        let pipeline_layout =
+        let pipeline_layout = {
+            let bg_layouts: Vec<Option<&wgpu::BindGroupLayout>> = match &bg_layout_1 {
+                Some(l) => vec![Some(&bg_layout), Some(l)],
+                None    => vec![Some(&bg_layout)],
+            };
+
             ctx.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label             : Some(desc.label),
-                bind_group_layouts: &[Some(&bg_layout)],
+                bind_group_layouts: &bg_layouts,
                 immediate_size    : desc.immediate_size,
-            });
+            })
+        };
 
         let pipeline =
             ctx.device().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -177,6 +174,8 @@ impl RenderPipeline {
             pipeline,
             bg_layout,
             bind_entries,
+            bg_layout_1,
+            set1_bind_entries,
             label: desc.label.to_string(),
         }
     }
@@ -200,6 +199,72 @@ impl PipelineBindLayout for RenderPipeline {
     fn bind_entries(&self) -> &[BindEntry] {
         &self.bind_entries
     }
+
+    fn bg_layout_set1(&self) -> Option<&wgpu::BindGroupLayout> {
+        self.bg_layout_1.as_ref()
+    }
+
+    fn bind_entries_set1(&self) -> &[BindEntry] {
+        &self.set1_bind_entries
+    }
+}
+
+// --- merge_raster_entries ---
+
+/// Merge VS and PS bind entries for a single descriptor set.
+///
+/// Bindings at the same slot must have the same kind; the visibility flags
+/// are unioned across stages.  Returns the merged entries sorted by slot.
+///
+/// # Panics
+///
+/// Panics if VS and PS declare the same binding slot with different kinds.
+fn merge_raster_entries(
+    vs_entries : &[(u32, BindKind)],
+    ps_entries : &[(u32, BindKind)],
+    vs_stage   : wgpu::ShaderStages,
+    ps_stage   : wgpu::ShaderStages,
+    label      : &str,
+)
+    -> Vec<BindEntry>
+{
+    let mut merged: Vec<(u32, BindKind, wgpu::ShaderStages)> = Vec::new();
+
+    fn add_entries(
+        merged  : &mut Vec<(u32, BindKind, wgpu::ShaderStages)>,
+        entries : &[(u32, BindKind)],
+        stage   : wgpu::ShaderStages,
+        label   : &str,
+    ) {
+        for &(binding, kind) in entries {
+            if let Some(existing) = merged.iter_mut().find(|(b, _, _)| *b == binding) {
+                let existing_kind_discriminant = std::mem::discriminant(&existing.1);
+                let new_kind_discriminant = std::mem::discriminant(&kind);
+
+                if existing_kind_discriminant != new_kind_discriminant {
+                    panic!(
+                        "pipeline `{}`: binding {} kind {:?} \
+                         conflicts with other stage's kind {:?} at the same slot",
+                        label, binding, kind, existing.1,
+                    );
+                }
+
+                existing.2 |= stage;
+            }
+            else {
+                merged.push((binding, kind, stage));
+            }
+        }
+    }
+
+    add_entries(&mut merged, vs_entries, vs_stage, label);
+    add_entries(&mut merged, ps_entries, ps_stage, label);
+
+    merged.sort_by_key(|(b, _, _)| *b);
+
+    merged.into_iter()
+        .map(|(binding, kind, visibility)| BindEntry { binding, kind, visibility })
+        .collect()
 }
 
 // --- Tests ---

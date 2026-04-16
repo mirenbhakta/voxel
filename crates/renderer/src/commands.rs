@@ -86,33 +86,39 @@ pub struct RasterPass<'a> {
 impl RasterPass<'_> {
     /// Record a draw call.
     ///
-    /// Sets `pipeline`, sets `bind_group` at group 0, and issues a
+    /// Sets `pipeline`, binds each group in `bind_groups` at its slice index
+    /// (`bind_groups[0]` = set 0, `bind_groups[1]` = set 1, …), and issues a
     /// `draw(vertices, instances)` call.
     pub fn draw(
         &mut self,
-        pipeline   : &RenderPipeline,
-        bind_group : &wgpu::BindGroup,
-        vertices   : std::ops::Range<u32>,
-        instances  : std::ops::Range<u32>,
+        pipeline    : &RenderPipeline,
+        bind_groups : &[&wgpu::BindGroup],
+        vertices    : std::ops::Range<u32>,
+        instances   : std::ops::Range<u32>,
     ) {
         self.pass.set_pipeline(pipeline.inner());
-        self.pass.set_bind_group(0, bind_group, &[]);
+        for (i, bg) in bind_groups.iter().enumerate() {
+            self.pass.set_bind_group(i as u32, *bg, &[]);
+        }
         self.pass.draw(vertices, instances);
     }
 
     /// Record an indirect draw call.
     ///
-    /// Sets `pipeline` and `bind_group`, then issues `draw_indirect` reading
-    /// parameters from `indirect_buf` at `offset`.
+    /// Sets `pipeline`, binds each group in `bind_groups` at its slice index,
+    /// then issues `draw_indirect` reading parameters from `indirect_buf` at
+    /// `offset`.
     pub fn draw_indirect(
         &mut self,
         pipeline     : &RenderPipeline,
-        bind_group   : &wgpu::BindGroup,
+        bind_groups  : &[&wgpu::BindGroup],
         indirect_buf : &wgpu::Buffer,
         offset       : u64,
     ) {
         self.pass.set_pipeline(pipeline.inner());
-        self.pass.set_bind_group(0, bind_group, &[]);
+        for (i, bg) in bind_groups.iter().enumerate() {
+            self.pass.set_bind_group(i as u32, *bg, &[]);
+        }
         self.pass.draw_indirect(indirect_buf, offset);
     }
 
@@ -121,21 +127,24 @@ impl RasterPass<'_> {
     /// Always available on wgpu 29 — emulated with repeated `draw_indirect`
     /// on backends without native support.  `wgpu::Features::MULTI_DRAW_INDIRECT_COUNT`
     /// (enabled in [`RendererContext`](crate::device::RendererContext)) guarantees
-    /// this call is not emulated.  Sets `pipeline` and `bind_group`, then issues
-    /// `count` indirect draws reading parameters from `indirect_buf` at `offset`.
+    /// this call is not emulated.  Sets `pipeline`, binds each group in
+    /// `bind_groups` at its slice index, then issues `count` indirect draws
+    /// reading parameters from `indirect_buf` at `offset`.
     ///
     /// For GPU-sourced draw counts (the matching primitive for GPU culling),
     /// use [`multi_draw_indirect_count`](Self::multi_draw_indirect_count).
     pub fn multi_draw_indirect(
         &mut self,
         pipeline     : &RenderPipeline,
-        bind_group   : &wgpu::BindGroup,
+        bind_groups  : &[&wgpu::BindGroup],
         indirect_buf : &wgpu::Buffer,
         offset       : u64,
         count        : u32,
     ) {
         self.pass.set_pipeline(pipeline.inner());
-        self.pass.set_bind_group(0, bind_group, &[]);
+        for (i, bg) in bind_groups.iter().enumerate() {
+            self.pass.set_bind_group(i as u32, *bg, &[]);
+        }
         self.pass.multi_draw_indirect(indirect_buf, offset, count);
     }
 
@@ -148,11 +157,14 @@ impl RasterPass<'_> {
     /// This is the matching primitive for GPU culling: the cull shader writes
     /// both the indirect args and the count atomically, and the draw reads
     /// them without a CPU roundtrip.
+    ///
+    /// Each group in `bind_groups` is bound at its slice index
+    /// (`bind_groups[0]` = set 0, `bind_groups[1]` = set 1, …).
     #[allow(clippy::too_many_arguments)]
     pub fn multi_draw_indirect_count(
         &mut self,
         pipeline        : &RenderPipeline,
-        bind_group      : &wgpu::BindGroup,
+        bind_groups     : &[&wgpu::BindGroup],
         indirect_buf    : &wgpu::Buffer,
         indirect_offset : u64,
         count_buf       : &wgpu::Buffer,
@@ -160,7 +172,9 @@ impl RasterPass<'_> {
         max_count       : u32,
     ) {
         self.pass.set_pipeline(pipeline.inner());
-        self.pass.set_bind_group(0, bind_group, &[]);
+        for (i, bg) in bind_groups.iter().enumerate() {
+            self.pass.set_bind_group(i as u32, *bg, &[]);
+        }
         self.pass.multi_draw_indirect_count(
             indirect_buf, indirect_offset,
             count_buf,    count_offset,

@@ -54,8 +54,8 @@ pub fn cull(
 )
     -> IndirectArgs
 {
-    let internal_bg = graph.create_internal_bind_group(
-        "cull_internal",
+    let set1_bg = graph.create_bind_group_set1(
+        "cull_set1",
         pipeline.as_ref(),
         &[(0, indirect.indirect.into())],
     );
@@ -67,9 +67,9 @@ pub fn cull(
         let workgroups = args.workgroups;
 
         pass.execute(move |ctx| {
-            let ext_bg = ctx.resources.bind_group(bind_group);
-            let int_bg = ctx.resources.bind_group(internal_bg);
-            ctx.commands.dispatch(&pipeline, &[ext_bg, int_bg], workgroups, &[]);
+            let bg0 = ctx.resources.bind_group(bind_group);
+            let bg1 = ctx.resources.bind_group(set1_bg);
+            ctx.commands.dispatch(&pipeline, &[bg0, bg1], workgroups, &[]);
         });
 
         IndirectArgs {
