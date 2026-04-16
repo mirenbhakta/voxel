@@ -19,12 +19,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use renderer::{FrameCount, RendererContext, RendererError};
-use renderer::{
-    SUBCHUNK_DEPTH_FORMAT, SUBCHUNK_MAX_CANDIDATES,
-    SubchunkInstance, SubchunkTest, TestCamera, nodes,
-    occupancy_exposure, sphere_occupancy,
-};
+use renderer::{SUBCHUNK_DEPTH_FORMAT, SubchunkCamera, nodes};
 use renderer::graph::{BufferPool, RenderGraph, TextureDesc, TexturePool};
+
+use crate::world_view::WorldView;
 use winit::{
     application::ApplicationHandler,
     event::{DeviceEvent, DeviceId, ElementState, KeyEvent, WindowEvent},
@@ -34,6 +32,8 @@ use winit::{
 };
 
 mod validation;
+mod world;
+mod world_view;
 
 // ---------------------------------------------------------------------------
 
@@ -61,11 +61,11 @@ const PITCH_CLAMP:     f32 = 1.553; // ~89°
 /// Application state.  Fields are populated on the first `resumed` event
 /// and remain `Some` for the rest of the session.
 struct App {
-    window:        Option<Arc<Window>>,
-    ctx:           Option<RendererContext>,
-    subchunk_test: Option<Arc<SubchunkTest>>,
-    buf_pool:      BufferPool,
-    tex_pool:      TexturePool,
+    window:     Option<Arc<Window>>,
+    ctx:        Option<RendererContext>,
+    world_view: Option<WorldView>,
+    buf_pool:   BufferPool,
+    tex_pool:   TexturePool,
 
     // --- Camera state ---
     pos:    [f32; 3],
@@ -78,13 +78,14 @@ struct App {
 impl App {
     fn new() -> Self {
         Self {
-            window:        None,
-            ctx:           None,
-            subchunk_test: None,
-            buf_pool:      BufferPool::default(),
-            tex_pool:      TexturePool::default(),
-            // Starting pose: outside the 4×4×4 grid [0,32]^3, facing +Z.
-            pos:    [16.0, 16.0, -40.0],
+            window:     None,
+            ctx:        None,
+            world_view: None,
+            buf_pool:   BufferPool::default(),
+            tex_pool:   TexturePool::default(),
+            // Starting pose: camera outside the initial 3³ L0 shell
+            // ([-8, 16]^3 voxel extent), looking toward +Z.
+            pos:    [4.0, 4.0, -40.0],
             yaw:    0.0,
             pitch:  0.0,
             keys:   HashSet::new(),
@@ -172,32 +173,13 @@ impl ApplicationHandler for App {
         let h = size.height.max(1);
         ctx.configure_surface(w, h);
 
-        // Build a 4×4×4 grid of 8³ sub-chunks spanning world-space [0,32]^3.
-        // Each candidate gets a sphere occupancy; the 6-bit directional
-        // exposure mask is derived from the occupancy itself (for a sphere,
-        // all six bits are set — the mask contributes no rejections here).
-        let sphere    = sphere_occupancy();
-        let sphere_ex = occupancy_exposure(&sphere);
-        let mut instances = [SubchunkInstance::new([0, 0, 0], 0, 0); SUBCHUNK_MAX_CANDIDATES];
-        let mut occs      = [sphere; SUBCHUNK_MAX_CANDIDATES];
-        for z in 0u32..4 {
-            for y in 0u32..4 {
-                for x in 0u32..4 {
-                    let idx = (z * 16 + y * 4 + x) as usize;
-                    instances[idx] = SubchunkInstance::new(
-                        [(x * 8) as i32, (y * 8) as i32, (z * 8) as i32],
-                        idx as u32,
-                        sphere_ex,
-                    );
-                    occs[idx] = sphere;
-                }
-            }
-        }
+        // Bring up the residency-driven world view. Populates the GPU's
+        // instance and occupancy buffers from the initial L0 shell around
+        // the camera before the first render.
+        let world_view = WorldView::new(&ctx, self.pos);
+        self.world_view = Some(world_view);
 
-        let test = Arc::new(SubchunkTest::new(&ctx, &instances, &occs));
-        self.subchunk_test = Some(test);
-
-        self.ctx = Some(ctx);
+        self.ctx    = Some(ctx);
         self.window = Some(window);
     }
 
@@ -274,10 +256,10 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
-                let (Some(ctx), Some(window), Some(test)) = (
+                let (Some(ctx), Some(window), Some(world_view)) = (
                     self.ctx.as_mut(),
                     self.window.as_ref(),
-                    self.subchunk_test.as_ref(),
+                    self.world_view.as_mut(),
                 ) else {
                     return;
                 };
@@ -323,7 +305,7 @@ impl ApplicationHandler for App {
                 let h      = size.height.max(1);
                 let aspect = w as f32 / h as f32;
 
-                let camera = TestCamera {
+                let camera = SubchunkCamera {
                     pos:     self.pos,
                     fov_y:   std::f32::consts::FRAC_PI_3,
                     forward,
@@ -334,7 +316,18 @@ impl ApplicationHandler for App {
                     _pad1:   0.0,
                 };
 
-                test.write_camera(ctx, &camera);
+                // Drive residency off the current camera position before
+                // uploading per-frame GPU state. `update` handles evictions,
+                // prep synthesis, slot uploads, and instance-list rebuild.
+                world_view.update(ctx, self.pos);
+                if world_view.evicted_last_update() > 0 {
+                    eprintln!(
+                        "evicted {} sub-chunks (total {})",
+                        world_view.evicted_last_update(),
+                        world_view.evicted_total(),
+                    );
+                }
+                world_view.renderer().write_camera(ctx, &camera);
 
                 let surface_frame = match ctx.acquire_frame() {
                     Ok(f) => f,
@@ -359,7 +352,7 @@ impl ApplicationHandler for App {
                         wgpu::TextureUsages::RENDER_ATTACHMENT,
                     ),
                 );
-                nodes::subchunk_test(&mut graph, test, color, depth);
+                nodes::subchunk_world(&mut graph, world_view.renderer(), color, depth);
 
                 let mut fe = ctx.begin_frame();
                 let frame  = ctx.frame_index();

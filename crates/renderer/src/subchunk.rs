@@ -1,17 +1,22 @@
-//! Sub-chunk bitmask DDA prototype — 64-instance cull + MDI draw pass.
+//! Sub-chunk render pipeline and GPU data formats.
 //!
-//! Rasterizes up to [`MAX_CANDIDATES`] sub-chunk bounding cubes via
-//! GPU frustum + directional-exposure cull → multi-draw-indirect. Each
-//! sub-chunk has:
-//! - A world-space [`SubchunkInstance`] (origin + occupancy slot +
-//!   6-bit directional exposure mask).
-//! - A [`SubchunkOccupancy`] (8×8×8 bitmask, 64 bytes).
+//! Owns the two pipelines that implement the V2 sub-chunk DDA primitive
+//! (`subchunk_cull.cs` + `subchunk.vs`/`subchunk.ps`) plus the dynamic
+//! GPU buffers they read from. Callers (e.g. the game crate) populate the
+//! buffers per frame from a residency-driven CPU shadow:
 //!
-//! # Bind group layouts
+//! - Camera uniform — one upload per frame.
+//! - Instance array — a full overwrite per frame (one entry per active
+//!   candidate sub-chunk; padding entries have `exposure_mask = 0` so the
+//!   cull shader rejects them trivially).
+//! - Occupancy array — a single slot is written on completion of a prep
+//!   request; never a full-array upload.
 //!
-//! Layouts are derived automatically from the shaders via SPIR-V reflection
-//! at pipeline construction time.  The entries documented here match the
-//! HLSL declarations but are no longer hand-written in Rust:
+//! The count buffer stays at `[1u32]` permanently — the cull shader emits
+//! exactly one indirect draw entry whose `instance_count` fans out to the
+//! number of passing candidates.
+//!
+//! # Bind group layouts (reflected from SPIR-V)
 //!
 //! **Cull bind group** (set 0 for `subchunk_cull.cs.hlsl`):
 //! - 0: camera     (UniformBuffer, 64)          — COMPUTE
@@ -24,21 +29,12 @@
 //! - 2: visible    (StorageReadOnly, stride=4)  — VERTEX
 //! - 3: occ_array  (StorageReadOnly, stride=64) — FRAGMENT
 //!
-//! Cull's indirect output lives on its own set-1 bind group, built inside
-//! the cull node; callers do not supply it.
-//!
-//! # wgpu-hal Vulkan binding compaction
-//!
-//! wgpu-hal sorts BGL entries by binding number and assigns sequential VK
-//! bindings 0, 1, 2, … The SPIR-V passthrough path does not remap, so the
-//! HLSL `[[vk::binding(N, 0)]]` number MUST equal N exactly.  Neither shader
-//! in this pass uses `GpuConsts`, so slot 0 is bound to camera — bindings
-//! stay contiguous from 0 as required.
+//! Cull's indirect output rides on its own set-1 bind group, assembled
+//! inside `nodes::cull`.
 
 use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
-use wgpu::util::DeviceExt;
 
 use crate::device::RendererContext;
 use crate::graph::{BufferDesc, RenderGraph, TextureHandle};
@@ -60,15 +56,19 @@ const SUBCHUNK_CS_SPV: &[u8] =
 
 // --- Constants ---
 
-/// Maximum number of candidate sub-chunks.  One thread per candidate in the
-/// cull dispatch; one workgroup of 64 threads handles the full set.
+/// Maximum number of candidate sub-chunks the cull pass handles in one
+/// dispatch. Baked into the cull shader's workgroup size (`[64, 1, 1]`)
+/// and into the `instance_buf` / `occ_buf` allocations.
 pub const MAX_CANDIDATES: usize = 64;
 
-// --- Public types ---
+/// Depth format used by the sub-chunk pipeline's `DepthStencilState`.
+pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-/// Camera parameters for the sub-chunk test render pass.
+// --- SubchunkCamera ---
+
+/// Camera parameters for the sub-chunk pipeline.
 ///
-/// Layout must match the HLSL `Camera` struct (64 bytes):
+/// Layout matches the HLSL `Camera` struct (64 bytes):
 /// ```text
 ///   float3 pos     (+0)
 ///   float  fov_y   (+12)
@@ -81,7 +81,7 @@ pub const MAX_CANDIDATES: usize = 64;
 /// ```
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-pub struct TestCamera {
+pub struct SubchunkCamera {
     pub pos:     [f32; 3],
     pub fov_y:   f32,
     pub forward: [f32; 3],
@@ -93,26 +93,25 @@ pub struct TestCamera {
 }
 
 const _: () = assert!(
-    std::mem::size_of::<TestCamera>() == 64,
-    "TestCamera must be 64 bytes to match HLSL Camera"
+    std::mem::size_of::<SubchunkCamera>() == 64,
+    "SubchunkCamera must be 64 bytes to match HLSL Camera"
 );
+
+// --- SubchunkInstance ---
 
 /// Per-sub-chunk instance data: world-space origin plus a packed slot +
 /// exposure-mask word.
 ///
-/// Layout must match the HLSL `Instance` struct (16 bytes):
+/// Layout matches the HLSL `Instance` struct (16 bytes):
 /// ```text
 ///   int3 origin    (+0)
 ///   uint slot_mask (+12)
 /// ```
 ///
-/// `slot_mask` packs two fields into one `u32` so the CPU/GPU struct stays
-/// 16-aligned (no trailing vec3-alignment padding):
-/// - Low 26 bits: occupancy slot index (space for up to `1 << 26`
-///   candidates; current cap is [`MAX_CANDIDATES`]).
-/// - High 6 bits: directional exposure mask. One bit per face direction,
-///   set when any voxel in the sub-chunk has an exposed face in that
-///   direction:
+/// `slot_mask` packs two fields into one `u32` so the struct stays
+/// 16-aligned on both sides:
+/// - Low 26 bits: occupancy slot index.
+/// - High 6 bits: directional exposure mask, one bit per face:
 ///
 /// | bit | direction |
 /// |:---:|:---------:|
@@ -122,14 +121,9 @@ const _: () = assert!(
 /// | 3   | +Y        |
 /// | 4   | -Z        |
 /// | 5   | +Z        |
-///
-/// The cull shader uses the mask to reject sub-chunks whose occupied
-/// voxels have no exposed faces in any camera-visible direction — a
-/// DDA-specific rejection with no analog in triangle rendering.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SubchunkInstance {
-    /// Voxel-space origin of the `[origin, origin+8)` sub-chunk box.
     pub origin:    [i32; 3],
     /// Low 26 bits: occupancy slot. High 6 bits: exposure mask.
     /// Prefer [`SubchunkInstance::new`] over constructing directly.
@@ -146,21 +140,14 @@ const SLOT_MASK:    u32 = (1 << SLOT_BITS) - 1;
 const EXPOSURE_MAX: u8  = (1 << 6) - 1;
 
 impl SubchunkInstance {
-    /// Build a `SubchunkInstance` from its three logical components.
+    /// Build an instance from its three logical components.
     ///
     /// # Panics
     ///
-    /// Debug builds panic if `occ_slot >= 2^26` or `exposure_mask > 0x3F`
-    /// (the packed encoding cannot represent either overflow).
+    /// Debug builds panic if `occ_slot >= 2^26` or `exposure_mask > 0x3F`.
     pub fn new(origin: [i32; 3], occ_slot: u32, exposure_mask: u8) -> Self {
-        debug_assert!(
-            occ_slot <= SLOT_MASK,
-            "occ_slot must fit in {SLOT_BITS} bits",
-        );
-        debug_assert!(
-            exposure_mask <= EXPOSURE_MAX,
-            "exposure_mask must fit in 6 bits",
-        );
+        debug_assert!(occ_slot      <= SLOT_MASK,    "occ_slot must fit in {SLOT_BITS} bits");
+        debug_assert!(exposure_mask <= EXPOSURE_MAX, "exposure_mask must fit in 6 bits");
         Self {
             origin,
             slot_mask: (occ_slot & SLOT_MASK)
@@ -168,32 +155,33 @@ impl SubchunkInstance {
         }
     }
 
-    /// Occupancy slot index (low 26 bits of `slot_mask`).
     pub fn occ_slot(&self) -> u32 {
         self.slot_mask & SLOT_MASK
     }
 
-    /// 6-bit directional exposure mask (high 6 bits of `slot_mask`).
     pub fn exposure_mask(&self) -> u8 {
         (self.slot_mask >> SLOT_BITS) as u8
     }
 }
 
-/// 8×8×8 occupancy stored as 8 XY planes, each a 64-bit bitmask.
+// --- SubchunkOccupancy ---
+
+/// GPU-format 8×8×8 occupancy, laid out as 16 × u32.
 ///
-/// `planes[z * 2 .. z * 2 + 2]` encodes Z layer `z`.  In the 64-bit value,
-/// bit `y * 8 + x` is set if voxel `(x, y, z)` is occupied.
+/// `planes[z * 2 .. z * 2 + 2]` encodes Z-layer `z`. In the 64 bits of
+/// that layer, bit `y * 8 + x` is set when voxel `(x, y, z)` is occupied.
+/// The HLSL storage buffer views the 16 u32s as `uint4 plane[4]`.
 ///
-/// In the HLSL storage buffer the 16 u32s are packed into `uint4 plane[4]`
-/// (four vec4s = 64 bytes, no internal padding issues since everything is u32).
+/// The CPU crate (`game::world::subchunk::SubchunkOccupancy`) uses a
+/// `[u64; 8]` layout with the same bit semantics and produces
+/// byte-compatible output via its `to_gpu_bytes` method.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SubchunkOccupancy {
     pub planes: [u32; 16],
 }
 
-/// Build a sphere occupancy: voxel (x,y,z) is occupied when the voxel centre
-/// lies within a sphere of radius 3.5 centred at (3.5, 3.5, 3.5).
+/// Debug helper: centered sphere of radius 3.5.
 pub fn sphere_occupancy() -> SubchunkOccupancy {
     let mut occ = SubchunkOccupancy { planes: [0u32; 16] };
     for z in 0u32..8 {
@@ -203,8 +191,8 @@ pub fn sphere_occupancy() -> SubchunkOccupancy {
                 let fy = y as f32 - 3.5;
                 let fz = z as f32 - 3.5;
                 if fx * fx + fy * fy + fz * fz <= 3.5 * 3.5 {
-                    let bit  = y * 8 + x;         // 0..63
-                    let word = z * 2 + (bit >> 5); // 0..15
+                    let bit  = y * 8 + x;
+                    let word = z * 2 + (bit >> 5);
                     occ.planes[word as usize] |= 1 << (bit & 31);
                 }
             }
@@ -213,17 +201,11 @@ pub fn sphere_occupancy() -> SubchunkOccupancy {
     occ
 }
 
-/// Compute the 6-bit directional exposure mask for a sub-chunk's occupancy.
+/// 6-bit directional exposure mask for `occ`, treating the sub-chunk as
+/// isolated (voxels outside `[0, 8)^3` are empty).
 ///
-/// Treats the sub-chunk as isolated — voxels outside `[0, 8)^3` are empty —
-/// so a voxel face on the outer boundary counts as exposed. Real voxel
-/// worlds would resolve exposure across sub-chunk boundaries; that's a
-/// plumbing concern for the residency control plane when it arrives.
-///
-/// Bit layout matches [`SubchunkInstance`]: 0/1 = -X/+X, 2/3 = -Y/+Y,
-/// 4/5 = -Z/+Z. A fully enclosed shape (like a sphere that doesn't touch
-/// the boundary) still lights up every bit, because each direction has at
-/// least one occupied voxel whose adjacent voxel in that direction is empty.
+/// Useful as a reference implementation; real usage computes the mask
+/// from the CPU-side occupancy.
 pub fn occupancy_exposure(occ: &SubchunkOccupancy) -> u8 {
     let is_set = |x: i32, y: i32, z: i32| -> bool {
         if !(0..8).contains(&x) || !(0..8).contains(&y) || !(0..8).contains(&z) {
@@ -256,57 +238,36 @@ pub fn occupancy_exposure(occ: &SubchunkOccupancy) -> u8 {
     mask
 }
 
-// --- SubchunkTest ---
+// --- WorldRenderer ---
 
-/// Persistent state for the sub-chunk cull + MDI draw pass.
+/// Pipelines + dynamic GPU buffers for the sub-chunk render path.
 ///
-/// Owns both pipelines (which carry their reflected bind group layouts) and
-/// all four persistent buffers.  Camera data is updated per-frame via
-/// [`Self::write_camera`] before the render graph is built.  Instance and
-/// occupancy data are committed at construction and stay fixed for the
-/// lifetime of this object.
-///
-/// The `visible` and `indirect` buffers are graph transients — allocated from
-/// the pool each frame and discarded after execute.  `count_buf` is a fixed
-/// persistent constant (holds `[1u32]`) that is never written after
-/// construction; it provides the GPU-side draw count cap.  Both bind groups
-/// are registered per frame via `graph.create_bind_group` inside
-/// [`subchunk_test`].
-pub struct SubchunkTest {
-    // --- Pipelines ---
-    cull_pipeline   : Arc<ComputePipeline>,
-    render_pipeline : Arc<RenderPipeline>,
+/// Created once at startup. The caller populates
+/// [`WorldRenderer::write_camera`] per frame, overwrites the full instance
+/// array with [`WorldRenderer::write_instances`], and uploads individual
+/// occupancy slots with [`WorldRenderer::write_occupancy_slot`] as the
+/// residency control plane delivers prep completions.
+pub struct WorldRenderer {
+    cull_pipeline:   Arc<ComputePipeline>,
+    render_pipeline: Arc<RenderPipeline>,
 
-    // --- Persistent buffers (imported into the graph each frame) ---
-    camera_buf   : wgpu::Buffer,
-    instance_buf : wgpu::Buffer,
-    occ_buf      : wgpu::Buffer,
-    count_buf    : wgpu::Buffer,
+    camera_buf:   wgpu::Buffer,
+    instance_buf: wgpu::Buffer,
+    occ_buf:      wgpu::Buffer,
+    count_buf:    wgpu::Buffer,
 }
 
-// --- SubchunkTest ---
-
-impl SubchunkTest {
-    /// Create the pass for the current surface format.
-    ///
-    /// `instances` and `occ` must be exactly [`MAX_CANDIDATES`] elements each.
-    /// Instance and occupancy data are written at allocation time via
-    /// `create_buffer_init` — no `write_buffer` ordering hazards.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `instances.len() != MAX_CANDIDATES` or
-    /// `occ.len() != MAX_CANDIDATES`.
-    pub fn new(
-        ctx       : &RendererContext,
-        instances : &[SubchunkInstance; MAX_CANDIDATES],
-        occ       : &[SubchunkOccupancy; MAX_CANDIDATES],
-    )
-        -> Self
-    {
+impl WorldRenderer {
+    /// Create the pipelines and allocate dynamic buffers sized for
+    /// [`MAX_CANDIDATES`] sub-chunks. Buffers are zero-initialized; the
+    /// caller must populate instances/occupancy before the first render
+    /// (padding instances have `slot_mask = 0` → exposure_mask 0, which
+    /// the cull shader rejects trivially, so a render before the first
+    /// upload produces a blank frame rather than undefined behavior).
+    pub fn new(ctx: &RendererContext) -> Self {
         let surface_format = ctx
             .surface_format()
-            .expect("SubchunkTest requires a windowed RendererContext");
+            .expect("WorldRenderer requires a windowed RendererContext");
 
         let device = ctx.device();
 
@@ -329,8 +290,10 @@ impl SubchunkTest {
 
         // --- Buffer sizes ---
 
-        let camera_size = std::mem::size_of::<TestCamera>() as u64;
-        let count_size  = 4u64; // one u32
+        let camera_size   = std::mem::size_of::<SubchunkCamera>() as u64;
+        let instance_size = (std::mem::size_of::<SubchunkInstance>() * MAX_CANDIDATES) as u64;
+        let occ_size      = (std::mem::size_of::<SubchunkOccupancy>() * MAX_CANDIDATES) as u64;
+        let count_size    = 4u64;
 
         // --- Persistent buffers ---
 
@@ -341,18 +304,18 @@ impl SubchunkTest {
             mapped_at_creation: false,
         });
 
-        // Instance and occupancy data are fixed at construction — commit via
-        // create_buffer_init (bytes written at allocation, no ordering hazards).
-        let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label:    Some("subchunk_instances"),
-            contents: bytemuck::cast_slice(instances),
-            usage:    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("subchunk_instances"),
+            size:               instance_size,
+            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
-        let occ_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label:    Some("subchunk_occ"),
-            contents: bytemuck::cast_slice(occ),
-            usage:    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        let occ_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("subchunk_occ"),
+            size:               occ_size,
+            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let count_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -364,31 +327,19 @@ impl SubchunkTest {
             mapped_at_creation: false,
         });
 
-        // Write the fixed draw count of 1.  After this the buffer is never
-        // written again — on the CPU or the GPU — for the lifetime of this
-        // SubchunkTest.
+        // Draw-count cap is always 1 — the cull shader emits one indirect
+        // entry whose `instance_count` fans out to the visible candidates.
         ctx.queue().write_buffer(&count_buf, 0, bytemuck::bytes_of(&1u32));
 
         // --- Pipelines ---
 
         let cull_pipeline = Arc::new(ComputePipeline::new(ctx, ComputePipelineDescriptor {
-            label:                  "subchunk_cull",
-            shader:                 cs,
+            label:                   "subchunk_cull",
+            shader:                  cs,
             expected_workgroup_size: Some([64, 1, 1]),
-            immediate_size:         0,
+            immediate_size:          0,
         }));
 
-        // wgpu's Vulkan backend flips Y via a negative viewport height, which
-        // reverses framebuffer winding relative to world-space winding; our
-        // cube table is outward-CCW in world space, so Cw is the front-face
-        // rule.
-        //
-        // Back-face culling is on. The vertex shader swaps triangle winding
-        // for cubes the camera is inside of (or near-plane-close to), which
-        // inverts which side the rasterizer treats as "front" — so inside
-        // cubes still get fragments via their back faces, while the common
-        // outside case still pays rasterization cost for only 3 of the 6
-        // cube faces.
         let render_pipeline = Arc::new(RenderPipeline::new(ctx, RenderPipelineDescriptor {
             label:          "subchunk",
             vertex:         vs,
@@ -426,10 +377,40 @@ impl SubchunkTest {
         }
     }
 
-    /// Upload camera data to the GPU. Call once per frame, before building
+    /// Overwrite the camera uniform. Call once per frame before building
     /// the render graph.
-    pub fn write_camera(&self, ctx: &RendererContext, camera: &TestCamera) {
+    pub fn write_camera(&self, ctx: &RendererContext, camera: &SubchunkCamera) {
         ctx.queue().write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(camera));
+    }
+
+    /// Overwrite the full instance array.
+    ///
+    /// `instances` must have at most [`MAX_CANDIDATES`] entries. Remaining
+    /// slots are not touched by this call — callers must keep them zeroed
+    /// (or otherwise ensure `exposure_mask = 0`) by passing an exactly
+    /// `MAX_CANDIDATES`-sized buffer whose tail entries are sentinels.
+    pub fn write_instances(&self, ctx: &RendererContext, instances: &[SubchunkInstance]) {
+        assert!(
+            instances.len() <= MAX_CANDIDATES,
+            "write_instances: got {} instances, max is {MAX_CANDIDATES}",
+            instances.len(),
+        );
+        ctx.queue().write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(instances));
+    }
+
+    /// Upload a single slot's 64-byte occupancy payload.
+    ///
+    /// `occ_bytes` must be exactly 64 bytes in the GPU layout — an
+    /// 8-word sequence of little-endian u64s covering z-layers 0..8, where
+    /// bit `y*8 + x` of layer `z` is set when voxel `(x, y, z)` is occupied.
+    pub fn write_occupancy_slot(
+        &self,
+        ctx:       &RendererContext,
+        slot:      u32,
+        occ_bytes: &[u8; std::mem::size_of::<SubchunkOccupancy>()],
+    ) {
+        let offset = (slot as u64) * std::mem::size_of::<SubchunkOccupancy>() as u64;
+        ctx.queue().write_buffer(&self.occ_buf, offset, occ_bytes);
     }
 
     pub(crate) fn cull_pipeline(&self) -> &Arc<ComputePipeline> {
@@ -452,42 +433,34 @@ impl SubchunkTest {
         &self.occ_buf
     }
 
-    /// The persistent draw-count buffer.  Holds `[1u32]` and is never written
-    /// after construction.  Imported as a graph resource each frame to provide
-    /// the GPU-side draw count cap.
     pub(crate) fn count_buf(&self) -> &wgpu::Buffer {
         &self.count_buf
     }
 }
 
-/// Depth format used by [`subchunk_test`] and by the pipeline's `DepthStencilState`.
-/// The game loop allocates a transient depth texture in this format each frame.
-pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+// --- subchunk_world render node ---
 
 /// Register the sub-chunk cull + MDI draw passes into `graph`.
 ///
-/// Imports the four persistent buffers as graph resources, allocates `visible`
-/// and `indirect` as per-frame transients, registers dynamic bind groups for
-/// both passes, dispatches the GPU frustum cull (1 workgroup × 64 threads),
-/// then issues a multi-draw-indirect-count raster pass that draws only the
-/// visible sub-chunks.
+/// Imports the renderer's four persistent buffers, allocates `visible`
+/// and `indirect` as per-frame transients, wires both dynamic bind groups,
+/// dispatches the 64-thread cull (1 workgroup), and issues a
+/// multi-draw-indirect-count raster that draws the surviving sub-chunks.
 ///
 /// Returns the versioned output handles for the color and depth textures.
-pub fn subchunk_test(
-    graph : &mut RenderGraph,
-    test  : &Arc<SubchunkTest>,
-    color : TextureHandle,
-    depth : TextureHandle,
+pub fn subchunk_world(
+    graph    : &mut RenderGraph,
+    renderer : &Arc<WorldRenderer>,
+    color    : TextureHandle,
+    depth    : TextureHandle,
 )
     -> (TextureHandle, TextureHandle)
 {
-    // --- Import persistent buffers ---
-    let camera_h   = graph.import_buffer(test.camera_buf().clone());
-    let instance_h = graph.import_buffer(test.instance_buf().clone());
-    let occ_h      = graph.import_buffer(test.occ_buf().clone());
-    let count_h    = graph.import_buffer(test.count_buf().clone());
+    let camera_h   = graph.import_buffer(renderer.camera_buf().clone());
+    let instance_h = graph.import_buffer(renderer.instance_buf().clone());
+    let occ_h      = graph.import_buffer(renderer.occ_buf().clone());
+    let count_h    = graph.import_buffer(renderer.count_buf().clone());
 
-    // --- Allocate cull outputs as transients ---
     let visible_size  = (4 * MAX_CANDIDATES) as u64;
     let indirect_size = 16u64;
 
@@ -501,10 +474,9 @@ pub fn subchunk_test(
         usage : wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
     });
 
-    // --- Register dynamic bind groups ---
     let cull_bg = graph.create_bind_group(
         "subchunk_cull_bg",
-        test.cull_pipeline().as_ref(),
+        renderer.cull_pipeline().as_ref(),
         None,
         &[
             (0, camera_h.into()),
@@ -515,7 +487,7 @@ pub fn subchunk_test(
 
     let render_bg = graph.create_bind_group(
         "subchunk_render_bg",
-        test.render_pipeline().as_ref(),
+        renderer.render_pipeline().as_ref(),
         None,
         &[
             (0, camera_h.into()),
@@ -525,12 +497,11 @@ pub fn subchunk_test(
         ],
     );
 
-    // --- Cull → mdi_draw chain ---
     let indirect_in = IndirectArgs { indirect: indirect_h, count: count_h, max_draws: 1 };
 
     let indirect_out = cull(
         graph,
-        test.cull_pipeline(),
+        renderer.cull_pipeline(),
         cull_bg,
         &CullArgs { workgroups: [1, 1, 1] },
         indirect_in,
@@ -538,7 +509,7 @@ pub fn subchunk_test(
 
     mdi_draw(
         graph,
-        test.render_pipeline(),
+        renderer.render_pipeline(),
         render_bg,
         &indirect_out,
         &DrawArgs::default(),

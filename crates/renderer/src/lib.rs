@@ -11,7 +11,7 @@ pub mod pipeline;
 pub mod shader;
 
 mod device;
-mod subchunk_test;
+mod subchunk;
 
 pub use buffer::StagedBuffer;
 pub use commands::{
@@ -26,13 +26,13 @@ pub use pipeline::{BindEntry, BindKind, PipelineBindLayout};
 pub use pipeline::{ComputePipeline, ComputePipelineDescriptor};
 pub use pipeline::{RenderPipeline, RenderPipelineDescriptor};
 pub use shader::{ShaderModule, ShaderSource};
-pub use subchunk_test::{
+pub use subchunk::{
     DEPTH_FORMAT as SUBCHUNK_DEPTH_FORMAT,
     MAX_CANDIDATES as SUBCHUNK_MAX_CANDIDATES,
+    SubchunkCamera,
     SubchunkInstance,
     SubchunkOccupancy,
-    SubchunkTest,
-    TestCamera,
+    WorldRenderer,
     occupancy_exposure,
     sphere_occupancy,
 };
