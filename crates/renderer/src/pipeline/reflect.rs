@@ -1,16 +1,13 @@
 //! SPIR-V workgroup-size and descriptor reflection via `rspirv`.
 //!
 //! Exposes [`reflect_spirv`] which parses a SPIR-V binary, locates a named
-//! entry point, and returns [`Reflected`] — the workgroup size, the
-//! uniform-buffer byte size at slot 0, the full descriptor-set-0 entry list,
-//! and the descriptor-set-1 entry list.
+//! entry point, and returns [`Reflected`] — the workgroup size and the
+//! descriptor-set-0/-1 entry lists.
 //!
 //! The implementation uses `rspirv`'s data-representation layer (`rspirv::dr`)
 //! and scans the module's `entry_points`, `execution_modes`, `annotations`,
 //! and `types_global_values` collections — no full instruction stream walk is
 //! needed.
-//!
-//! [`GpuConstsData`]: crate::gpu_consts::GpuConstsData
 
 use rspirv::dr::{Instruction, Module, Operand};
 use rspirv::spirv::{self, Decoration, Op, StorageClass, Word};
@@ -39,17 +36,12 @@ pub struct Reflected {
     /// The workgroup size declared by the entry point's `LocalSize` execution
     /// mode — `[x, y, z]`, matching `[numthreads(x, y, z)]` in HLSL.
     /// `None` for raster (vertex/fragment) shaders, which have no `LocalSize`.
-    pub workgroup_size      : Option<[u32; 3]>,
-    /// Size in bytes of the uniform buffer at descriptor set 0 binding 0, or
-    /// `None` if the shader does not declare one.  The
-    /// [`ComputePipeline`](crate::pipeline::compute::ComputePipeline)
-    /// constructor asserts this value equals `size_of::<GpuConstsData>()`.
-    pub gpu_consts_byte_size: Option<u32>,
+    pub workgroup_size : Option<[u32; 3]>,
     /// All bindings in descriptor set 0, sorted by binding number.
-    pub entries             : Vec<ReflectedEntry>,
+    pub entries        : Vec<ReflectedEntry>,
     /// All bindings in descriptor set 1, sorted by binding number.
     /// Empty for shaders that declare no set-1 resources.
-    pub set1_entries        : Vec<ReflectedEntry>,
+    pub set1_entries   : Vec<ReflectedEntry>,
 }
 
 // --- Public API ---
@@ -93,14 +85,7 @@ pub fn reflect_spirv(spv: &[u8], entry_point: &str)
     let mut set1_entries = reflect_set_entries(&module, 1)?;
     set1_entries.sort_by_key(|e| e.binding);
 
-    let gpu_consts_byte_size = entries.iter()
-        .find(|e| e.binding == 0)
-        .and_then(|e| match e.kind {
-            BindKind::UniformBuffer { size } => Some(size as u32),
-            _ => None,
-        });
-
-    Ok(Reflected { workgroup_size, gpu_consts_byte_size, entries, set1_entries })
+    Ok(Reflected { workgroup_size, entries, set1_entries })
 }
 
 // --- Error helper ---
@@ -413,7 +398,12 @@ fn classify_var(module: &Module, var_id: Word, binding: u32)
                      runtime-array last member with ArrayStride decoration",
                 ))?;
 
-            let kind = if var_is_non_writable(module, var_id) {
+            // DXC marks read-only storage buffers (`StructuredBuffer<T>` /
+            // `ByteAddressBuffer`) with `NonWritable` on the struct's member 0,
+            // not on the `OpVariable`. Treat either placement as read-only.
+            let kind = if var_is_non_writable(module, var_id)
+                || struct_member_is_non_writable(module, struct_id)
+            {
                 BindKind::StorageBufferReadOnly { size }
             }
             else {
@@ -436,6 +426,17 @@ fn classify_var(module: &Module, var_id: Word, binding: u32)
 /// Whether `var_id` carries an `OpDecorate NonWritable`.
 fn var_is_non_writable(module: &Module, var_id: Word) -> bool {
     decorates(module).any(|(t, d, _)| t == var_id && d == Decoration::NonWritable)
+}
+
+/// Whether any member of `struct_id` carries `OpMemberDecorate NonWritable`.
+///
+/// DXC emits `StructuredBuffer<T>` / `ByteAddressBuffer` as a struct wrapping
+/// a runtime array, with the runtime array (member 0) decorated `NonWritable`
+/// when the HLSL source is read-only.  The `OpVariable` itself has no
+/// `NonWritable` decoration in that case.
+fn struct_member_is_non_writable(module: &Module, struct_id: Word) -> bool {
+    member_decorates(module)
+        .any(|(sid, _, d, _)| sid == struct_id && d == Decoration::NonWritable)
 }
 
 /// Returns `Block` or `BufferBlock` if `struct_id` is decorated with either,
@@ -681,7 +682,7 @@ mod tests {
     }
 
     /// Hand-crafted minimal SPIR-V (no DXC required). Verifies the success
-    /// path: correct workgroup size returned, and `None` for `gpu_consts_byte_size`
+    /// path: correct workgroup size returned, and an empty set-0 entries list
     /// since the shader declares no descriptor bindings.
     #[test]
     fn reflect_spirv_succeeds_on_minimal_compute_shader() {
@@ -694,19 +695,18 @@ mod tests {
             Some([64, 1, 1]),
             "workgroup size should match the LocalSize 64 1 1 in the binary",
         );
-        assert_eq!(
-            reflected.gpu_consts_byte_size,
-            None,
-            "gpu_consts_byte_size should be None: shader has no descriptor bindings",
+        assert!(
+            reflected.entries.is_empty(),
+            "entries should be empty: shader has no descriptor bindings",
         );
     }
 
     /// Hand-crafted SPV with a uniform buffer at (set=0, binding=0)
     /// containing 8 × u32 (32 bytes, matching `GpuConstsData`). Exercises
-    /// the full `reflect_spirv` success path — workgroup size *and*
-    /// `gpu_consts_byte_size` — without requiring DXC.
+    /// the full `reflect_spirv` success path — workgroup size *and* slot-0
+    /// `UniformBuffer` size — without requiring DXC.
     #[test]
-    fn reflect_spirv_reports_gpu_consts_byte_size_from_hand_crafted_spv() {
+    fn reflect_spirv_reports_slot0_uniform_size_from_hand_crafted_spv() {
         let spv = compute_spirv_with_uniform(64, 1, 1, 8);
         let reflected = reflect_spirv(&spv, "main")
             .expect("reflect_spirv should succeed on hand-crafted SPV with uniform buffer");
@@ -716,10 +716,14 @@ mod tests {
             Some([64, 1, 1]),
             "workgroup size should match the LocalSize in the binary",
         );
-        assert_eq!(
-            reflected.gpu_consts_byte_size,
-            Some(32),
-            "gpu_consts_byte_size should be Some(32) for 8 × u32 members",
+        assert!(
+            matches!(
+                reflected.entries.first().map(|e| (e.binding, e.kind)),
+                Some((0, BindKind::UniformBuffer { size: 32 })),
+            ),
+            "slot 0 should reflect as UniformBuffer {{ size: 32 }} for 8 × u32 members; \
+             got {:?}",
+            reflected.entries.first(),
         );
     }
 
@@ -732,10 +736,14 @@ mod tests {
             .expect("reflect_spirv should succeed on 4-member uniform buffer");
 
         assert_eq!(reflected.workgroup_size, Some([32, 1, 1]));
-        assert_eq!(
-            reflected.gpu_consts_byte_size,
-            Some(16),
-            "gpu_consts_byte_size should be Some(16) for 4 × u32 members",
+        assert!(
+            matches!(
+                reflected.entries.first().map(|e| (e.binding, e.kind)),
+                Some((0, BindKind::UniformBuffer { size: 16 })),
+            ),
+            "slot 0 should reflect as UniformBuffer {{ size: 16 }} for 4 × u32 members; \
+             got {:?}",
+            reflected.entries.first(),
         );
     }
 
@@ -839,8 +847,8 @@ mod tests {
     }
 
     /// A fragment shader has no `LocalSize` execution mode — `workgroup_size`
-    /// must be `None`. `gpu_consts_byte_size` is also `None` since this shader
-    /// declares no descriptor bindings.
+    /// must be `None`. `entries` is also empty since this shader declares no
+    /// descriptor bindings.
     #[test]
     fn reflect_spirv_returns_none_workgroup_size_for_raster_shader() {
         let spv = minimal_fragment_spirv();
@@ -852,10 +860,9 @@ mod tests {
             None,
             "workgroup_size should be None for a raster (fragment) shader",
         );
-        assert_eq!(
-            reflected.gpu_consts_byte_size,
-            None,
-            "gpu_consts_byte_size should be None: shader has no descriptor bindings",
+        assert!(
+            reflected.entries.is_empty(),
+            "entries should be empty: shader has no descriptor bindings",
         );
     }
 
@@ -878,8 +885,8 @@ mod tests {
         );
     }
 
-    /// Reflects `VALIDATION_CS_SPV` and asserts the GpuConsts uniform buffer
-    /// at (set=0, binding=0) has the same byte size as `GpuConstsData` (32).
+    /// Reflects `VALIDATION_CS_SPV` and asserts the slot-0 GpuConsts uniform
+    /// buffer reflects at the same byte size as `GpuConstsData` (32).
     ///
     /// Gated for the same reason as `reflect_spirv_reports_workgroup_size`.
     #[test]
@@ -888,10 +895,14 @@ mod tests {
         let reflected = reflect_spirv(crate::shader::VALIDATION_CS_SPV, "main")
             .expect("reflect_spirv should succeed on a DXC-compiled validation shader");
 
-        assert_eq!(
-            reflected.gpu_consts_byte_size,
-            Some(32),
-            "expected Some(32) matching GpuConstsData (8 × u32)",
+        assert!(
+            matches!(
+                reflected.entries.iter().find(|e| e.binding == 0).map(|e| e.kind),
+                Some(BindKind::UniformBuffer { size: 32 }),
+            ),
+            "expected slot 0 UniformBuffer {{ size: 32 }} matching GpuConstsData (8 × u32); \
+             got {:?}",
+            reflected.entries.iter().find(|e| e.binding == 0),
         );
     }
 
@@ -1065,6 +1076,84 @@ mod tests {
         w.iter().flat_map(|word| word.to_le_bytes()).collect()
     }
 
+    /// Build a SPIR-V compute shader with a read-only storage buffer on
+    /// `(set=0, binding=0)`.  The `NonWritable` decoration is placed on the
+    /// struct's member 0 rather than on the `OpVariable` — this is the shape
+    /// DXC emits for `StructuredBuffer<T>` / `ByteAddressBuffer`.
+    ///
+    /// IDs: %1=void, %2=voidfn, %3=main, %4=label,
+    ///      %5=uint, %6=rta, %7=struct, %8=ptr, %9=var. Bound=10.
+    fn compute_spirv_with_member_nonwritable_storage_ro() -> Vec<u8> {
+        let mut w: Vec<u32> = Vec::new();
+
+        // Header (bound = 10)
+        w.extend_from_slice(&[0x07230203, 0x00010100, 0x00000000, 0x0000000A, 0x00000000]);
+
+        // OpCapability Shader
+        w.extend_from_slice(&[0x00020011, 0x00000001]);
+
+        // OpMemoryModel Logical GLSL450
+        w.extend_from_slice(&[0x0003000E, 0x00000000, 0x00000001]);
+
+        // OpEntryPoint GLCompute %3 "main"
+        w.extend_from_slice(&[0x0005000F, 0x00000005, 0x00000003, 0x6E69616D, 0x00000000]);
+
+        // OpExecutionMode %3 LocalSize 64 1 1
+        w.extend_from_slice(&[0x00060010, 0x00000003, 0x00000011, 64, 1, 1]);
+
+        // --- Annotations ---
+
+        // OpDecorate %9 DescriptorSet 0
+        w.extend_from_slice(&[0x00040047, 0x00000009, 0x00000022, 0x00000000]);
+        // OpDecorate %9 Binding 0
+        w.extend_from_slice(&[0x00040047, 0x00000009, 0x00000021, 0x00000000]);
+        // OpDecorate %7 Block
+        w.extend_from_slice(&[0x00030047, 0x00000007, 0x00000002]);
+        // OpDecorate %6 ArrayStride 4
+        w.extend_from_slice(&[0x00040047, 0x00000006, 0x00000006, 0x00000004]);
+        // OpMemberDecorate %7 0 NonWritable  (op=72=0x48, wc=4, deco=24=0x18)
+        w.extend_from_slice(&[0x00040048, 0x00000007, 0x00000000, 0x00000018]);
+
+        // --- Types ---
+        w.extend_from_slice(&[0x00020013, 0x00000001]);                         // %1 = OpTypeVoid
+        w.extend_from_slice(&[0x00030021, 0x00000002, 0x00000001]);             // %2 = OpTypeFunction %1
+        w.extend_from_slice(&[0x00040015, 0x00000005, 0x00000020, 0x00000000]); // %5 = OpTypeInt 32 0
+        w.extend_from_slice(&[0x0003001D, 0x00000006, 0x00000005]);             // %6 = OpTypeRuntimeArray %5
+        w.extend_from_slice(&[0x0003001E, 0x00000007, 0x00000006]);             // %7 = OpTypeStruct %6
+        w.extend_from_slice(&[0x00040020, 0x00000008, 0x0000000C, 0x00000007]); // %8 = OpTypePointer StorageBuffer %7
+        w.extend_from_slice(&[0x0004003B, 0x00000008, 0x00000009, 0x0000000C]); // %9 = OpVariable %8 StorageBuffer
+
+        // --- Function ---
+        w.extend_from_slice(&[0x00050036, 0x00000001, 0x00000003, 0x00000000, 0x00000002]);
+        w.extend_from_slice(&[0x000200F8, 0x00000004]);
+        w.push(0x000100FD);
+        w.push(0x00010038);
+
+        w.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// A storage buffer with the `NonWritable` decoration on the struct's
+    /// member 0 (the DXC emission shape for read-only `StructuredBuffer<T>`)
+    /// must reflect as `StorageBufferReadOnly`, not `ReadWrite`.  This shape
+    /// is what caused `subchunk.vs` to be misclassified before the
+    /// member-level check landed in `classify_var`.
+    #[test]
+    fn reflect_spirv_member_nonwritable_reflects_as_read_only() {
+        let spv = compute_spirv_with_member_nonwritable_storage_ro();
+        let reflected = reflect_spirv(&spv, "main")
+            .expect("reflect_spirv should succeed");
+
+        assert_eq!(reflected.entries.len(), 1);
+        assert!(
+            matches!(
+                reflected.entries[0].kind,
+                BindKind::StorageBufferReadOnly { size: 4 },
+            ),
+            "expected StorageBufferReadOnly {{ size: 4 }}, got {:?}",
+            reflected.entries[0].kind,
+        );
+    }
+
     /// A set-1 storage-rw binding appears in `set1_entries` and not in
     /// `entries` (set 0).
     #[test]
@@ -1120,10 +1209,10 @@ mod tests {
         );
     }
 
-    /// Uniform buffer entries show up in `entries` and `gpu_consts_byte_size`
-    /// is derived from the slot-0 entry.
+    /// Uniform buffer entries show up in `entries` at the correct slot and
+    /// kind.
     #[test]
-    fn reflect_spirv_entries_match_gpu_consts_byte_size() {
+    fn reflect_spirv_entries_slot0_uniform_buffer() {
         let spv = compute_spirv_with_uniform(64, 1, 1, 8);
         let reflected = reflect_spirv(&spv, "main")
             .expect("reflect_spirv should succeed");
@@ -1133,6 +1222,5 @@ mod tests {
         assert!(
             matches!(reflected.entries[0].kind, BindKind::UniformBuffer { size: 32 }),
         );
-        assert_eq!(reflected.gpu_consts_byte_size, Some(32));
     }
 }

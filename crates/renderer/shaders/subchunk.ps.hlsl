@@ -15,22 +15,18 @@
 // through Z layers, one per step, testing the bit at the current (x,y)
 // position against the plane's 64-bit mask. O(8) operations, no per-voxel DDA.
 //
-// GpuConsts at binding 0 is unused by this test, but must be declared and
-// bound. wgpu-hal's Vulkan backend sequentially compacts BGL bindings to
-// VK bindings 0, 1, 2, ... regardless of the user-supplied binding numbers
-// (see wgpu-hal vulkan/device.rs `create_bind_group_layout`). Since the
-// SPIR-V passthrough path skips naga's binding remap, the shader's binding
-// numbers MUST match the compacted VK binding numbers — i.e., bindings
-// must start at 0 and be contiguous. Skipping slot 0 causes the shader's
-// bindings 1 and 2 to silently read the wrong / unbound descriptors.
+// Binding layout across VS + PS (merged into one set-0 BGL at pipeline
+// construction via SPIR-V reflection):
+//   0: Camera       (VS + PS)
+//   1: instances    (VS only)
+//   2: visible      (VS only)
+//   3: occ_array    (PS only)
 //
-// Bindings 2 and 3 (instances and visible) are vertex-stage-only; this shader
-// does not declare them. Their positions are still reflected in the BGL by the
-// Rust side, which is what determines the VK binding compaction order. The PS
-// only declares the bindings it actually reads (1 and 4); DXC emits only those
-// descriptor references into the SPIR-V, and the VK binding numbers for those
-// match because no slots are skipped in the BGL.
-#include "include/gpu_consts.hlsl"
+// wgpu-hal's Vulkan backend sequentially compacts BGL bindings to VK
+// bindings 0, 1, 2, ... in sorted-binding order, and the SPIR-V passthrough
+// path does not remap — so HLSL binding N must equal N's ordinal position
+// in the merged BGL. Keeping the set contiguous from 0 guarantees this;
+// gaps would silently off-by-one every shader that reads past the gap.
 
 struct Camera {
     float3 pos;
@@ -47,8 +43,8 @@ struct SubchunkOcc {
     uint4 plane[4];
 };
 
-[[vk::binding(1, 0)]] ConstantBuffer<Camera>        g_camera;
-[[vk::binding(4, 0)]] StructuredBuffer<SubchunkOcc> g_occ_array;
+[[vk::binding(0, 0)]] ConstantBuffer<Camera>        g_camera;
+[[vk::binding(3, 0)]] StructuredBuffer<SubchunkOcc> g_occ_array;
 
 // Must match the VS projection. Kept in sync by hand — if you change these,
 // update `subchunk.vs.hlsl` too. Used to project the voxel-hit position back

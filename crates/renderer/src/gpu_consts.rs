@@ -1,9 +1,11 @@
 //! Shared GPU constants uniform buffer.
 //!
-//! [`GpuConstsData`] is the single source of truth for constants read by every
-//! shader in the renderer. It is bound at slot 0 of every pipeline's bind
-//! group layout (asserted by reflection at pipeline construction).
-//! See [`GpuConsts::SLOT`].
+//! [`GpuConstsData`] is the single source of truth for constants read by
+//! shaders that need it.  When a shader declares `g_consts` via the
+//! `shaders/include/gpu_consts.hlsl` include, it lands at slot 0 of set 0
+//! ([`GpuConsts::SLOT`]) by convention.  Shaders that do not reference
+//! `g_consts` omit it entirely — their bind group layouts start at whatever
+//! slot the shader actually uses.
 
 use crate::device::RendererContext;
 
@@ -23,13 +25,11 @@ use crate::device::RendererContext;
 ///
 /// `size_of::<GpuConstsData>()` must equal `sizeof(GpuConsts{in HLSL})`,
 /// field-for-field, against the mirror struct in
-/// `shaders/include/gpu_consts.hlsl`. This is enforced at three levels:
+/// `shaders/include/gpu_consts.hlsl`. This is enforced at two levels:
 ///
 /// 1. A Rust const assertion: `size_of::<GpuConstsData>() == 32` (below).
 ///    Any change that breaks the size fails to compile.
-/// 2. A runtime SPIR-V reflection check that asserts the HLSL uniform buffer
-///    size reflected out of the compiled shader matches the Rust side.
-/// 3. Behavioral verification via the validation binary's sentinel roundtrip
+/// 2. Behavioral verification via the validation binary's sentinel roundtrip
 ///    — any layout disagreement produces a garbage echo which the test
 ///    detects loudly.
 ///
@@ -110,13 +110,14 @@ pub struct GpuConsts {
 }
 
 impl GpuConsts {
-    /// The descriptor binding slot reserved for `GpuConstsData`.
+    /// The descriptor binding slot reserved for `GpuConstsData` when a shader
+    /// declares it.
     ///
-    /// This is the single number that both the HLSL side
-    /// (`[[vk::binding(0, 0)]] ConstantBuffer<GpuConsts>` in
-    /// `shaders/include/gpu_consts.hlsl`) and every pipeline constructor
-    /// commit to. Pipeline constructors assert slot 0 is a `UniformBuffer`
-    /// sized to `GpuConstsData` during reflection.
+    /// Both the HLSL side (`[[vk::binding(0, 0)]] ConstantBuffer<GpuConsts>`
+    /// in `shaders/include/gpu_consts.hlsl`) and
+    /// [`RenderGraph::create_bind_group`](crate::graph::RenderGraph::create_bind_group)
+    /// commit to this slot.  Shaders that do not reference `g_consts` do not
+    /// declare this slot at all, and their bind groups omit it entirely.
     pub const SLOT: u32 = 0;
 
     /// Create a new uniform buffer initialized with the given constants.
@@ -171,8 +172,9 @@ impl GpuConsts {
     }
 
     /// Access the underlying wgpu buffer. Only visible to primitives within
-    /// the crate — external callers pass a `&GpuConsts` into
-    /// `RenderGraph::create_bind_group`, which resolves slot 0 internally.
+    /// the crate — external callers pass an `Option<&GpuConsts>` into
+    /// [`RenderGraph::create_bind_group`](crate::graph::RenderGraph::create_bind_group),
+    /// which resolves slot 0 internally when the pipeline reflects it.
     #[allow(dead_code)] // First caller: bind group construction in the validation binary (later increment).
     pub(crate) fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer

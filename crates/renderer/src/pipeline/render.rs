@@ -2,12 +2,12 @@
 //!
 //! Mirrors [`ComputePipeline`] for raster workloads. Vertex and fragment
 //! shaders are loaded separately via [`ShaderModule::load`] before pipeline
-//! construction — reflection and `GpuConsts`-size assertion happen in
-//! [`RenderPipeline::new`].
+//! construction. The `GpuConstsData` layout check fires inside
+//! [`ShaderModule::load`]; [`RenderPipeline::new`] only merges entries and
+//! builds the bind group layout.
 //!
 //! VS and PS entries are merged by slot: the kind must match on collision; the
-//! visibility is unioned across stages. Slot 0 (GpuConsts) appears in both
-//! stages and ends up as `VERTEX | FRAGMENT`.
+//! visibility is unioned across stages.
 //!
 //! Vertex buffers, color targets, depth/stencil, primitive state, multisample
 //! state, and immediate data (previously called push constants) are all
@@ -17,7 +17,6 @@
 //! [`ComputePipeline`]: crate::pipeline::compute::ComputePipeline
 
 use crate::device::RendererContext;
-use crate::gpu_consts::{GpuConsts, GpuConstsData};
 use crate::pipeline::PipelineBindLayout;
 use crate::pipeline::binding::{BindEntry, BindKind};
 use crate::pipeline::bind_kind_to_wgpu_ty;
@@ -69,17 +68,13 @@ impl RenderPipeline {
     ///
     /// 1. Merges VS and PS bind entries by slot (kind must match; visibility
     ///    is unioned).
-    /// 2. Asserts slot 0 is the GpuConsts `UniformBuffer`.
-    /// 3. Builds `wgpu::BindGroupLayout` from the merged entries.
-    /// 4. Creates the wgpu render pipeline.
+    /// 2. Builds `wgpu::BindGroupLayout` from the merged entries.
+    /// 3. Creates the wgpu render pipeline.
     ///
     /// # Panics
     ///
-    /// Panics if VS and PS entries at the same slot have different kinds, or if
-    /// slot 0 is absent, not a `UniformBuffer`, or sized incorrectly.
+    /// Panics if VS and PS entries at the same slot have different kinds.
     pub fn new(ctx: &RendererContext, desc: RenderPipelineDescriptor<'_>) -> Self {
-        use std::mem::size_of;
-
         // Step 1: merge VS and PS entries.
         // Map: binding → (kind, visibility).
         let mut merged: Vec<(u32, BindKind, wgpu::ShaderStages)> = Vec::new();
@@ -127,32 +122,7 @@ impl RenderPipeline {
 
         merged.sort_by_key(|(b, _, _)| *b);
 
-        // Step 2: slot-0 GpuConsts assertion.
-        let slot0 = merged.iter().find(|(b, _, _)| *b == GpuConsts::SLOT);
-
-        match slot0 {
-            Some((_, BindKind::UniformBuffer { size }, _))
-                if *size as usize == size_of::<GpuConstsData>() => {}
-            Some((_, BindKind::UniformBuffer { size }, _)) => panic!(
-                "pipeline `{}`: slot {} is a UniformBuffer but its size is {} bytes; \
-                 expected {} bytes (GpuConstsData) — \
-                 check that the shader includes shaders/include/gpu_consts.hlsl",
-                desc.label, GpuConsts::SLOT, size, size_of::<GpuConstsData>(),
-            ),
-            Some((_, kind, _)) => panic!(
-                "pipeline `{}`: slot {} must be the GpuConsts uniform buffer but is \
-                 {:?} — check that the shader includes shaders/include/gpu_consts.hlsl",
-                desc.label, GpuConsts::SLOT, kind,
-            ),
-            None => panic!(
-                "pipeline `{}`: slot {} (GpuConsts) is absent from the shader's \
-                 descriptor set 0 — check that the shader includes \
-                 shaders/include/gpu_consts.hlsl",
-                desc.label, GpuConsts::SLOT,
-            ),
-        }
-
-        // Step 3: build BindEntry list and wgpu::BindGroupLayout.
+        // Step 2: build BindEntry list and wgpu::BindGroupLayout.
         let bind_entries: Vec<BindEntry> = merged.iter()
             .map(|&(binding, kind, visibility)| BindEntry { binding, kind, visibility })
             .collect();
@@ -172,7 +142,7 @@ impl RenderPipeline {
                 entries: &wgpu_entries,
             });
 
-        // Step 4: create the wgpu render pipeline.
+        // Step 3: create the wgpu render pipeline.
         let pipeline_layout =
             ctx.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label             : Some(desc.label),

@@ -5,7 +5,7 @@
 //! DXC at build time and emits compiled SPV blobs under `$OUT_DIR/shaders/`;
 //! Rust then picks them up with `include_bytes!` into `&'static [u8]`
 //! constants and passes them to [`ShaderModule::load`], which performs SPIR-V
-//! reflection, asserts `GpuConsts` layout, and uploads the module to the GPU.
+//! reflection and uploads the module to the GPU.
 //!
 //! The toolchain is HLSL → DXC rather than WGSL because later subsystems
 //! need `DrawIndex`, which naga can't round-trip — switching toolchains later
@@ -40,8 +40,8 @@ pub enum ShaderSource {
 
 // --- ShaderModule ---
 
-/// A loaded shader — SPIR-V reflected, GpuConsts-asserted, and uploaded to
-/// the GPU as a `wgpu::ShaderModule`. Consumed by pipeline constructors.
+/// A loaded shader — SPIR-V reflected and uploaded to the GPU as a
+/// `wgpu::ShaderModule`. Consumed by pipeline constructors.
 ///
 /// `wgpu::ShaderModule` does not leak through this type's public interface
 /// (principle 3); the `inner` field is `pub(crate)` so pipeline types in
@@ -51,29 +51,25 @@ pub struct ShaderModule {
     pub(crate) entry_point: String,
     /// Workgroup size reflected from the shader's `LocalSize` execution mode.
     /// `None` for raster (vertex/fragment) shaders, which have no `LocalSize`.
-    pub workgroup_size      : Option<[u32; 3]>,
-    /// Byte size of the `GpuConsts` uniform buffer at (set=0, binding=0),
-    /// or `None` if the shader does not declare one.
-    pub gpu_consts_byte_size: Option<u32>,
+    pub workgroup_size   : Option<[u32; 3]>,
     /// All descriptor-set-0 bindings reflected from the shader, as
     /// `(binding_slot, kind)` pairs sorted by slot. Visibility is populated
     /// by the pipeline constructor that consumes this `ShaderModule`.
-    pub bind_entries        : Vec<(u32, BindKind)>,
+    pub bind_entries     : Vec<(u32, BindKind)>,
     /// All descriptor-set-1 bindings reflected from the shader, as
     /// `(binding_slot, kind)` pairs sorted by slot. Empty for shaders that
     /// declare no set-1 resources. Visibility is populated by the pipeline
     /// constructor that consumes this `ShaderModule`.
-    pub set1_bind_entries   : Vec<(u32, BindKind)>,
+    pub set1_bind_entries: Vec<(u32, BindKind)>,
     /// The shader stage of this module's entry point.
-    pub stage               : wgpu::ShaderStages,
+    pub stage            : wgpu::ShaderStages,
 }
 
 impl ShaderModule {
     /// Load a shader from compiled SPIR-V.
     ///
-    /// Performs SPIR-V reflection, asserts the `GpuConsts` uniform buffer size
-    /// against `GpuConstsData` if the shader declares one, then uploads the
-    /// module to the GPU via `wgpu`'s SPIR-V passthrough path.
+    /// Performs SPIR-V reflection, then uploads the module to the GPU via
+    /// `wgpu`'s SPIR-V passthrough path.
     ///
     /// # Errors
     ///
@@ -83,32 +79,19 @@ impl ShaderModule {
     ///
     /// # Panics
     ///
-    /// Panics if the reflected `GpuConsts` buffer size does not match
-    /// `size_of::<GpuConstsData>()`, or if the SPIR-V bytes are malformed
-    /// (not a multiple of 4, missing magic number).
+    /// Panics if the SPIR-V bytes are malformed (not a multiple of 4, missing
+    /// magic number).
     pub fn load(
         ctx: &RendererContext,
         label: &str,
         source: ShaderSource,
         entry_point: &str,
     ) -> Result<Self, RendererError> {
-        use std::mem::size_of;
-        use crate::gpu_consts::GpuConstsData;
         use crate::pipeline::reflect;
 
         let ShaderSource::Spirv(spv_bytes) = source;
         let reflected = reflect::reflect_spirv(spv_bytes, entry_point)?;
         let stage     = reflect::entry_point_stage(spv_bytes, entry_point)?;
-
-        if let Some(size) = reflected.gpu_consts_byte_size {
-            assert_eq!(
-                size as usize,
-                size_of::<GpuConstsData>(),
-                "GpuConsts size mismatch for shader `{label}`: \
-                 HLSL sees {size} bytes, Rust has {} bytes",
-                size_of::<GpuConstsData>(),
-            );
-        }
 
         let inner            = create_wgpu_module(ctx, label, ShaderSource::Spirv(spv_bytes));
         let bind_entries     = reflected.entries.into_iter()
@@ -120,9 +103,8 @@ impl ShaderModule {
 
         Ok(Self {
             inner,
-            entry_point       : entry_point.to_owned(),
-            workgroup_size    : reflected.workgroup_size,
-            gpu_consts_byte_size: reflected.gpu_consts_byte_size,
+            entry_point    : entry_point.to_owned(),
+            workgroup_size : reflected.workgroup_size,
             bind_entries,
             set1_bind_entries,
             stage,

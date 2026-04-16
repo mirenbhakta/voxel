@@ -312,9 +312,12 @@ impl RenderGraph {
         handle
     }
 
-    /// Register a deferred bind group against `pipeline`'s reflected layout,
-    /// slot 0 bound to `gpu_consts`, user slots bound to the
-    /// `(binding, resource)` pairs in `entries`.
+    /// Register a deferred bind group against `pipeline`'s reflected layout.
+    ///
+    /// When `gpu_consts` is `Some`, the referenced buffer is bound at
+    /// [`GpuConsts::SLOT`] and the caller must omit that slot from `entries`.
+    /// When `None`, slot 0 (if the pipeline declares it) must be supplied by
+    /// the caller through `entries` like any other binding.
     ///
     /// Returns an opaque [`BindGroupHandle`].  The actual wgpu bind group
     /// is produced during [`CompiledGraph::resolve_bind_groups`] — the
@@ -325,16 +328,14 @@ impl RenderGraph {
     /// look up the resolved group via
     /// [`ResourceMap::bind_group`](ResourceMap::bind_group).
     ///
-    /// User-slot bindings correspond 1:1 to the pipeline's `bind_entries`
-    /// (other than slot 0) — every binding declared (other than slot 0) must be
-    /// supplied exactly once.  `ResourceId` may come from either a
-    /// [`BufferHandle`] or a [`TextureHandle`] (via [`From`]); the
-    /// resolver branches on the underlying [`ResourceEntry`] kind.
+    /// `ResourceId` may come from either a [`BufferHandle`] or a
+    /// [`TextureHandle`] (via [`From`]); the resolver branches on the
+    /// underlying [`ResourceEntry`] kind.
     pub fn create_bind_group(
         &mut self,
         label      : &str,
         pipeline   : &dyn PipelineBindLayout,
-        gpu_consts : &GpuConsts,
+        gpu_consts : Option<&GpuConsts>,
         entries    : &[(u32, ResourceId)],
     )
         -> BindGroupHandle
@@ -344,7 +345,7 @@ impl RenderGraph {
             label          : label.to_string(),
             bg_layout      : pipeline.bg_layout().clone(),
             bind_entries   : pipeline.bind_entries().to_vec(),
-            gpu_consts_buf : Some(gpu_consts.buffer().clone()),
+            gpu_consts_buf : gpu_consts.map(|c| c.buffer().clone()),
             entries        : entries.to_vec(),
         });
         handle

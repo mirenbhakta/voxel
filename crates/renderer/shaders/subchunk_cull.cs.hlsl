@@ -19,18 +19,17 @@
 //
 // Binding layout:
 //
-// Set 0 — caller-supplied bindings, all consecutive from 1 so the
-// wgpu-hal Vulkan compaction leaves HLSL binding N == VK binding N:
-//   0: GpuConsts    (declared in include/gpu_consts.hlsl; pipeline reflection
-//                   asserts this slot is the GpuConsts uniform — unused here)
-//   1: Camera       (uniform, 64 bytes)
-//   2: instances    (StorageBuffer<Instance>, read-only; slot_mask carries
+// Set 0 — caller-supplied bindings, contiguous from 0 (wgpu-hal's Vulkan
+// backend compacts BGL entries sequentially, and the SPIR-V passthrough
+// path does not remap — so HLSL binding numbers must equal their ordinal
+// position within the reflected set):
+//   0: Camera       (uniform, 64 bytes)
+//   1: instances    (StorageBuffer<Instance>, read-only; slot_mask carries
 //                   the 6-bit directional exposure mask in its high bits)
-//   3: visible      (RWStorageBuffer<uint>)
+//   2: visible      (RWStorageBuffer<uint>)
 //
 // Set 1 — cull-internal binding, owned by the cull node, not the caller:
 //   0: indirect     (RWStorageBuffer<uint4>, one entry = DrawIndirectArgs)
-#include "include/gpu_consts.hlsl"
 
 struct Camera {
     float3 pos;
@@ -52,9 +51,9 @@ struct Instance {
     uint slot_mask;
 };
 
-[[vk::binding(1, 0)]] ConstantBuffer<Camera>     g_camera;
-[[vk::binding(2, 0)]] StructuredBuffer<Instance> g_instances;
-[[vk::binding(3, 0)]] RWStructuredBuffer<uint>   g_visible;
+[[vk::binding(0, 0)]] ConstantBuffer<Camera>     g_camera;
+[[vk::binding(1, 0)]] StructuredBuffer<Instance> g_instances;
+[[vk::binding(2, 0)]] RWStructuredBuffer<uint>   g_visible;
 [[vk::binding(0, 1)]] RWStructuredBuffer<uint4>  g_indirect; // uint4 = {vertex_count, instance_count, first_vertex, first_instance}
 
 static const uint  MAX_CANDIDATES = 64u;

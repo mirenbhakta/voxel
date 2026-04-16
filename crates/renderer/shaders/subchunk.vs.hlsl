@@ -17,10 +17,11 @@
 // the projection matrix is reconstructed inline rather than adding a new
 // uniform.
 //
-// GpuConsts at binding 0 is unused by this shader but declared so the
-// wgpu-hal Vulkan binding compaction lands g_camera on slot 1 (see ps shader
-// for the full rationale).
-#include "include/gpu_consts.hlsl"
+// Bindings are contiguous from 0 within the set so that the HLSL-declared
+// binding number equals the VK binding number produced by wgpu-hal's
+// sequential BGL compaction (the SPIR-V passthrough path does not remap).
+// The shared camera/instances/visible slots (0..2) are co-declared with
+// `subchunk.ps.hlsl` so the two stages merge into a single set-0 BGL.
 
 struct Camera {
     float3 pos;
@@ -41,9 +42,9 @@ struct Instance {
     uint slot_mask;
 };
 
-[[vk::binding(1, 0)]] ConstantBuffer<Camera>     g_camera;
-[[vk::binding(2, 0)]] StructuredBuffer<Instance> g_instances;
-[[vk::binding(3, 0)]] StructuredBuffer<uint>     g_visible;
+[[vk::binding(0, 0)]] ConstantBuffer<Camera>     g_camera;
+[[vk::binding(1, 0)]] StructuredBuffer<Instance> g_instances;
+[[vk::binding(2, 0)]] StructuredBuffer<uint>     g_visible;
 
 // 36 cube-corner positions in the unit cube [0,1]^3. Windings are CCW from
 // outside — the outward-normal cross product of (v1 - v0) × (v2 - v0) matches

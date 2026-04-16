@@ -1,26 +1,27 @@
 //! `ComputePipeline` with shader-reflected layout and workgroup-size assertion.
 //!
 //! [`ComputePipeline`] is the only path to dispatching a compute shader in
-//! the renderer. It enforces three invariants at pipeline load time (inside
-//! [`ComputePipeline::new`]), before any wgpu call, so a CPU-side mismatch
-//! panics deterministically without touching the GPU:
+//! the renderer. It enforces the workgroup-size invariant at pipeline load
+//! time (inside [`ComputePipeline::new`]), before any wgpu call, so a CPU-side
+//! mismatch panics deterministically without touching the GPU:
 //!
-//! 1. **Workgroup-size assertion**: if
-//!    `ComputePipelineDescriptor::expected_workgroup_size` is `Some(expected)`,
-//!    the value is compared against the `LocalSize` execution mode reflected
-//!    from the SPIR-V binary. A mismatch is a `panic!` with a message pointing
-//!    at both the expected and actual values — the CPU dispatch code and the
-//!    shader `[numthreads(...)]` are out of sync.
+//! - **Workgroup-size assertion**: if
+//!   `ComputePipelineDescriptor::expected_workgroup_size` is `Some(expected)`,
+//!   the value is compared against the `LocalSize` execution mode reflected
+//!   from the SPIR-V binary. A mismatch is a `panic!` with a message pointing
+//!   at both the expected and actual values — the CPU dispatch code and the
+//!   shader `[numthreads(...)]` are out of sync.
 //!
-//! 2. **GpuConsts size assertion**: the reflected SPIR-V must declare a uniform
-//!    buffer at descriptor set 0 binding 0 (the slot [`GpuConstsData`] always
-//!    occupies), and its byte size must equal `size_of::<GpuConstsData>()`.
-//!    A missing or wrong-sized entry indicates a Rust/HLSL layout disagreement
-//!    or a shader that does not include `gpu_consts.hlsl`.
+//! The `GpuConstsData` layout check fires one level up, inside
+//! [`ShaderModule::load`] — if the shader declares a uniform buffer at
+//! descriptor set 0 binding 0 (the [`GpuConsts::SLOT`] convention), its byte
+//! size must equal `size_of::<GpuConstsData>()`. Shaders that do not read
+//! `g_consts` simply do not reflect a slot-0 entry, and the BGL starts at
+//! whatever the shader actually uses.
 //!
-//! Both assertions fire at construction, not at dispatch — catching
-//! CPU/shader mismatches at load means they surface immediately on startup
-//! rather than on the first dispatch.
+//! The workgroup-size assertion fires at construction, not at dispatch —
+//! catching CPU/shader mismatches at load means they surface immediately on
+//! startup rather than on the first dispatch.
 //!
 //! ## wgpu::BindGroup leakage
 //!
@@ -35,9 +36,8 @@
 //! [`GpuConstsData`]: crate::gpu_consts::GpuConstsData
 
 use crate::device::RendererContext;
-use crate::gpu_consts::{GpuConsts, GpuConstsData};
 use crate::pipeline::PipelineBindLayout;
-use crate::pipeline::binding::{BindEntry, BindKind};
+use crate::pipeline::binding::BindEntry;
 use crate::pipeline::bind_kind_to_wgpu_ty;
 use crate::shader::ShaderModule;
 
@@ -86,19 +86,14 @@ impl ComputePipeline {
     /// Construct a new `ComputePipeline` from `desc`.
     ///
     /// 1. Workgroup-size assertion (if `expected_workgroup_size` is `Some`).
-    /// 2. Slot-0 GpuConsts assertion — the shader must declare a
-    ///    `UniformBuffer` at slot 0 sized to `GpuConstsData`.
-    /// 3. Build `wgpu::BindGroupLayout` from the reflected entries.
-    /// 4. Create the wgpu compute pipeline.
+    /// 2. Build `wgpu::BindGroupLayout` from the reflected entries.
+    /// 3. Create the wgpu compute pipeline.
     ///
     /// # Panics
     ///
     /// Panics if `expected_workgroup_size` is `Some` and does not match the
-    /// reflected workgroup size, or if a raster shader is passed, or if slot 0
-    /// is absent, not a `UniformBuffer`, or sized incorrectly.
+    /// reflected workgroup size, or if a raster shader is passed.
     pub fn new(ctx: &RendererContext, desc: ComputePipelineDescriptor<'_>) -> Self {
-        use std::mem::size_of;
-
         // Step 1: workgroup-size assertion.
         if let Some(expected) = desc.expected_workgroup_size {
             match desc.shader.workgroup_size {
@@ -118,33 +113,7 @@ impl ComputePipeline {
             }
         }
 
-        // Step 2: slot-0 GpuConsts assertion.
-        let slot0 = desc.shader.bind_entries.iter()
-            .find(|(b, _)| *b == GpuConsts::SLOT);
-
-        match slot0 {
-            Some((_, BindKind::UniformBuffer { size }))
-                if *size as usize == size_of::<GpuConstsData>() => {}
-            Some((_, BindKind::UniformBuffer { size })) => panic!(
-                "pipeline `{}`: slot {} is a UniformBuffer but its size is {} bytes; \
-                 expected {} bytes (GpuConstsData) — \
-                 check that the shader includes shaders/include/gpu_consts.hlsl",
-                desc.label, GpuConsts::SLOT, size, size_of::<GpuConstsData>(),
-            ),
-            Some((_, kind)) => panic!(
-                "pipeline `{}`: slot {} must be the GpuConsts uniform buffer but is \
-                 {:?} — check that the shader includes shaders/include/gpu_consts.hlsl",
-                desc.label, GpuConsts::SLOT, kind,
-            ),
-            None => panic!(
-                "pipeline `{}`: slot {} (GpuConsts) is absent from the shader's \
-                 descriptor set 0 — check that the shader includes \
-                 shaders/include/gpu_consts.hlsl",
-                desc.label, GpuConsts::SLOT,
-            ),
-        }
-
-        // Step 3: build BindEntry list and wgpu::BindGroupLayout for set 0.
+        // Step 2: build BindEntry list and wgpu::BindGroupLayout for set 0.
         let mut bind_entries: Vec<BindEntry> = desc.shader.bind_entries.iter()
             .map(|&(binding, kind)| BindEntry {
                 binding,
@@ -200,7 +169,7 @@ impl ComputePipeline {
             }))
         };
 
-        // Step 4: create the wgpu pipeline.
+        // Step 3: create the wgpu pipeline.
         let pipeline_layout = {
             let bg_layouts: Vec<Option<&wgpu::BindGroupLayout>> = match &bg_layout_1 {
                 Some(l) => vec![Some(&bg_layout), Some(l)],

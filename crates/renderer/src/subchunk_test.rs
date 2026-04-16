@@ -14,25 +14,26 @@
 //! HLSL declarations but are no longer hand-written in Rust:
 //!
 //! **Cull bind group** (set 0 for `subchunk_cull.cs.hlsl`):
-//! - 0: GpuConsts (reflected + asserted)
-//! - 1: camera     (UniformBuffer, 64)       — COMPUTE
-//! - 2: instances  (StorageReadOnly, stride=16) — COMPUTE
-//! - 3: visible    (StorageRW, stride=4)     — COMPUTE
-//! - 4: indirect   (StorageRW, stride=4)     — COMPUTE
+//! - 0: camera     (UniformBuffer, 64)          — COMPUTE
+//! - 1: instances  (StorageReadOnly, stride=16) — COMPUTE
+//! - 2: visible    (StorageRW, stride=4)        — COMPUTE
 //!
 //! **Render bind group** (set 0 for `subchunk.vs/.ps.hlsl`):
-//! - 0: GpuConsts  (reflected + asserted)
-//! - 1: camera     (UniformBuffer, 64)         — VERTEX | FRAGMENT
-//! - 2: instances  (StorageReadOnly, stride=16) — VERTEX
-//! - 3: visible    (StorageReadOnly, stride=4)  — VERTEX
-//! - 4: occ_array  (StorageReadOnly, stride=64) — FRAGMENT
+//! - 0: camera     (UniformBuffer, 64)          — VERTEX | FRAGMENT
+//! - 1: instances  (StorageReadOnly, stride=16) — VERTEX
+//! - 2: visible    (StorageReadOnly, stride=4)  — VERTEX
+//! - 3: occ_array  (StorageReadOnly, stride=64) — FRAGMENT
+//!
+//! Cull's indirect output lives on its own set-1 bind group, built inside
+//! the cull node; callers do not supply it.
 //!
 //! # wgpu-hal Vulkan binding compaction
 //!
 //! wgpu-hal sorts BGL entries by binding number and assigns sequential VK
 //! bindings 0, 1, 2, … The SPIR-V passthrough path does not remap, so the
-//! HLSL `[[vk::binding(N, 0)]]` number MUST equal N exactly. User bindings
-//! start at 1 and are consecutive — no gaps. See `subchunk.ps.hlsl` comments.
+//! HLSL `[[vk::binding(N, 0)]]` number MUST equal N exactly.  Neither shader
+//! in this pass uses `GpuConsts`, so slot 0 is bound to camera — bindings
+//! stay contiguous from 0 as required.
 
 use std::sync::Arc;
 
@@ -40,7 +41,6 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::device::RendererContext;
-use crate::gpu_consts::{GpuConsts, GpuConstsData};
 use crate::graph::{BufferDesc, RenderGraph, TextureHandle};
 use crate::nodes::{CullArgs, DrawArgs, IndirectArgs, cull, mdi_draw};
 use crate::pipeline::compute::{ComputePipeline, ComputePipelineDescriptor};
@@ -282,10 +282,6 @@ pub struct SubchunkTest {
     instance_buf : wgpu::Buffer,
     occ_buf      : wgpu::Buffer,
     count_buf    : wgpu::Buffer,
-
-    // --- GpuConsts slot-0 holders ---
-    gpu_consts_cull   : GpuConsts,
-    gpu_consts_render : GpuConsts,
 }
 
 // --- SubchunkTest ---
@@ -420,11 +416,6 @@ impl SubchunkTest {
             immediate_size: 0,
         }));
 
-        // --- GpuConsts placeholders (one per bind group) ---
-
-        let gpu_consts_cull   = GpuConsts::new(ctx, GpuConstsData::default());
-        let gpu_consts_render = GpuConsts::new(ctx, GpuConstsData::default());
-
         Self {
             cull_pipeline,
             render_pipeline,
@@ -432,8 +423,6 @@ impl SubchunkTest {
             instance_buf,
             occ_buf,
             count_buf,
-            gpu_consts_cull,
-            gpu_consts_render,
         }
     }
 
@@ -449,14 +438,6 @@ impl SubchunkTest {
 
     pub(crate) fn render_pipeline(&self) -> &Arc<RenderPipeline> {
         &self.render_pipeline
-    }
-
-    pub(crate) fn gpu_consts_cull(&self) -> &GpuConsts {
-        &self.gpu_consts_cull
-    }
-
-    pub(crate) fn gpu_consts_render(&self) -> &GpuConsts {
-        &self.gpu_consts_render
     }
 
     pub(crate) fn camera_buf(&self) -> &wgpu::Buffer {
@@ -524,23 +505,23 @@ pub fn subchunk_test(
     let cull_bg = graph.create_bind_group(
         "subchunk_cull_bg",
         test.cull_pipeline().as_ref(),
-        test.gpu_consts_cull(),
+        None,
         &[
-            (1, camera_h.into()),
-            (2, instance_h.into()),
-            (3, visible_h.into()),
+            (0, camera_h.into()),
+            (1, instance_h.into()),
+            (2, visible_h.into()),
         ],
     );
 
     let render_bg = graph.create_bind_group(
         "subchunk_render_bg",
         test.render_pipeline().as_ref(),
-        test.gpu_consts_render(),
+        None,
         &[
-            (1, camera_h.into()),
-            (2, instance_h.into()),
-            (3, visible_h.into()),
-            (4, occ_h.into()),
+            (0, camera_h.into()),
+            (1, instance_h.into()),
+            (2, visible_h.into()),
+            (3, occ_h.into()),
         ],
     );
 
