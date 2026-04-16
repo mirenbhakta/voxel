@@ -7,21 +7,25 @@
 //!   6-bit directional exposure mask).
 //! - A [`SubchunkOccupancy`] (8×8×8 bitmask, 64 bytes).
 //!
-//! # Binding layouts
+//! # Bind group layouts
+//!
+//! Layouts are derived automatically from the shaders via SPIR-V reflection
+//! at pipeline construction time.  The entries documented here match the
+//! HLSL declarations but are no longer hand-written in Rust:
 //!
 //! **Cull bind group** (set 0 for `subchunk_cull.cs.hlsl`):
-//! - 0: GpuConsts (injected)
+//! - 0: GpuConsts (reflected + asserted)
 //! - 1: camera     (UniformBuffer, 64)       — COMPUTE
-//! - 2: instances  (StorageReadOnly, 16×MAX) — COMPUTE
-//! - 3: visible    (StorageRW, 4×MAX)        — COMPUTE
-//! - 4: indirect   (StorageRW, 16)           — COMPUTE
+//! - 2: instances  (StorageReadOnly, stride=16) — COMPUTE
+//! - 3: visible    (StorageRW, stride=4)     — COMPUTE
+//! - 4: indirect   (StorageRW, stride=4)     — COMPUTE
 //!
 //! **Render bind group** (set 0 for `subchunk.vs/.ps.hlsl`):
-//! - 0: GpuConsts  (injected)
-//! - 1: camera     (UniformBuffer, 64)       — VERTEX | FRAGMENT
-//! - 2: instances  (StorageReadOnly, 16×MAX) — VERTEX
-//! - 3: visible    (StorageReadOnly, 4×MAX)  — VERTEX
-//! - 4: occ_array  (StorageReadOnly, 64×MAX) — FRAGMENT
+//! - 0: GpuConsts  (reflected + asserted)
+//! - 1: camera     (UniformBuffer, 64)         — VERTEX | FRAGMENT
+//! - 2: instances  (StorageReadOnly, stride=16) — VERTEX
+//! - 3: visible    (StorageReadOnly, stride=4)  — VERTEX
+//! - 4: occ_array  (StorageReadOnly, stride=64) — FRAGMENT
 //!
 //! # wgpu-hal Vulkan binding compaction
 //!
@@ -39,7 +43,6 @@ use crate::device::RendererContext;
 use crate::gpu_consts::{GpuConsts, GpuConstsData};
 use crate::graph::{BufferDesc, RenderGraph, TextureHandle};
 use crate::nodes::{CullArgs, DrawArgs, IndirectArgs, cull, mdi_draw};
-use crate::pipeline::binding::{BindEntry, BindKind, BindingLayout};
 use crate::pipeline::compute::{ComputePipeline, ComputePipelineDescriptor};
 use crate::pipeline::render::{RenderPipeline, RenderPipelineDescriptor};
 use crate::shader::{ShaderModule, ShaderSource};
@@ -257,11 +260,11 @@ pub fn occupancy_exposure(occ: &SubchunkOccupancy) -> u8 {
 
 /// Persistent state for the sub-chunk cull + MDI draw pass.
 ///
-/// Owns both pipelines, both binding layouts (needed for per-frame bind group
-/// registration), and all four persistent buffers.  Camera data is updated
-/// per-frame via [`Self::write_camera`] before the render graph is built.
-/// Instance and occupancy data are committed at construction and stay fixed
-/// for the lifetime of this object.
+/// Owns both pipelines (which carry their reflected bind group layouts) and
+/// all four persistent buffers.  Camera data is updated per-frame via
+/// [`Self::write_camera`] before the render graph is built.  Instance and
+/// occupancy data are committed at construction and stay fixed for the
+/// lifetime of this object.
 ///
 /// The `visible` and `indirect` buffers are graph transients — allocated from
 /// the pool each frame and discarded after execute.  `count_buf` is a fixed
@@ -274,15 +277,11 @@ pub struct SubchunkTest {
     cull_pipeline   : Arc<ComputePipeline>,
     render_pipeline : Arc<RenderPipeline>,
 
-    // --- Binding layouts (needed for per-frame bind group registration) ---
-    cull_layout   : Arc<BindingLayout>,
-    render_layout : Arc<BindingLayout>,
-
     // --- Persistent buffers (imported into the graph each frame) ---
-    camera_buf    : wgpu::Buffer,
-    instance_buf  : wgpu::Buffer,
-    occ_buf       : wgpu::Buffer,
-    count_buf     : wgpu::Buffer,
+    camera_buf   : wgpu::Buffer,
+    instance_buf : wgpu::Buffer,
+    occ_buf      : wgpu::Buffer,
+    count_buf    : wgpu::Buffer,
 
     // --- GpuConsts slot-0 holders ---
     gpu_consts_cull   : GpuConsts,
@@ -334,12 +333,8 @@ impl SubchunkTest {
 
         // --- Buffer sizes ---
 
-        let camera_size   = std::mem::size_of::<TestCamera>() as u64;
-        let instance_size = (std::mem::size_of::<SubchunkInstance>() * MAX_CANDIDATES) as u64;
-        let occ_size      = (std::mem::size_of::<SubchunkOccupancy>() * MAX_CANDIDATES) as u64;
-        let visible_size  = (4 * MAX_CANDIDATES) as u64;
-        let indirect_size = 16u64; // one DrawIndirectArgs = 4 × u32
-        let count_size    = 4u64;  // one u32
+        let camera_size = std::mem::size_of::<TestCamera>() as u64;
+        let count_size  = 4u64; // one u32
 
         // --- Persistent buffers ---
 
@@ -378,68 +373,13 @@ impl SubchunkTest {
         // SubchunkTest.
         ctx.queue().write_buffer(&count_buf, 0, bytemuck::bytes_of(&1u32));
 
-        // --- Cull binding layout (bindings 1-4) ---
-
-        let cull_layout = Arc::new(
-            BindingLayout::builder("subchunk_cull")
-                .add_entry(BindEntry {
-                    binding:    1,
-                    kind:       BindKind::UniformBuffer { size: camera_size },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .add_entry(BindEntry {
-                    binding:    2,
-                    kind:       BindKind::StorageBufferReadOnly { size: instance_size },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .add_entry(BindEntry {
-                    binding:    3,
-                    kind:       BindKind::StorageBufferReadWrite { size: visible_size },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .add_entry(BindEntry {
-                    binding:    4,
-                    kind:       BindKind::StorageBufferReadWrite { size: indirect_size },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .build(ctx),
-        );
-
-        // --- Render binding layout (bindings 1-4) ---
-
-        let render_layout = Arc::new(
-            BindingLayout::builder("subchunk")
-                .add_entry(BindEntry {
-                    binding:    1,
-                    kind:       BindKind::UniformBuffer { size: camera_size },
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                })
-                .add_entry(BindEntry {
-                    binding:    2,
-                    kind:       BindKind::StorageBufferReadOnly { size: instance_size },
-                    visibility: wgpu::ShaderStages::VERTEX,
-                })
-                .add_entry(BindEntry {
-                    binding:    3,
-                    kind:       BindKind::StorageBufferReadOnly { size: visible_size },
-                    visibility: wgpu::ShaderStages::VERTEX,
-                })
-                .add_entry(BindEntry {
-                    binding:    4,
-                    kind:       BindKind::StorageBufferReadOnly { size: occ_size },
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                })
-                .build(ctx),
-        );
-
         // --- Pipelines ---
 
         let cull_pipeline = Arc::new(ComputePipeline::new(ctx, ComputePipelineDescriptor {
-            label:                 "subchunk_cull",
-            shader:                cs,
-            layout:                Arc::clone(&cull_layout),
+            label:                  "subchunk_cull",
+            shader:                 cs,
             expected_workgroup_size: Some([64, 1, 1]),
-            immediate_size:        0,
+            immediate_size:         0,
         }));
 
         // wgpu's Vulkan backend flips Y via a negative viewport height, which
@@ -457,7 +397,6 @@ impl SubchunkTest {
             label:          "subchunk",
             vertex:         vs,
             fragment:       ps,
-            layout:         Arc::clone(&render_layout),
             vertex_buffers: &[],
             color_targets:  &[Some(wgpu::ColorTargetState {
                 format:     surface_format,
@@ -489,8 +428,6 @@ impl SubchunkTest {
         Self {
             cull_pipeline,
             render_pipeline,
-            cull_layout,
-            render_layout,
             camera_buf,
             instance_buf,
             occ_buf,
@@ -512,14 +449,6 @@ impl SubchunkTest {
 
     pub(crate) fn render_pipeline(&self) -> &Arc<RenderPipeline> {
         &self.render_pipeline
-    }
-
-    pub(crate) fn cull_layout(&self) -> &Arc<BindingLayout> {
-        &self.cull_layout
-    }
-
-    pub(crate) fn render_layout(&self) -> &Arc<BindingLayout> {
-        &self.render_layout
     }
 
     pub(crate) fn gpu_consts_cull(&self) -> &GpuConsts {
@@ -594,7 +523,7 @@ pub fn subchunk_test(
     // --- Register dynamic bind groups ---
     let cull_bg = graph.create_bind_group(
         "subchunk_cull_bg",
-        test.cull_layout(),
+        test.cull_pipeline().as_ref(),
         test.gpu_consts_cull(),
         &[
             (1, camera_h.into()),
@@ -606,7 +535,7 @@ pub fn subchunk_test(
 
     let render_bg = graph.create_bind_group(
         "subchunk_render_bg",
-        test.render_layout(),
+        test.render_pipeline().as_ref(),
         test.gpu_consts_render(),
         &[
             (1, camera_h.into()),

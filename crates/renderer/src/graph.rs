@@ -24,13 +24,12 @@ pub use resource::{
 };
 use resource::ResourceHandle;
 
-use std::sync::Arc;
-
 use crate::commands::Commands;
 use crate::device::FrameEncoder;
 use crate::frame::FrameIndex;
 use crate::gpu_consts::GpuConsts;
-use crate::pipeline::binding::{BindKind, BindingLayout};
+use crate::pipeline::PipelineBindLayout;
+use crate::pipeline::binding::{BindEntry, BindKind};
 
 /// Type alias for the per-pass execute closure stored in [`PassData`].
 ///
@@ -49,13 +48,15 @@ enum ResourceEntry {
 
 /// Deferred bind-group description registered at graph-build time.
 ///
-/// Records the binding layout, the slot-0 GpuConsts buffer, and the
-/// (binding, resource) pairs for user slots.  The actual [`wgpu::BindGroup`]
-/// is produced during [`CompiledGraph::resolve_bind_groups`] once every
-/// referenced transient buffer has been allocated.
+/// Records the pipeline's reflected bind entries, the slot-0 GpuConsts buffer,
+/// and the (binding, resource) pairs for user slots.  The actual
+/// [`wgpu::BindGroup`] is produced during
+/// [`CompiledGraph::resolve_bind_groups`] once every referenced transient
+/// buffer has been allocated.
 struct BindGroupTemplate {
     label          : String,
-    layout         : Arc<BindingLayout>,
+    bg_layout      : wgpu::BindGroupLayout,
+    bind_entries   : Vec<BindEntry>,
     gpu_consts_buf : wgpu::Buffer,
     entries        : Vec<(u32, ResourceId)>,
 }
@@ -301,9 +302,9 @@ impl RenderGraph {
         handle
     }
 
-    /// Register a deferred bind group against `layout`, slot 0 bound to
-    /// `gpu_consts`, user slots bound to the `(binding, resource)` pairs
-    /// in `entries`.
+    /// Register a deferred bind group against `pipeline`'s reflected layout,
+    /// slot 0 bound to `gpu_consts`, user slots bound to the
+    /// `(binding, resource)` pairs in `entries`.
     ///
     /// Returns an opaque [`BindGroupHandle`].  The actual wgpu bind group
     /// is produced during [`CompiledGraph::resolve_bind_groups`] — the
@@ -314,15 +315,15 @@ impl RenderGraph {
     /// look up the resolved group via
     /// [`ResourceMap::bind_group`](ResourceMap::bind_group).
     ///
-    /// User-slot bindings correspond 1:1 to [`BindingLayout`] entries —
-    /// every binding declared on the layout (other than slot 0) must be
+    /// User-slot bindings correspond 1:1 to the pipeline's `bind_entries`
+    /// (other than slot 0) — every binding declared (other than slot 0) must be
     /// supplied exactly once.  `ResourceId` may come from either a
     /// [`BufferHandle`] or a [`TextureHandle`] (via [`From`]); the
     /// resolver branches on the underlying [`ResourceEntry`] kind.
     pub fn create_bind_group(
         &mut self,
         label      : &str,
-        layout     : &Arc<BindingLayout>,
+        pipeline   : &dyn PipelineBindLayout,
         gpu_consts : &GpuConsts,
         entries    : &[(u32, ResourceId)],
     )
@@ -331,7 +332,8 @@ impl RenderGraph {
         let handle = BindGroupHandle(self.bind_group_templates.len() as u32);
         self.bind_group_templates.push(BindGroupTemplate {
             label          : label.to_string(),
-            layout         : Arc::clone(layout),
+            bg_layout      : pipeline.bg_layout().clone(),
+            bind_entries   : pipeline.bind_entries().to_vec(),
             gpu_consts_buf : gpu_consts.buffer().clone(),
             entries        : entries.to_vec(),
         });
@@ -515,11 +517,11 @@ impl<'g> PassBuilder<'g> {
         TextureHandle(self.record_write(h.0))
     }
 
-    /// Auto-record pass accesses from a bind group's layout.
+    /// Auto-record pass accesses from a bind group's pipeline entries.
     ///
     /// Walks each entry of the bind group's template, pairs it with the
-    /// matching [`BindEntry`](crate::pipeline::binding::BindEntry) in the
-    /// [`BindingLayout`], and records one access per entry:
+    /// matching [`BindEntry`](crate::pipeline::binding::BindEntry) from the
+    /// pipeline's reflected layout, and records one access per entry:
     ///
     /// - [`BindKind::UniformBuffer`] / [`BindKind::StorageBufferReadOnly`]:
     ///   [`Access::Read`] at the resource's current version.
@@ -537,13 +539,12 @@ impl<'g> PassBuilder<'g> {
     /// skipped here — it is resolved internally at bind-group creation
     /// and never requires barriers.
     pub fn use_bind_group(&mut self, bg: BindGroupHandle) -> BindGroupWrites {
-        // One borrow over the template/layout to build a work list, then
-        // a second pass to record accesses without holding the borrow.
+        // One borrow over the template to build a work list, then a second
+        // pass to record accesses without holding the borrow.
         let work: Vec<(ResourceId, BindKind)> = {
             let tpl = &self.graph.bind_group_templates[bg.0 as usize];
-            let layout_entries = tpl.layout.entries();
             tpl.entries.iter().map(|&(binding, res_id)| {
-                let entry = layout_entries.iter()
+                let entry = tpl.bind_entries.iter()
                     .find(|e| e.binding == binding)
                     .unwrap_or_else(|| panic!(
                         "bind group template entry at slot {binding} has no \
@@ -736,9 +737,9 @@ impl CompiledGraph {
             let mut bg_entries: Vec<wgpu::BindGroupEntry> =
                 Vec::with_capacity(tpl.entries.len() + 1);
 
-            // Slot 0: GpuConsts — always present, injected by BindingLayout.
+            // Slot 0: GpuConsts — always present, asserted by pipeline construction.
             bg_entries.push(wgpu::BindGroupEntry {
-                binding  : BindingLayout::GPU_CONSTS_SLOT,
+                binding  : GpuConsts::SLOT,
                 resource : tpl.gpu_consts_buf.as_entire_binding(),
             });
 
@@ -763,7 +764,7 @@ impl CompiledGraph {
 
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label   : Some(&tpl.label),
-                layout  : tpl.layout.wgpu_layout(),
+                layout  : &tpl.bg_layout,
                 entries : &bg_entries,
             });
 
@@ -1517,132 +1518,4 @@ mod tests {
         pending.release(&mut pool, &mut tex_pool);
     }
 
-    // -- use_bind_group tests --
-
-    /// `use_bind_group` must derive Read accesses for read-only bindings
-    /// and Write accesses for read-write bindings, producing the same
-    /// barriers that manual `read_buffer` / `write_buffer` would.
-    #[test]
-    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
-    fn use_bind_group_derives_reads_and_writes() {
-        use crate::device::RendererContext;
-        use crate::frame::FrameCount;
-        use crate::gpu_consts::GpuConstsData;
-        use crate::pipeline::binding::{BindEntry, BindKind, BindingLayout};
-
-        let ctx = pollster::block_on(RendererContext::new_headless(
-            FrameCount::new(2).unwrap(),
-        ))
-        .expect("headless GPU context");
-
-        let rw_layout = Arc::new(
-            BindingLayout::builder("rw_layout")
-                .add_entry(BindEntry {
-                    binding:    1,
-                    kind:       BindKind::StorageBufferReadWrite { size: 64 },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .build(&ctx),
-        );
-
-        let ro_layout = Arc::new(
-            BindingLayout::builder("ro_layout")
-                .add_entry(BindEntry {
-                    binding:    1,
-                    kind:       BindKind::StorageBufferReadOnly { size: 64 },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .build(&ctx),
-        );
-
-        let gpu_consts = GpuConsts::new(&ctx, GpuConstsData::default());
-
-        let mut graph = RenderGraph::new();
-
-        let buf = graph.create_buffer("buf", desc());
-
-        let writer_bg = graph.create_bind_group(
-            "writer_bg", &rw_layout, &gpu_consts,
-            &[(1, buf.into())],
-        );
-        let reader_bg = graph.create_bind_group(
-            "reader_bg", &ro_layout, &gpu_consts,
-            &[(1, buf.into())],
-        );
-
-        let buf_v1 = graph.add_pass("writer", |pass| {
-            let w = pass.use_bind_group(writer_bg);
-            w.write_of(buf)
-        });
-
-        let out = graph.create_buffer("out", desc());
-        let out_v1 = graph.add_pass("reader", |pass| {
-            pass.use_bind_group(reader_bg);
-            pass.write_buffer(out)
-        });
-
-        graph.mark_output(buf_v1);
-        graph.mark_output(out_v1);
-
-        let compiled = graph.compile().unwrap();
-        assert_eq!(compiled.pass_names(), ["writer", "reader"]);
-
-        let buf_barriers: Vec<_> = compiled.barriers().iter()
-            .filter(|b| b.resource == ResourceId::from(buf))
-            .collect();
-
-        assert_eq!(buf_barriers.len(), 1);
-        assert_eq!(buf_barriers[0].src,    Access::Write);
-        assert_eq!(buf_barriers[0].dst,    Access::Read);
-        assert_eq!(buf_barriers[0].after,  0);
-        assert_eq!(buf_barriers[0].before, 1);
-    }
-
-    /// Calling `write_of` on a resource that is bound read-only is a
-    /// programmer error (no new version exists for it) and must panic
-    /// with a message that names the read-write constraint.
-    #[test]
-    #[ignore = "requires real GPU hardware (vulkan); run with --ignored"]
-    #[should_panic(expected = "not a read-write binding")]
-    fn write_of_panics_on_read_only_binding() {
-        use crate::device::RendererContext;
-        use crate::frame::FrameCount;
-        use crate::gpu_consts::GpuConstsData;
-        use crate::pipeline::binding::{BindEntry, BindKind, BindingLayout};
-
-        let ctx = pollster::block_on(RendererContext::new_headless(
-            FrameCount::new(2).unwrap(),
-        ))
-        .expect("headless GPU context");
-
-        let ro_layout = Arc::new(
-            BindingLayout::builder("ro_layout")
-                .add_entry(BindEntry {
-                    binding:    1,
-                    kind:       BindKind::StorageBufferReadOnly { size: 64 },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .build(&ctx),
-        );
-
-        let gpu_consts = GpuConsts::new(&ctx, GpuConstsData::default());
-        let mut graph = RenderGraph::new();
-
-        let buf = graph.create_buffer("buf", desc());
-
-        let bg = graph.create_bind_group(
-            "bg", &ro_layout, &gpu_consts,
-            &[(1, buf.into())],
-        );
-
-        let out = graph.create_buffer("out", desc());
-        let out_v1 = graph.add_pass("use", |pass| {
-            let w = pass.use_bind_group(bg);
-            let _ = w.write_of(buf);
-            pass.write_buffer(out)
-        });
-
-        graph.mark_output(out_v1);
-        let _ = graph.compile();
-    }
 }

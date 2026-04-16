@@ -21,6 +21,7 @@ use std::borrow::Cow;
 
 use crate::device::RendererContext;
 use crate::error::RendererError;
+use crate::pipeline::binding::BindKind;
 
 /// The source bytes of a shader module.
 ///
@@ -46,14 +47,20 @@ pub enum ShaderSource {
 /// (principle 3); the `inner` field is `pub(crate)` so pipeline types in
 /// this crate can use it without exposing it to callers.
 pub struct ShaderModule {
-    pub(crate) inner: wgpu::ShaderModule,
+    pub(crate) inner      : wgpu::ShaderModule,
     pub(crate) entry_point: String,
     /// Workgroup size reflected from the shader's `LocalSize` execution mode.
     /// `None` for raster (vertex/fragment) shaders, which have no `LocalSize`.
-    pub workgroup_size: Option<[u32; 3]>,
+    pub workgroup_size      : Option<[u32; 3]>,
     /// Byte size of the `GpuConsts` uniform buffer at (set=0, binding=0),
     /// or `None` if the shader does not declare one.
     pub gpu_consts_byte_size: Option<u32>,
+    /// All descriptor-set-0 bindings reflected from the shader, as
+    /// `(binding_slot, kind)` pairs sorted by slot. Visibility is populated
+    /// by the pipeline constructor that consumes this `ShaderModule`.
+    pub bind_entries        : Vec<(u32, BindKind)>,
+    /// The shader stage of this module's entry point.
+    pub stage               : wgpu::ShaderStages,
 }
 
 impl ShaderModule {
@@ -86,6 +93,7 @@ impl ShaderModule {
 
         let ShaderSource::Spirv(spv_bytes) = source;
         let reflected = reflect::reflect_spirv(spv_bytes, entry_point)?;
+        let stage     = reflect::entry_point_stage(spv_bytes, entry_point)?;
 
         if let Some(size) = reflected.gpu_consts_byte_size {
             assert_eq!(
@@ -97,13 +105,18 @@ impl ShaderModule {
             );
         }
 
-        let inner = create_wgpu_module(ctx, label, ShaderSource::Spirv(spv_bytes));
+        let inner       = create_wgpu_module(ctx, label, ShaderSource::Spirv(spv_bytes));
+        let bind_entries = reflected.entries.into_iter()
+            .map(|e| (e.binding, e.kind))
+            .collect();
 
         Ok(Self {
             inner,
-            entry_point: entry_point.to_owned(),
-            workgroup_size: reflected.workgroup_size,
+            entry_point     : entry_point.to_owned(),
+            workgroup_size  : reflected.workgroup_size,
             gpu_consts_byte_size: reflected.gpu_consts_byte_size,
+            bind_entries,
+            stage,
         })
     }
 }

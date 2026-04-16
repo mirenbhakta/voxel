@@ -28,9 +28,9 @@ pub struct DrawArgs {}
 
 /// Register an MDI raster pass into `graph`.
 ///
-/// Declares resource accesses automatically from `bind_group`'s
-/// [`BindingLayout`](crate::pipeline::binding::BindingLayout) (typically
-/// all read-only entries for the draw side) plus explicit reads of
+/// Declares resource accesses automatically from `bind_group`'s pipeline
+/// bind entries (typically all read-only entries for the draw side) plus
+/// explicit reads of
 /// `indirect.indirect` and `indirect.count` (these travel with `INDIRECT`
 /// usage and are not bound through the layout), and writes of `color`
 /// and `depth` (both cleared at pass start).  Returns the new versioned

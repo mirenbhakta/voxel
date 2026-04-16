@@ -28,11 +28,11 @@ pub struct CullArgs {
 
 /// Register a cull compute pass into `graph`.
 ///
-/// Declares resource accesses automatically from `bind_group`'s
-/// [`BindingLayout`](crate::pipeline::binding::BindingLayout) — every
-/// read-only binding is registered as a read at its current version, and
-/// every read-write binding is registered as a write at a freshly-minted
-/// version.  Callers therefore do not pass separate read/write lists.
+/// Declares resource accesses automatically from `bind_group`'s pipeline
+/// bind entries — every read-only binding is registered as a read at its
+/// current version, and every read-write binding is registered as a write at
+/// a freshly-minted version.  Callers therefore do not pass separate
+/// read/write lists.
 ///
 /// The cull output indirect buffer is identified by
 /// `indirect.indirect` — the caller is responsible for ensuring that

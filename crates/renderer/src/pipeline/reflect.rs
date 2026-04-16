@@ -1,10 +1,9 @@
 //! SPIR-V workgroup-size and descriptor reflection via `rspirv`.
 //!
 //! Exposes [`reflect_spirv`] which parses a SPIR-V binary, locates a named
-//! entry point, and returns [`Reflected`] — the workgroup size extracted from
-//! the `LocalSize` execution mode, and the uniform-buffer byte size at
-//! descriptor set 0 binding 0 (the slot [`GpuConstsData`] occupies in every
-//! pipeline).
+//! entry point, and returns [`Reflected`] — the workgroup size, the
+//! uniform-buffer byte size at slot 0, and the full descriptor-set-0 entry
+//! list.
 //!
 //! The implementation uses `rspirv`'s data-representation layer (`rspirv::dr`)
 //! and scans the module's `entry_points`, `execution_modes`, `annotations`,
@@ -13,10 +12,22 @@
 //!
 //! [`GpuConstsData`]: crate::gpu_consts::GpuConstsData
 
-use rspirv::dr::Operand;
-use rspirv::spirv;
+use rspirv::dr::{Instruction, Module, Operand};
+use rspirv::spirv::{self, Decoration, Op, StorageClass, Word};
 
 use crate::error::RendererError;
+use crate::pipeline::binding::BindKind;
+
+// --- ReflectedEntry ---
+
+/// A single binding reflected from a SPIR-V descriptor set 0 variable.
+#[derive(Debug, Clone)]
+pub struct ReflectedEntry {
+    /// The `[[vk::binding(N, 0)]]` slot number.
+    pub binding : u32,
+    /// Classification of the resource accessed at this slot.
+    pub kind    : BindKind,
+}
 
 // --- Reflected ---
 
@@ -28,24 +39,38 @@ pub struct Reflected {
     /// The workgroup size declared by the entry point's `LocalSize` execution
     /// mode — `[x, y, z]`, matching `[numthreads(x, y, z)]` in HLSL.
     /// `None` for raster (vertex/fragment) shaders, which have no `LocalSize`.
-    pub workgroup_size: Option<[u32; 3]>,
+    pub workgroup_size      : Option<[u32; 3]>,
     /// Size in bytes of the uniform buffer at descriptor set 0 binding 0, or
-    /// `None` if the shader does not declare one. This slot is always
-    /// `GpuConstsData` in the renderer's binding model (forced injection by
-    /// [`BindingLayout`](crate::pipeline::binding::BindingLayout)); the
+    /// `None` if the shader does not declare one.  The
     /// [`ComputePipeline`](crate::pipeline::compute::ComputePipeline)
     /// constructor asserts this value equals `size_of::<GpuConstsData>()`.
     pub gpu_consts_byte_size: Option<u32>,
+    /// All bindings in descriptor set 0, sorted by binding number.
+    pub entries             : Vec<ReflectedEntry>,
 }
 
-// --- reflect_spirv ---
+// --- Public API ---
+
+/// Return the `wgpu::ShaderStages` flag for the named entry point.
+///
+/// Walks `module.entry_points` to find the `OpEntryPoint` whose name matches
+/// `entry_point` and returns the corresponding stage flag.
+///
+/// Returns [`RendererError::ShaderReflectionFailed`] if the entry point is not
+/// found.
+pub fn entry_point_stage(spv: &[u8], entry_point: &str)
+    -> Result<wgpu::ShaderStages, RendererError>
+{
+    let module = parse_module(spv)?;
+    Ok(find_entry_point(&module, entry_point)?.stage)
+}
 
 /// Parse `spv` (raw SPIR-V bytes) and reflect the named `entry_point`.
 ///
 /// Returns [`Reflected`] on success. Returns
 /// [`RendererError::ShaderReflectionFailed`] for any structural problem in the
 /// module: parse failure, missing entry point, unsupported `LocalSizeId`
-/// execution mode, or other malformed SPIR-V.
+/// execution mode, unsupported binding shape, or other malformed SPIR-V.
 ///
 /// Only literal `LocalSize` execution modes are supported. If the shader uses
 /// `LocalSizeId` (spec-constant workgroup sizes), this function returns an
@@ -55,68 +80,184 @@ pub struct Reflected {
 pub fn reflect_spirv(spv: &[u8], entry_point: &str)
     -> Result<Reflected, RendererError>
 {
-    let module = rspirv::dr::load_bytes(spv)
-        .map_err(|e| RendererError::ShaderReflectionFailed(
-            format!("failed to parse SPIR-V: {e}"),
-        ))?;
+    let module          = parse_module(spv)?;
+    let ep              = find_entry_point(&module, entry_point)?;
+    let workgroup_size  = find_workgroup_size(&module, ep.fn_id, entry_point)?;
+    let mut entries     = reflect_set0_entries(&module)?;
+    entries.sort_by_key(|e| e.binding);
 
-    let fn_id = find_entry_point_fn_id(&module, entry_point)?;
-    let workgroup_size = find_workgroup_size(&module, fn_id, entry_point)?;
-    let gpu_consts_byte_size = find_gpu_consts_byte_size(&module);
+    let gpu_consts_byte_size = entries.iter()
+        .find(|e| e.binding == 0)
+        .and_then(|e| match e.kind {
+            BindKind::UniformBuffer { size } => Some(size as u32),
+            _ => None,
+        });
 
-    Ok(Reflected { workgroup_size, gpu_consts_byte_size })
+    Ok(Reflected { workgroup_size, gpu_consts_byte_size, entries })
 }
 
-// --- private helpers ---
+// --- Error helper ---
 
-/// Walk `module.entry_points` to find the `OpEntryPoint` whose name operand
-/// matches `name`. Returns the function-id (`IdRef`) that the `OpEntryPoint`
-/// instruction references.
+/// Shorthand for `RendererError::ShaderReflectionFailed(format!(...))`.
+macro_rules! refl_err {
+    ($($arg:tt)*) => {
+        RendererError::ShaderReflectionFailed(format!($($arg)*))
+    };
+}
+
+// --- Module parsing ---
+
+fn parse_module(spv: &[u8]) -> Result<Module, RendererError> {
+    rspirv::dr::load_bytes(spv)
+        .map_err(|e| refl_err!("failed to parse SPIR-V: {e}"))
+}
+
+// --- Operand helpers ---
+
+fn as_id(op: Option<&Operand>) -> Option<Word> {
+    match op {
+        Some(Operand::IdRef(id)) => Some(*id),
+        _ => None,
+    }
+}
+
+fn as_lit(op: Option<&Operand>) -> Option<u32> {
+    match op {
+        Some(Operand::LiteralBit32(v)) => Some(*v),
+        _ => None,
+    }
+}
+
+fn as_deco(op: Option<&Operand>) -> Option<Decoration> {
+    match op {
+        Some(Operand::Decoration(d)) => Some(*d),
+        _ => None,
+    }
+}
+
+// --- Type-table lookup ---
+
+/// Find the instruction in `module.types_global_values` matching both
+/// `opcode` and `result_id`.
+fn find_type(module: &Module, opcode: Op, id: Word) -> Option<&Instruction> {
+    module.types_global_values.iter()
+        .find(|i| i.class.opcode == opcode && i.result_id == Some(id))
+}
+
+/// Find the instruction in `module.types_global_values` whose `result_id`
+/// matches, regardless of opcode.
+fn find_type_any(module: &Module, id: Word) -> Option<&Instruction> {
+    module.types_global_values.iter()
+        .find(|i| i.result_id == Some(id))
+}
+
+/// Iterate the `IdRef` operands of an instruction.
+fn id_refs(inst: &Instruction) -> impl Iterator<Item = Word> + '_ {
+    inst.operands.iter().filter_map(|op| {
+        if let Operand::IdRef(id) = op { Some(*id) } else { None }
+    })
+}
+
+// --- Decoration iteration ---
+
+/// Yield `(target_id, decoration, extras)` for every `OpDecorate` in
+/// `module.annotations`, where `extras` is the slice of operands after the
+/// decoration tag (so `extras.first()` is the decoration's first literal).
+fn decorates(module: &Module)
+    -> impl Iterator<Item = (Word, Decoration, &[Operand])>
+{
+    module.annotations.iter().filter_map(|inst| {
+        if inst.class.opcode != Op::Decorate {
+            return None;
+        }
+
+        let target = as_id(inst.operands.first())?;
+        let deco   = as_deco(inst.operands.get(1))?;
+        Some((target, deco, inst.operands.get(2..).unwrap_or(&[])))
+    })
+}
+
+/// Yield `(struct_id, member_index, decoration, extras)` for every
+/// `OpMemberDecorate` in `module.annotations`.
+fn member_decorates(module: &Module)
+    -> impl Iterator<Item = (Word, u32, Decoration, &[Operand])>
+{
+    module.annotations.iter().filter_map(|inst| {
+        if inst.class.opcode != Op::MemberDecorate {
+            return None;
+        }
+
+        let sid  = as_id(inst.operands.first())?;
+        let idx  = as_lit(inst.operands.get(1))?;
+        let deco = as_deco(inst.operands.get(2))?;
+        Some((sid, idx, deco, inst.operands.get(3..).unwrap_or(&[])))
+    })
+}
+
+// --- Entry point lookup ---
+
+/// Parsed `OpEntryPoint`: the function id it targets and the stage flag for
+/// its execution model.
+struct EntryPoint {
+    fn_id: Word,
+    stage: wgpu::ShaderStages,
+}
+
+/// Walk `module.entry_points` for the `OpEntryPoint` with a matching name
+/// operand and return its `(fn_id, stage)`.
 ///
 /// `OpEntryPoint` operand layout: `[ExecutionModel, IdRef(fn_id),
 /// LiteralString(name), IdRef*(interface)]`.
-fn find_entry_point_fn_id(
-    module: &rspirv::dr::Module,
-    name: &str,
-)
-    -> Result<spirv::Word, RendererError>
+fn find_entry_point(module: &Module, name: &str)
+    -> Result<EntryPoint, RendererError>
 {
     for inst in &module.entry_points {
-        // Operands[1] = IdRef(fn_id), Operands[2] = LiteralString(name).
-        if let (
+        let (
+            Some(Operand::ExecutionModel(model)),
             Some(Operand::IdRef(fn_id)),
             Some(Operand::LiteralString(ep_name)),
-        ) = (inst.operands.get(1), inst.operands.get(2))
-            && ep_name == name
-        {
-            return Ok(*fn_id);
+        ) = (
+            inst.operands.first(),
+            inst.operands.get(1),
+            inst.operands.get(2),
+        )
+        else {
+            continue;
+        };
+
+        if ep_name != name {
+            continue;
         }
+
+        let stage = match model {
+            spirv::ExecutionModel::Vertex    => wgpu::ShaderStages::VERTEX,
+            spirv::ExecutionModel::Fragment  => wgpu::ShaderStages::FRAGMENT,
+            spirv::ExecutionModel::GLCompute => wgpu::ShaderStages::COMPUTE,
+            other => return Err(refl_err!(
+                "entry point '{name}' has unsupported execution model {other:?}",
+            )),
+        };
+
+        return Ok(EntryPoint { fn_id: *fn_id, stage });
     }
 
-    Err(RendererError::ShaderReflectionFailed(format!(
+    Err(refl_err!(
         "no entry point named '{name}' found in SPIR-V module"
-    )))
+    ))
 }
 
 /// Walk `module.execution_modes` to find the `OpExecutionMode` for `fn_id`
 /// with mode `LocalSize`. Returns `Some([x, y, z])` for compute shaders,
 /// `None` for raster shaders that have no `LocalSize` execution mode.
-///
-/// `OpExecutionMode` operand layout: `[IdRef(fn_id), ExecutionMode(mode),
-/// LiteralBit32(x), LiteralBit32(y), LiteralBit32(z)]` for `LocalSize`.
 fn find_workgroup_size(
-    module: &rspirv::dr::Module,
-    fn_id: spirv::Word,
+    module     : &Module,
+    fn_id      : Word,
     entry_point: &str,
 )
     -> Result<Option<[u32; 3]>, RendererError>
 {
     for inst in &module.execution_modes {
-        let Some(Operand::IdRef(id)) = inst.operands.first() else {
-            continue;
-        };
-
-        if *id != fn_id {
+        if as_id(inst.operands.first()) != Some(fn_id) {
             continue;
         }
 
@@ -131,23 +272,23 @@ fn find_workgroup_size(
                 let z = extract_literal_bit32(&inst.operands, 4, "LocalSize z")?;
 
                 if x == 0 || y == 0 || z == 0 {
-                    return Err(RendererError::ShaderReflectionFailed(format!(
+                    return Err(refl_err!(
                         "entry point '{entry_point}' has invalid LocalSize \
                          [{x}, {y}, {z}]; all dimensions must be ≥ 1 \
                          (Vulkan spec: WorkgroupSize must be at least 1 \
-                         in each dimension)"
-                    )));
+                         in each dimension)",
+                    ));
                 }
 
                 return Ok(Some([x, y, z]));
             }
 
             spirv::ExecutionMode::LocalSizeId => {
-                return Err(RendererError::ShaderReflectionFailed(format!(
+                return Err(refl_err!(
                     "entry point '{entry_point}' uses LocalSizeId (spec-constant \
                      workgroup size); use literal numthreads instead — \
-                     LocalSizeId is not supported in the first rewrite pass"
-                )));
+                     LocalSizeId is not supported in the first rewrite pass",
+                ));
             }
 
             _ => {}
@@ -161,252 +302,216 @@ fn find_workgroup_size(
 /// Extract a `LiteralBit32` from `operands[index]`, or return an error.
 fn extract_literal_bit32(
     operands: &[Operand],
-    index: usize,
-    label: &str,
+    index   : usize,
+    label   : &str,
 )
     -> Result<u32, RendererError>
 {
-    match operands.get(index) {
-        Some(Operand::LiteralBit32(v)) => Ok(*v),
-        other => Err(RendererError::ShaderReflectionFailed(format!(
-            "expected LiteralBit32 for {label}, got {other:?}"
-        ))),
+    as_lit(operands.get(index)).ok_or_else(|| refl_err!(
+        "expected LiteralBit32 for {label}, got {:?}", operands.get(index),
+    ))
+}
+
+// --- Descriptor set 0 reflection ---
+
+/// Walk all `module.annotations` to find every variable decorated with
+/// `DescriptorSet = 0`, then classify each one into a [`ReflectedEntry`].
+fn reflect_set0_entries(module: &Module)
+    -> Result<Vec<ReflectedEntry>, RendererError>
+{
+    let set0_bindings = collect_set0_bindings(module);
+    let mut entries   = Vec::with_capacity(set0_bindings.len());
+
+    for (var_id, binding) in set0_bindings {
+        let kind = classify_var(module, var_id, binding)?;
+        entries.push(ReflectedEntry { binding, kind });
     }
+
+    Ok(entries)
 }
 
-/// Scan annotations + types to find the uniform buffer at descriptor set 0
-/// binding 0, then compute its byte size from the pointed-to struct's members.
-///
-/// Returns `None` if no variable is decorated with `(set=0, binding=0)`.
-/// Returns `Some(size)` with the sum of member widths in bytes otherwise.
-///
-/// Implementation strategy:
-/// 1. Collect all variable ids decorated with `DescriptorSet = 0`.
-/// 2. From those, find the one also decorated with `Binding = 0`.
-/// 3. Follow: `OpVariable.result_type` → `OpTypePointer` → struct id.
-/// 4. Walk the struct's member `OpTypeInt` (or other scalar) types and sum
-///    widths. Member `Offset` decorations are used if present, falling back to
-///    a straight sum for contiguous layouts.
-fn find_gpu_consts_byte_size(module: &rspirv::dr::Module) -> Option<u32> {
-    // Step 1–2: find variable id at (set=0, binding=0).
-    let var_id = find_var_at_set0_binding0(module)?;
+/// Collect `(var_id, binding)` for every variable that has both
+/// `OpDecorate DescriptorSet 0` and `OpDecorate Binding N`.
+fn collect_set0_bindings(module: &Module) -> Vec<(Word, u32)> {
+    let mut set0_vars  : Vec<Word>         = Vec::new();
+    let mut binding_map: Vec<(Word, u32)>  = Vec::new();
 
-    // Step 3: find the OpVariable, follow its result_type (a pointer type id)
-    // to the pointed-to struct type id.
-    let struct_id = find_pointed_struct_id(module, var_id)?;
-
-    // Step 4: compute byte size from struct member types + optional offsets.
-    compute_struct_byte_size(module, struct_id)
-}
-
-/// Find the SPIR-V variable id decorated with both `DescriptorSet = 0` and
-/// `Binding = 0`, scanning `module.annotations`.
-fn find_var_at_set0_binding0(module: &rspirv::dr::Module) -> Option<spirv::Word> {
-    let mut set0_vars: Vec<spirv::Word> = Vec::new();
-    let mut binding0_vars: Vec<spirv::Word> = Vec::new();
-
-    for inst in &module.annotations {
-        let opcode = inst.class.opcode;
-
-        if opcode != spirv::Op::Decorate {
-            continue;
-        }
-
-        // OpDecorate operands: [IdRef(target), Decoration, ...extra]
-        let (Some(Operand::IdRef(target)), Some(Operand::Decoration(deco))) =
-            (inst.operands.first(), inst.operands.get(1))
-        else {
-            continue;
-        };
-
+    for (target, deco, extras) in decorates(module) {
         match deco {
-            spirv::Decoration::DescriptorSet => {
-                if let Some(Operand::LiteralBit32(0)) = inst.operands.get(2) {
-                    set0_vars.push(*target);
-                }
+            Decoration::DescriptorSet if as_lit(extras.first()) == Some(0) => {
+                set0_vars.push(target);
             }
-            spirv::Decoration::Binding => {
-                if let Some(Operand::LiteralBit32(0)) = inst.operands.get(2) {
-                    binding0_vars.push(*target);
+            Decoration::Binding => {
+                if let Some(n) = as_lit(extras.first()) {
+                    binding_map.push((target, n));
                 }
             }
             _ => {}
         }
     }
 
-    // The variable must appear in both lists.
-    set0_vars
-        .iter()
-        .find(|id| binding0_vars.contains(id))
-        .copied()
+    binding_map.into_iter()
+        .filter(|(id, _)| set0_vars.contains(id))
+        .collect()
 }
 
-/// Given a variable id, walk `module.types_global_values` to find the
-/// `OpVariable` with that result id, then follow its `result_type` (a pointer
-/// type id) through `OpTypePointer` to get the pointee struct type id.
-fn find_pointed_struct_id(
-    module: &rspirv::dr::Module,
-    var_id: spirv::Word,
-)
-    -> Option<spirv::Word>
+/// Classify a single descriptor-set-0 variable into a `BindKind`.
+///
+/// - `Uniform` + `Block` → uniform buffer (size from member offsets).
+/// - `Uniform` + `BufferBlock` (legacy SPIR-V) OR `StorageBuffer` + `Block`
+///   → storage buffer (size = element stride of the trailing runtime array).
+///   Read-only when the variable carries `NonWritable`, read-write otherwise.
+/// - Anything else → `ShaderReflectionFailed`.
+fn classify_var(module: &Module, var_id: Word, binding: u32)
+    -> Result<BindKind, RendererError>
 {
-    // Find the OpVariable to get its result_type (the pointer type id).
-    // Only accept Uniform storage class — storage buffers also live at
-    // descriptor set 0 / binding 0 in some shaders and must not be mistaken
-    // for the GpuConsts uniform buffer.
-    // OpVariable operand layout: [StorageClass, optional initializer].
-    let pointer_type_id = module.types_global_values.iter()
-        .find(|inst| {
-            inst.class.opcode == spirv::Op::Variable
-                && inst.result_id == Some(var_id)
-                && matches!(
-                    inst.operands.first(),
-                    Some(Operand::StorageClass(spirv::StorageClass::Uniform))
-                )
-        })
-        .and_then(|inst| inst.result_type)?;
+    let var_inst = find_type(module, Op::Variable, var_id)
+        .ok_or_else(|| refl_err!(
+            "binding {binding}: no OpVariable found for id {var_id}",
+        ))?;
 
-    // Find the OpTypePointer with that result id.
-    // OpTypePointer operand layout: [StorageClass, IdRef(pointee)].
-    // Require Uniform storage class as a belt-and-suspenders check: a
-    // storage-buffer pointer (StorageBuffer class) pointing to a struct must
-    // not be treated as the GpuConsts slot.
-    let struct_id = module.types_global_values.iter()
-        .find(|inst| {
-            inst.class.opcode == spirv::Op::TypePointer
-                && inst.result_id == Some(pointer_type_id)
-                && matches!(
-                    inst.operands.first(),
-                    Some(Operand::StorageClass(spirv::StorageClass::Uniform))
-                )
-        })
-        .and_then(|inst| {
-            if let Some(Operand::IdRef(pointee)) = inst.operands.get(1) {
-                Some(*pointee)
+    let Some(Operand::StorageClass(sc)) = var_inst.operands.first() else {
+        return Err(refl_err!(
+            "binding {binding}: OpVariable has no StorageClass operand",
+        ));
+    };
+
+    let ptr_id = var_inst.result_type.ok_or_else(|| refl_err!(
+        "binding {binding}: OpVariable has no result type",
+    ))?;
+
+    let struct_id = find_type(module, Op::TypePointer, ptr_id)
+        .and_then(|i| as_id(i.operands.get(1)))
+        .ok_or_else(|| refl_err!(
+            "binding {binding}: cannot follow pointer type {ptr_id} to a struct",
+        ))?;
+
+    let block = struct_block_decoration(module, struct_id);
+
+    match (sc, block) {
+        (StorageClass::Uniform, Some(Decoration::Block)) => {
+            let size = compute_struct_byte_size(module, struct_id)
+                .ok_or_else(|| refl_err!(
+                    "binding {binding}: cannot compute byte size of uniform struct {struct_id}",
+                ))?;
+
+            Ok(BindKind::UniformBuffer { size: size as u64 })
+        }
+
+        (StorageClass::Uniform,       Some(Decoration::BufferBlock))
+        | (StorageClass::StorageBuffer, Some(Decoration::Block)) => {
+            let size = storage_buffer_size_from_struct(module, struct_id)
+                .ok_or_else(|| refl_err!(
+                    "binding {binding}: storage buffer struct {struct_id} has no \
+                     runtime-array last member with ArrayStride decoration",
+                ))?;
+
+            let kind = if var_is_non_writable(module, var_id) {
+                BindKind::StorageBufferReadOnly { size }
             }
             else {
-                None
-            }
-        })?;
+                BindKind::StorageBufferReadWrite { size }
+            };
 
-    // Verify the pointee is actually a struct, then return its id.
-    let is_struct = module.types_global_values.iter()
-        .any(|inst| {
-            inst.class.opcode == spirv::Op::TypeStruct
-                && inst.result_id == Some(struct_id)
-        });
+            Ok(kind)
+        }
 
-    if is_struct { Some(struct_id) } else { None }
+        (sc, deco) => Err(refl_err!(
+            "binding {binding}: unsupported variable shape \
+             (StorageClass={sc:?}, decoration={deco:?}); \
+             only Uniform+Block, Uniform+BufferBlock, and StorageBuffer+Block are supported",
+        )),
+    }
 }
+
+// --- Decoration queries ---
+
+/// Whether `var_id` carries an `OpDecorate NonWritable`.
+fn var_is_non_writable(module: &Module, var_id: Word) -> bool {
+    decorates(module).any(|(t, d, _)| t == var_id && d == Decoration::NonWritable)
+}
+
+/// Returns `Block` or `BufferBlock` if `struct_id` is decorated with either,
+/// `None` otherwise.
+fn struct_block_decoration(module: &Module, struct_id: Word) -> Option<Decoration> {
+    decorates(module)
+        .find(|(t, d, _)| {
+            *t == struct_id
+                && matches!(d, Decoration::Block | Decoration::BufferBlock)
+        })
+        .map(|(_, d, _)| d)
+}
+
+/// Find the `ArrayStride` decoration on an `OpTypeRuntimeArray` type id.
+fn runtime_array_stride(module: &Module, rta_id: Word) -> Option<u32> {
+    decorates(module)
+        .find(|(t, d, _)| *t == rta_id && *d == Decoration::ArrayStride)
+        .and_then(|(_, _, extras)| as_lit(extras.first()))
+}
+
+// --- Struct size computation ---
 
 /// Compute the total byte size of a struct type.
 ///
-/// Strategy: collect all member `Offset` decorations from
-/// `module.annotations` (`OpMemberDecorate`). If offsets are present,
-/// size = `offset_of_last_member + size_of_last_member`. If absent, fall back
-/// to summing each member's scalar bit-width in bytes.
-///
-/// For `GpuConstsData` (8 × u32, no vector members, offsets at 0, 4, 8, …
-/// 28) both paths produce 32.
-fn compute_struct_byte_size(
-    module: &rspirv::dr::Module,
-    struct_id: spirv::Word,
-)
-    -> Option<u32>
-{
-    // Collect the struct's member type ids (IdRef operands of OpTypeStruct).
-    let struct_inst = module.types_global_values.iter()
-        .find(|inst| {
-            inst.class.opcode == spirv::Op::TypeStruct
-                && inst.result_id == Some(struct_id)
-        })?;
+/// Strategy: if every member has an `OpMemberDecorate Offset`, return
+/// `offset_of_last + size_of_last`. Otherwise sum each member's scalar
+/// bit-width in bytes. For `GpuConstsData` (8 × u32, offsets 0, 4, … 28) both
+/// paths produce 32.
+fn compute_struct_byte_size(module: &Module, struct_id: Word) -> Option<u32> {
+    let struct_inst = find_type(module, Op::TypeStruct, struct_id)?;
+    let members: Vec<Word> = id_refs(struct_inst).collect();
 
-    let member_type_ids: Vec<spirv::Word> = struct_inst.operands.iter()
-        .filter_map(|op| {
-            if let Operand::IdRef(id) = op { Some(*id) } else { None }
-        })
-        .collect();
-
-    if member_type_ids.is_empty() {
+    if members.is_empty() {
         return Some(0);
     }
 
-    // Collect OpMemberDecorate Offset values for this struct.
-    // offsets[member_index] = offset in bytes, if declared.
-    let mut offsets: Vec<Option<u32>> = vec![None; member_type_ids.len()];
+    let mut offsets: Vec<Option<u32>> = vec![None; members.len()];
 
-    for inst in &module.annotations {
-        if inst.class.opcode != spirv::Op::MemberDecorate {
+    for (sid, idx, deco, extras) in member_decorates(module) {
+        if sid != struct_id || deco != Decoration::Offset {
             continue;
         }
 
-        // OpMemberDecorate: [IdRef(struct_id), LiteralBit32(member), Decoration, ...extra]
-        let (
-            Some(Operand::IdRef(sid)),
-            Some(Operand::LiteralBit32(member_idx)),
-            Some(Operand::Decoration(spirv::Decoration::Offset)),
-            Some(Operand::LiteralBit32(offset)),
-        ) = (
-            inst.operands.first(),
-            inst.operands.get(1),
-            inst.operands.get(2),
-            inst.operands.get(3),
-        ) else {
-            continue;
-        };
+        let idx = idx as usize;
 
-        if *sid == struct_id {
-            let idx = *member_idx as usize;
-
-            if idx < offsets.len() {
-                offsets[idx] = Some(*offset);
-            }
+        if idx < offsets.len()
+            && let Some(off) = as_lit(extras.first())
+        {
+            offsets[idx] = Some(off);
         }
     }
 
-    let all_offsets_present = offsets.iter().all(|o| o.is_some());
-
-    if all_offsets_present {
-        // Use offset of last member + size of last member.
-        let last_idx = member_type_ids.len() - 1;
-        let last_offset = offsets[last_idx]?;
-        let last_type_id = member_type_ids[last_idx];
-        let last_size = member_byte_size(module, last_type_id)?;
-
-        Some(last_offset + last_size)
+    if offsets.iter().all(Option::is_some) {
+        let last      = members.len() - 1;
+        let last_off  = offsets[last]?;
+        let last_size = member_byte_size(module, members[last])?;
+        Some(last_off + last_size)
     }
     else {
-        // Fall back: sum all member sizes in order.
-        let mut total: u32 = 0;
-
-        for type_id in &member_type_ids {
-            total += member_byte_size(module, *type_id)?;
-        }
-
-        Some(total)
+        members.iter()
+            .try_fold(0u32, |acc, &tid| Some(acc + member_byte_size(module, tid)?))
     }
 }
 
-/// Return the byte size of a SPIR-V scalar/vector type by looking it up in
-/// `module.types_global_values`.
-///
-/// Handles `OpTypeInt` (width/8) and `OpTypeFloat` (width/8). Returns `None`
-/// for unrecognised types — the caller treats `None` as "couldn't compute
-/// size."
-fn member_byte_size(module: &rspirv::dr::Module, type_id: spirv::Word) -> Option<u32> {
-    let inst = module.types_global_values.iter()
-        .find(|i| i.result_id == Some(type_id))?;
+/// For a struct whose last member is `OpTypeRuntimeArray`, return the array's
+/// element stride from the `ArrayStride` decoration. Used as the reported
+/// "size" of a storage buffer binding.
+fn storage_buffer_size_from_struct(module: &Module, struct_id: Word) -> Option<u64> {
+    let struct_inst = find_type(module, Op::TypeStruct, struct_id)?;
+    let last_member = id_refs(struct_inst).last()?;
+
+    find_type(module, Op::TypeRuntimeArray, last_member)?;
+    runtime_array_stride(module, last_member).map(|s| s as u64)
+}
+
+/// Return the byte size of a SPIR-V scalar type (`OpTypeInt` or
+/// `OpTypeFloat`). Returns `None` for any other type — callers treat that as
+/// "size couldn't be computed".
+fn member_byte_size(module: &Module, type_id: Word) -> Option<u32> {
+    let inst = find_type_any(module, type_id)?;
 
     match inst.class.opcode {
-        spirv::Op::TypeInt | spirv::Op::TypeFloat => {
-            // operands[0] = LiteralBit32(width in bits)
-            if let Some(Operand::LiteralBit32(width)) = inst.operands.first() {
-                Some(width / 8)
-            }
-            else {
-                None
-            }
-        }
+        Op::TypeInt | Op::TypeFloat => as_lit(inst.operands.first()).map(|w| w / 8),
         _ => None,
     }
 }
@@ -781,5 +886,149 @@ mod tests {
             Some(32),
             "expected Some(32) matching GpuConstsData (8 × u32)",
         );
+    }
+
+    // --- Storage buffer reflection helpers and tests ---
+
+    /// Build a SPIR-V compute shader with:
+    /// - A uniform buffer at (set=0, binding=0): `num_uniform_members` × u32.
+    /// - A read-write storage buffer at (set=0, binding=1): struct wrapping a
+    ///   runtime array of u32 with `ArrayStride = element_stride`, using the
+    ///   modern `StorageBuffer` storage class + `Block` decoration.
+    ///
+    /// IDs: %1=void, %2=voidfn, %3=main, %4=label,
+    ///      %5=uint, %6=uniform_struct, %7=uniform_ptr, %8=uniform_var,
+    ///      %9=rta, %10=storage_struct, %11=storage_ptr, %12=storage_var.
+    ///      Bound = 13.
+    fn compute_spirv_with_uniform_and_storage_rw(
+        x: u32, y: u32, z: u32,
+        num_uniform_members: u32,
+        element_stride: u32,
+    ) -> Vec<u8> {
+        assert!(num_uniform_members > 0);
+
+        let mut w: Vec<u32> = Vec::new();
+
+        // Header (bound = 13)
+        w.extend_from_slice(&[0x07230203, 0x00010100, 0x00000000, 0x0000000D, 0x00000000]);
+
+        // OpCapability Shader
+        w.extend_from_slice(&[0x00020011, 0x00000001]);
+
+        // OpMemoryModel Logical GLSL450
+        w.extend_from_slice(&[0x0003000E, 0x00000000, 0x00000001]);
+
+        // OpEntryPoint GLCompute %3 "main"
+        w.extend_from_slice(&[0x0005000F, 0x00000005, 0x00000003, 0x6E69616D, 0x00000000]);
+
+        // OpExecutionMode %3 LocalSize x y z
+        w.extend_from_slice(&[0x00060010, 0x00000003, 0x00000011, x, y, z]);
+
+        // --- Annotations ---
+
+        // Uniform buffer (binding 0):
+        // OpDecorate %8 DescriptorSet 0
+        w.extend_from_slice(&[0x00040047, 0x00000008, 0x00000022, 0x00000000]);
+        // OpDecorate %8 Binding 0
+        w.extend_from_slice(&[0x00040047, 0x00000008, 0x00000021, 0x00000000]);
+        // OpDecorate %6 Block
+        w.extend_from_slice(&[0x00030047, 0x00000006, 0x00000002]);
+        // OpMemberDecorate %6 i Offset (i*4)
+        for i in 0..num_uniform_members {
+            w.extend_from_slice(&[0x00050048, 0x00000006, i, 0x00000023, i * 4]);
+        }
+
+        // Storage buffer (binding 1):
+        // OpDecorate %12 DescriptorSet 0
+        w.extend_from_slice(&[0x00040047, 0x0000000C, 0x00000022, 0x00000000]);
+        // OpDecorate %12 Binding 1
+        w.extend_from_slice(&[0x00040047, 0x0000000C, 0x00000021, 0x00000001]);
+        // OpDecorate %10 Block  (modern storage buffer)
+        w.extend_from_slice(&[0x00030047, 0x0000000A, 0x00000002]);
+        // OpDecorate %9 ArrayStride element_stride
+        w.extend_from_slice(&[0x00040047, 0x00000009, 0x00000006, element_stride]);
+
+        // --- Types ---
+
+        // %1 = OpTypeVoid  (op=19=0x13, wc=2)
+        w.extend_from_slice(&[0x00020013, 0x00000001]);
+        // %2 = OpTypeFunction %1  (op=33=0x21, wc=3)
+        w.extend_from_slice(&[0x00030021, 0x00000002, 0x00000001]);
+        // %5 = OpTypeInt 32 0  (op=21=0x15, wc=4)
+        w.extend_from_slice(&[0x00040015, 0x00000005, 0x00000020, 0x00000000]);
+
+        // %6 = OpTypeStruct %5 × num_uniform_members  (op=30=0x1E)
+        let ubuf_struct_wc = 2 + num_uniform_members;
+        w.push((ubuf_struct_wc << 16) | 0x001E);
+        w.push(0x00000006);
+        w.extend(std::iter::repeat_n(0x00000005u32, num_uniform_members as usize));
+
+        // %7 = OpTypePointer Uniform %6  (Uniform = 2, op=32=0x20, wc=4)
+        w.extend_from_slice(&[0x00040020, 0x00000007, 0x00000002, 0x00000006]);
+        // %8 = OpVariable %7 Uniform  (op=59=0x3B, wc=4)
+        w.extend_from_slice(&[0x0004003B, 0x00000007, 0x00000008, 0x00000002]);
+
+        // %9 = OpTypeRuntimeArray %5  (op=29=0x1D, wc=3)
+        w.extend_from_slice(&[0x0003001D, 0x00000009, 0x00000005]);
+        // %10 = OpTypeStruct %9  (op=30=0x1E, wc=3)
+        w.extend_from_slice(&[0x0003001E, 0x0000000A, 0x00000009]);
+        // %11 = OpTypePointer StorageBuffer %10  (StorageBuffer=12=0xC, op=32=0x20, wc=4)
+        w.extend_from_slice(&[0x00040020, 0x0000000B, 0x0000000C, 0x0000000A]);
+        // %12 = OpVariable %11 StorageBuffer  (op=59=0x3B, wc=4)
+        w.extend_from_slice(&[0x0004003B, 0x0000000B, 0x0000000C, 0x0000000C]);
+
+        // --- Function ---
+
+        // %3 = OpFunction %1 None %2  (op=54=0x36, wc=5)
+        w.extend_from_slice(&[0x00050036, 0x00000001, 0x00000003, 0x00000000, 0x00000002]);
+        // %4 = OpLabel  (op=248=0xF8, wc=2)
+        w.extend_from_slice(&[0x000200F8, 0x00000004]);
+        // OpReturn  (op=253=0xFD, wc=1)
+        w.push(0x000100FD);
+        // OpFunctionEnd  (op=56=0x38, wc=1)
+        w.push(0x00010038);
+
+        w.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// A 2-binding shader (uniform at 0, storage-rw at 1) reflects the correct
+    /// (binding, kind) pairs in ascending binding order.
+    #[test]
+    fn reflect_spirv_entries_uniform_and_storage_rw() {
+        let spv = compute_spirv_with_uniform_and_storage_rw(64, 1, 1, 8, 4);
+        let reflected = reflect_spirv(&spv, "main")
+            .expect("reflect_spirv should succeed on 2-binding shader");
+
+        assert_eq!(reflected.entries.len(), 2, "expected 2 entries");
+
+        assert_eq!(reflected.entries[0].binding, 0);
+        assert!(
+            matches!(reflected.entries[0].kind, BindKind::UniformBuffer { size: 32 }),
+            "slot 0 should be UniformBuffer {{ size: 32 }}, got {:?}",
+            reflected.entries[0].kind,
+        );
+
+        assert_eq!(reflected.entries[1].binding, 1);
+        assert!(
+            matches!(reflected.entries[1].kind, BindKind::StorageBufferReadWrite { size: 4 }),
+            "slot 1 should be StorageBufferReadWrite {{ size: 4 }}, got {:?}",
+            reflected.entries[1].kind,
+        );
+    }
+
+    /// Uniform buffer entries show up in `entries` and `gpu_consts_byte_size`
+    /// is derived from the slot-0 entry.
+    #[test]
+    fn reflect_spirv_entries_match_gpu_consts_byte_size() {
+        let spv = compute_spirv_with_uniform(64, 1, 1, 8);
+        let reflected = reflect_spirv(&spv, "main")
+            .expect("reflect_spirv should succeed");
+
+        assert_eq!(reflected.entries.len(), 1);
+        assert_eq!(reflected.entries[0].binding, 0);
+        assert!(
+            matches!(reflected.entries[0].kind, BindKind::UniformBuffer { size: 32 }),
+        );
+        assert_eq!(reflected.gpu_consts_byte_size, Some(32));
     }
 }

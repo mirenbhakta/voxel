@@ -22,7 +22,7 @@ pub use error::RendererError;
 pub use frame::{FrameCount, FrameIndex};
 pub use gpu_consts::{GpuConsts, GpuConstsData};
 pub use graph::PassContext;
-pub use pipeline::{BindEntry, BindKind, BindingLayout, BindingLayoutBuilder};
+pub use pipeline::{BindEntry, BindKind, PipelineBindLayout};
 pub use pipeline::{ComputePipeline, ComputePipelineDescriptor};
 pub use pipeline::{RenderPipeline, RenderPipelineDescriptor};
 pub use shader::{ShaderModule, ShaderSource};

@@ -1,15 +1,14 @@
 //! Shared GPU constants uniform buffer.
 //!
 //! [`GpuConstsData`] is the single source of truth for constants read by every
-//! shader in the renderer. It is bound at slot 0 of every [`BindingLayout`]
-//! via forced injection (principle 5: constants flow from one source).
-//!
-//! [`BindingLayout`]: crate::pipeline::binding::BindingLayout
+//! shader in the renderer. It is bound at slot 0 of every pipeline's bind
+//! group layout (asserted by reflection at pipeline construction).
+//! See [`GpuConsts::SLOT`].
 
 use crate::device::RendererContext;
 
-/// Shared constants read by all shaders via a uniform buffer bound at slot 0
-/// of every [`BindingLayout`](crate::pipeline::binding::BindingLayout).
+/// Shared constants read by all shaders via a uniform buffer bound at
+/// [`GpuConsts::SLOT`] of every pipeline's bind group layout.
 ///
 /// Updated rarely — this is a "constants" table, not a per-frame ring. Later
 /// passes grow this table as real shared constants appear.
@@ -111,6 +110,15 @@ pub struct GpuConsts {
 }
 
 impl GpuConsts {
+    /// The descriptor binding slot reserved for `GpuConstsData`.
+    ///
+    /// This is the single number that both the HLSL side
+    /// (`[[vk::binding(0, 0)]] ConstantBuffer<GpuConsts>` in
+    /// `shaders/include/gpu_consts.hlsl`) and every pipeline constructor
+    /// commit to. Pipeline constructors assert slot 0 is a `UniformBuffer`
+    /// sized to `GpuConstsData` during reflection.
+    pub const SLOT: u32 = 0;
+
     /// Create a new uniform buffer initialized with the given constants.
     ///
     /// Allocates one `wgpu::Buffer` of `size_of::<GpuConstsData>()` bytes with
@@ -163,8 +171,8 @@ impl GpuConsts {
     }
 
     /// Access the underlying wgpu buffer. Only visible to primitives within
-    /// the crate — external callers receive a `&GpuConsts` and go through
-    /// `BindingLayout` for binding construction.
+    /// the crate — external callers pass a `&GpuConsts` into
+    /// `RenderGraph::create_bind_group`, which resolves slot 0 internally.
     #[allow(dead_code)] // First caller: bind group construction in the validation binary (later increment).
     pub(crate) fn buffer(&self) -> &wgpu::Buffer {
         &self.buffer
@@ -175,6 +183,14 @@ impl GpuConsts {
 mod tests {
     use super::*;
     use crate::frame::FrameCount;
+
+    /// The reserved slot constant is zero — this is the single number that the
+    /// shader-side `[[vk::binding(0, 0)]] ConstantBuffer<GpuConsts>` in
+    /// `shaders/include/gpu_consts.hlsl` also commits to.
+    #[test]
+    fn gpu_consts_slot_is_zero() {
+        assert_eq!(GpuConsts::SLOT, 0);
+    }
 
     /// Pure-CPU size assertion — mirrors the const assert above, but surfaces
     /// the number in a test report rather than a build error when it breaks.

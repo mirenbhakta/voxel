@@ -19,7 +19,8 @@
 //
 // Binding layout (set 0) — all user bindings consecutive from 1 so the
 // wgpu-hal Vulkan compaction leaves HLSL binding N == VK binding N:
-//   0: GpuConsts    (injected by BindingLayout, unused here but must be present)
+//   0: GpuConsts    (declared in include/gpu_consts.hlsl; pipeline reflection
+//                   asserts this slot is the GpuConsts uniform — unused here)
 //   1: Camera       (uniform, 64 bytes)
 //   2: instances    (StorageBuffer<Instance>, read-only; slot_mask carries
 //                   the 6-bit directional exposure mask in its high bits)

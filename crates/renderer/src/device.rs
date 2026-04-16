@@ -24,7 +24,7 @@ struct WindowedState {
 ///
 /// Increment 3 added headless construction and frame getters; Increment 4
 /// opens the `pub(crate)` device/queue accessors so `GpuConsts` and
-/// `BindingLayout` can allocate their GPU resources, and adds the
+/// pipelines can allocate their GPU resources, and adds the
 /// [`Self::begin_frame`] / [`Self::end_frame`] pair so command recording
 /// flows through a single [`FrameEncoder`] from day one. The surface-based
 /// constructor still lands in a later increment once a windowed caller
@@ -296,9 +296,8 @@ impl RendererContext {
     /// Exposed publicly because the render graph's transient-pool allocation
     /// (`CompiledGraph::allocate_transients`) takes `&wgpu::Device` and lives
     /// above the renderer in callers such as the game crate. Every other
-    /// device use flows through renderer primitives (`GpuConsts`,
-    /// `BindingLayout`, pipelines) per principle 3 (wgpu is contained behind
-    /// render abstractions).
+    /// device use flows through renderer primitives (`GpuConsts`, pipelines)
+    /// per principle 3 (wgpu is contained behind render abstractions).
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }

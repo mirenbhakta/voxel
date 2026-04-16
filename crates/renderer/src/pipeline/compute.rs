@@ -1,7 +1,7 @@
-//! `ComputePipeline` with workgroup-size and GpuConsts-size assertions.
+//! `ComputePipeline` with shader-reflected layout and workgroup-size assertion.
 //!
 //! [`ComputePipeline`] is the only path to dispatching a compute shader in
-//! the renderer. It enforces two invariants at pipeline load time (inside
+//! the renderer. It enforces three invariants at pipeline load time (inside
 //! [`ComputePipeline::new`]), before any wgpu call, so a CPU-side mismatch
 //! panics deterministically without touching the GPU:
 //!
@@ -12,15 +12,15 @@
 //!    at both the expected and actual values — the CPU dispatch code and the
 //!    shader `[numthreads(...)]` are out of sync.
 //!
-//! 2. **GpuConsts size assertion**: if the reflected SPIR-V declares a uniform
+//! 2. **GpuConsts size assertion**: the reflected SPIR-V must declare a uniform
 //!    buffer at descriptor set 0 binding 0 (the slot [`GpuConstsData`] always
-//!    occupies), its byte size is asserted equal to `size_of::<GpuConstsData>()`.
-//!    A mismatch indicates a Rust/HLSL layout disagreement.
+//!    occupies), and its byte size must equal `size_of::<GpuConstsData>()`.
+//!    A missing or wrong-sized entry indicates a Rust/HLSL layout disagreement
+//!    or a shader that does not include `gpu_consts.hlsl`.
 //!
 //! Both assertions fire at construction, not at dispatch — catching
 //! CPU/shader mismatches at load means they surface immediately on startup
-//! rather than on the first dispatch. If checked at dispatch, tests that
-//! construct but never use a pipeline would silently pass.
+//! rather than on the first dispatch.
 //!
 //! ## wgpu::BindGroup leakage
 //!
@@ -34,10 +34,11 @@
 //!
 //! [`GpuConstsData`]: crate::gpu_consts::GpuConstsData
 
-use std::sync::Arc;
-
 use crate::device::RendererContext;
-use crate::pipeline::binding::BindingLayout;
+use crate::gpu_consts::{GpuConsts, GpuConstsData};
+use crate::pipeline::PipelineBindLayout;
+use crate::pipeline::binding::{BindEntry, BindKind};
+use crate::pipeline::bind_kind_to_wgpu_ty;
 use crate::shader::ShaderModule;
 
 // --- ComputePipelineDescriptor ---
@@ -50,9 +51,6 @@ pub struct ComputePipelineDescriptor<'a> {
     pub label: &'a str,
     /// Loaded shader module (produced by [`ShaderModule::load`]).
     pub shader: ShaderModule,
-    /// The binding layout this pipeline was built against. Stored on the
-    /// pipeline and available via [`ComputePipeline::layout`].
-    pub layout: Arc<BindingLayout>,
     /// If `Some`, the reflected workgroup size must equal this value. Triggers
     /// a `panic!` at construction if it does not, with a message pointing at
     /// both values. Pass `None` to skip the assertion (not recommended — it
@@ -65,8 +63,7 @@ pub struct ComputePipelineDescriptor<'a> {
 
 // --- ComputePipeline ---
 
-/// A compute pipeline with baked-in binding layout and reflected workgroup
-/// size.
+/// A compute pipeline with shader-reflected bind group layout.
 ///
 /// The only path to dispatching compute shaders in the renderer. Workgroup-size
 /// and GpuConsts-size assertions fire during [`Self::new`], before any wgpu
@@ -74,10 +71,11 @@ pub struct ComputePipelineDescriptor<'a> {
 ///
 /// See module-level documentation.
 pub struct ComputePipeline {
-    pipeline: wgpu::ComputePipeline,
-    layout: Arc<BindingLayout>,
+    pipeline     : wgpu::ComputePipeline,
+    bg_layout    : wgpu::BindGroupLayout,
+    bind_entries : Vec<BindEntry>,
     workgroup_size: [u32; 3],
-    label: String,
+    label        : String,
 }
 
 // --- ComputePipeline ---
@@ -85,22 +83,21 @@ pub struct ComputePipeline {
 impl ComputePipeline {
     /// Construct a new `ComputePipeline` from `desc`.
     ///
-    /// Reflection and `GpuConsts`-size assertions were already performed
-    /// inside [`ShaderModule::load`]. This function only performs the
-    /// workgroup-size check and wires up the wgpu pipeline.
-    ///
-    /// The sequence is:
-    /// 1. Workgroup-size assertion if `expected_workgroup_size` is `Some`
-    ///    (fires before any GPU calls).
-    /// 2. `wgpu` pipeline layout + compute pipeline construction.
+    /// 1. Workgroup-size assertion (if `expected_workgroup_size` is `Some`).
+    /// 2. Slot-0 GpuConsts assertion — the shader must declare a
+    ///    `UniformBuffer` at slot 0 sized to `GpuConstsData`.
+    /// 3. Build `wgpu::BindGroupLayout` from the reflected entries.
+    /// 4. Create the wgpu compute pipeline.
     ///
     /// # Panics
     ///
     /// Panics if `expected_workgroup_size` is `Some` and does not match the
-    /// workgroup size reflected during [`ShaderModule::load`], or if a raster
-    /// shader is passed to a compute pipeline.
+    /// reflected workgroup size, or if a raster shader is passed, or if slot 0
+    /// is absent, not a `UniformBuffer`, or sized incorrectly.
     pub fn new(ctx: &RendererContext, desc: ComputePipelineDescriptor<'_>) -> Self {
-        // Step 1: workgroup-size assertion (fires before any GPU calls).
+        use std::mem::size_of;
+
+        // Step 1: workgroup-size assertion.
         if let Some(expected) = desc.expected_workgroup_size {
             match desc.shader.workgroup_size {
                 Some(actual) if actual == expected => {}
@@ -119,30 +116,81 @@ impl ComputePipeline {
             }
         }
 
-        // Step 2a: create the pipeline layout.
-        let pipeline_layout =
-            ctx.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some(desc.label),
-                bind_group_layouts: &[Some(desc.layout.wgpu_layout())],
-                immediate_size: desc.immediate_size,
+        // Step 2: slot-0 GpuConsts assertion.
+        let slot0 = desc.shader.bind_entries.iter()
+            .find(|(b, _)| *b == GpuConsts::SLOT);
+
+        match slot0 {
+            Some((_, BindKind::UniformBuffer { size }))
+                if *size as usize == size_of::<GpuConstsData>() => {}
+            Some((_, BindKind::UniformBuffer { size })) => panic!(
+                "pipeline `{}`: slot {} is a UniformBuffer but its size is {} bytes; \
+                 expected {} bytes (GpuConstsData) — \
+                 check that the shader includes shaders/include/gpu_consts.hlsl",
+                desc.label, GpuConsts::SLOT, size, size_of::<GpuConstsData>(),
+            ),
+            Some((_, kind)) => panic!(
+                "pipeline `{}`: slot {} must be the GpuConsts uniform buffer but is \
+                 {:?} — check that the shader includes shaders/include/gpu_consts.hlsl",
+                desc.label, GpuConsts::SLOT, kind,
+            ),
+            None => panic!(
+                "pipeline `{}`: slot {} (GpuConsts) is absent from the shader's \
+                 descriptor set 0 — check that the shader includes \
+                 shaders/include/gpu_consts.hlsl",
+                desc.label, GpuConsts::SLOT,
+            ),
+        }
+
+        // Step 3: build BindEntry list and wgpu::BindGroupLayout.
+        let mut bind_entries: Vec<BindEntry> = desc.shader.bind_entries.iter()
+            .map(|&(binding, kind)| BindEntry {
+                binding,
+                kind,
+                visibility: desc.shader.stage,
+            })
+            .collect();
+        bind_entries.sort_by_key(|e| e.binding);
+
+        let wgpu_entries: Vec<wgpu::BindGroupLayoutEntry> = bind_entries.iter()
+            .map(|e| wgpu::BindGroupLayoutEntry {
+                binding   : e.binding,
+                visibility: e.visibility,
+                ty        : bind_kind_to_wgpu_ty(e.kind),
+                count     : None,
+            })
+            .collect();
+
+        let bg_layout = ctx.device()
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label  : Some(desc.label),
+                entries: &wgpu_entries,
             });
 
-        // Step 2b: create the compute pipeline.
+        // Step 4: create the wgpu pipeline.
+        let pipeline_layout =
+            ctx.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label             : Some(desc.label),
+                bind_group_layouts: &[Some(&bg_layout)],
+                immediate_size    : desc.immediate_size,
+            });
+
         let pipeline =
             ctx.device().create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(desc.label),
-                layout: Some(&pipeline_layout),
-                module: &desc.shader.inner,
-                entry_point: Some(desc.shader.entry_point.as_str()),
+                label              : Some(desc.label),
+                layout             : Some(&pipeline_layout),
+                module             : &desc.shader.inner,
+                entry_point        : Some(desc.shader.entry_point.as_str()),
                 compilation_options: Default::default(),
-                cache: None,
+                cache              : None,
             });
 
         let workgroup_size = desc.shader.workgroup_size;
 
         Self {
             pipeline,
-            layout: desc.layout,
+            bg_layout,
+            bind_entries,
             workgroup_size: workgroup_size.unwrap_or([1, 1, 1]),
             label: desc.label.to_string(),
         }
@@ -152,11 +200,6 @@ impl ComputePipeline {
     /// mode — `[x, y, z]`, matching `[numthreads(x, y, z)]` in HLSL.
     pub fn workgroup_size(&self) -> [u32; 3] {
         self.workgroup_size
-    }
-
-    /// The binding layout this pipeline was constructed with.
-    pub fn layout(&self) -> &Arc<BindingLayout> {
-        &self.layout
     }
 
     /// The debug label this pipeline was constructed with.
@@ -170,18 +213,26 @@ impl ComputePipeline {
     }
 }
 
+impl PipelineBindLayout for ComputePipeline {
+    fn bg_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bg_layout
+    }
+
+    fn bind_entries(&self) -> &[BindEntry] {
+        &self.bind_entries
+    }
+}
+
 // --- Tests ---
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::frame::FrameCount;
-    use crate::pipeline::binding::{BindEntry, BindKind, BindingLayout};
     use crate::shader::{ShaderModule, ShaderSource, VALIDATION_CS_SPV};
 
     /// Builds a `ComputePipeline` for `validation.cs.hlsl` with the correct
     /// expected workgroup size and asserts the baked-in size is `[64, 1, 1]`.
-    /// Also asserts the pipeline retains a clone of the `Arc<BindingLayout>`.
     ///
     /// Gated because it requires a DXC-compiled SPV (placeholder SPV is not
     /// a loadable module) and a Vulkan-capable GPU.
@@ -192,16 +243,6 @@ mod tests {
             FrameCount::new(2).unwrap(),
         ))
         .expect("headless GPU context should construct on a vulkan-capable machine");
-
-        let layout = Arc::new(
-            BindingLayout::builder("validation")
-                .add_entry(BindEntry {
-                    binding: 1,
-                    kind: BindKind::StorageBufferReadWrite { size: 4 },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .build(&ctx),
-        );
 
         let shader = ShaderModule::load(
             &ctx,
@@ -214,11 +255,10 @@ mod tests {
         let pipeline = ComputePipeline::new(
             &ctx,
             ComputePipelineDescriptor {
-                label: "validation",
+                label:                  "validation",
                 shader,
-                layout: layout.clone(),
                 expected_workgroup_size: Some([64, 1, 1]),
-                immediate_size: 0,
+                immediate_size:         0,
             },
         );
 
@@ -226,12 +266,6 @@ mod tests {
             pipeline.workgroup_size(),
             [64, 1, 1],
             "baked-in workgroup size should match [numthreads(64, 1, 1)]",
-        );
-
-        // The pipeline stores one clone; the caller holds another.
-        assert!(
-            Arc::strong_count(pipeline.layout()) >= 2,
-            "pipeline should retain a clone of the Arc<BindingLayout>",
         );
     }
 
@@ -250,16 +284,6 @@ mod tests {
         ))
         .expect("headless GPU context should construct on a vulkan-capable machine");
 
-        let layout = Arc::new(
-            BindingLayout::builder("validation")
-                .add_entry(BindEntry {
-                    binding: 1,
-                    kind: BindKind::StorageBufferReadWrite { size: 4 },
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                })
-                .build(&ctx),
-        );
-
         let shader = ShaderModule::load(
             &ctx,
             "validation",
@@ -272,11 +296,10 @@ mod tests {
         ComputePipeline::new(
             &ctx,
             ComputePipelineDescriptor {
-                label: "validation",
+                label:                  "validation",
                 shader,
-                layout,
                 expected_workgroup_size: Some([32, 1, 1]),
-                immediate_size: 0,
+                immediate_size:         0,
             },
         );
     }
