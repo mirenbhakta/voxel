@@ -367,7 +367,7 @@ impl ApplicationHandler for App {
                 };
 
                 let mut graph = RenderGraph::new();
-                let color = graph.import_texture(surface_frame.texture_clone());
+                let color = graph.present(surface_frame);
                 let depth = graph.create_texture(
                     "subchunk_depth",
                     TextureDesc::new_2d(
@@ -376,17 +376,15 @@ impl ApplicationHandler for App {
                         wgpu::TextureUsages::RENDER_ATTACHMENT,
                     ),
                 );
-                let (color_v, _depth_v) = nodes::subchunk_test(&mut graph, test, color, depth);
-                graph.present(color_v);
+                nodes::subchunk_test(&mut graph, test, color, depth);
 
                 let mut fe = ctx.begin_frame();
                 let frame  = ctx.frame_index();
-                let pending = graph.compile()
+                let (pending, present_token) = graph.compile()
                     .expect("render graph compile")
                     .execute(&mut fe, frame, &mut self.buf_pool, &mut self.tex_pool, ctx.device());
                 ctx.end_frame(fe);
-
-                surface_frame.present();
+                present_token.present();
 
                 pending.release(&mut self.buf_pool, &mut self.tex_pool);
 

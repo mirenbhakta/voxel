@@ -25,7 +25,7 @@ pub use resource::{
 use resource::ResourceHandle;
 
 use crate::commands::Commands;
-use crate::device::FrameEncoder;
+use crate::device::{FrameEncoder, SurfaceFrame};
 use crate::frame::FrameIndex;
 use crate::gpu_consts::GpuConsts;
 use crate::pipeline::PipelineBindLayout;
@@ -231,6 +231,13 @@ pub struct RenderGraph {
     /// resolved into [`wgpu::BindGroup`]s during
     /// [`CompiledGraph::resolve_bind_groups`].
     bind_group_templates    : Vec<BindGroupTemplate>,
+    /// Swapchain image for this frame, owned by the graph so that
+    /// [`CompiledGraph::execute`] can hand back a token that presents it
+    /// after the caller submits.  `Some` after [`present`](Self::present) is
+    /// called; `None` for validation/test/headless paths.  Paired with the
+    /// resource id of the imported texture so [`compile`](Self::compile) can
+    /// seed `output_versions` with the current version at compile time.
+    present_target          : Option<(u32, SurfaceFrame)>,
 }
 
 impl Default for RenderGraph {
@@ -252,6 +259,7 @@ impl RenderGraph {
             imported_buffers        : Vec::new(),
             imported_textures       : Vec::new(),
             bind_group_templates    : Vec::new(),
+            present_target          : None,
         }
     }
 
@@ -386,13 +394,31 @@ impl RenderGraph {
         self.output_versions.push(handle.0);
     }
 
-    /// Mark a texture version as the frame output (swapchain present target).
+    /// Hand the frame's swapchain image to the graph as the frame output.
     ///
-    /// Semantically distinct from [`mark_output`](Self::mark_output): this
-    /// signals which texture the frame loop should present after submit.
-    /// Mechanically it seeds dead-pass culling, just as `mark_output` does.
-    pub fn present(&mut self, handle: TextureHandle) {
-        self.output_versions.push(handle.0);
+    /// Imports the surface texture, stashes the [`SurfaceFrame`] for
+    /// post-submit presentation, and returns a [`TextureHandle`] that passes
+    /// render into.  The version of this resource at [`compile`](Self::compile)
+    /// time — i.e. whatever the final pass wrote — is automatically seeded
+    /// into `output_versions`, so callers do not make a second "mark as
+    /// output" call.  The paired [`SurfacePresent`] token returned from
+    /// [`CompiledGraph::execute`] must be presented after the caller's queue
+    /// submit.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called twice on the same graph — a frame has exactly one
+    /// swapchain output.
+    pub fn present(&mut self, surface_frame: SurfaceFrame) -> TextureHandle {
+        assert!(
+            self.present_target.is_none(),
+            "RenderGraph::present called twice — a frame has exactly one \
+             swapchain output",
+        );
+        let handle = self.alloc_texture_handle();
+        self.imported_textures.push((handle.0.resource, surface_frame.texture_clone()));
+        self.present_target = Some((handle.0.resource, surface_frame));
+        handle
     }
 
     /// Declare a new pass.
@@ -426,7 +452,16 @@ impl RenderGraph {
     ///
     /// Consumes the graph and returns a [`CompiledGraph`] ready for
     /// execution.
-    pub fn compile(self) -> Result<CompiledGraph, CompileError> {
+    pub fn compile(mut self) -> Result<CompiledGraph, CompileError> {
+        // Seed the present-target output with the resource's current version
+        // (= the final pass's write).  Done here rather than in `present()`
+        // because the handle returned there is version 0 — no passes have
+        // run yet at build time.
+        if let Some((resource, _)) = &self.present_target {
+            let version = self.resource_versions[*resource as usize];
+            self.output_versions.push(ResourceHandle { resource: *resource, version });
+        }
+
         let pass_accesses: Vec<Vec<compile::PassAccess>> = self.passes.iter()
             .map(|p| p.accesses.clone())
             .collect();
@@ -494,6 +529,7 @@ impl RenderGraph {
             transient_buffer_descs,
             transient_texture_descs,
             bind_group_templates   : self.bind_group_templates,
+            present_target         : self.present_target.map(|(_, frame)| frame),
         })
     }
 }
@@ -716,6 +752,39 @@ pub struct CompiledGraph {
     transient_buffer_descs  : Vec<(BufferHandle, BufferDesc, String)>,
     transient_texture_descs : Vec<(TextureHandle, TextureDesc, String)>,
     bind_group_templates    : Vec<BindGroupTemplate>,
+    /// Swapchain frame to hand back as a [`SurfacePresent`] token at the end
+    /// of [`execute`](Self::execute).  `None` for graphs that did not call
+    /// [`RenderGraph::present`] (validation harness, tests).
+    present_target          : Option<SurfaceFrame>,
+}
+
+// --- SurfacePresent ---
+
+/// Swapchain-present token returned from [`CompiledGraph::execute`].
+///
+/// Holds the [`SurfaceFrame`] for the frame the graph rendered into.  The
+/// caller must call [`present`](Self::present) *after* the queue submit
+/// containing the frame's commands — wgpu requires the submit to happen
+/// before the present, and dropping the token without presenting silently
+/// drops the frame.
+///
+/// A no-op (wraps `None`) when the graph was not handed a swapchain image,
+/// so headless and validation paths can keep a uniform call shape.
+pub struct SurfacePresent {
+    frame: Option<SurfaceFrame>,
+}
+
+impl SurfacePresent {
+    /// Present the frame's swapchain image, or no-op if the graph did not
+    /// have a swapchain target.
+    ///
+    /// Must be called after the queue submit containing this frame's
+    /// commands.
+    pub fn present(self) {
+        if let Some(frame) = self.frame {
+            frame.present();
+        }
+    }
 }
 
 impl CompiledGraph {
@@ -820,10 +889,12 @@ impl CompiledGraph {
     /// constructs a [`Commands`] recorder from `encoder` and calls each pass's
     /// execute closure sequentially with a [`PassContext`].
     ///
-    /// Returns a [`PendingRelease`] holding the transient resources.
-    /// The caller must hold it until the GPU has completed the submit
-    /// containing this frame's commands, then call
-    /// [`PendingRelease::release`] to return the resources to the pools.
+    /// Returns a [`PendingRelease`] holding the transient resources — the
+    /// caller must hold it until the GPU has completed the submit containing
+    /// this frame's commands, then call [`PendingRelease::release`] to return
+    /// the resources to the pools — and a [`SurfacePresent`] token that
+    /// presents the swapchain image after submit (a no-op for graphs without
+    /// a [`RenderGraph::present`] call).
     pub fn execute(
         mut self,
         encoder  : &mut FrameEncoder,
@@ -832,7 +903,7 @@ impl CompiledGraph {
         tex_pool : &mut TexturePool,
         device   : &wgpu::Device,
     )
-        -> PendingRelease
+        -> (PendingRelease, SurfacePresent)
     {
         self.allocate_transients(buf_pool, tex_pool, device);
         self.resolve_bind_groups(device);
@@ -844,6 +915,7 @@ impl CompiledGraph {
             entries,
             bind_groups,
             barriers,
+            present_target,
             ..
         } = self;
 
@@ -905,7 +977,12 @@ impl CompiledGraph {
             "orphaned barriers with before >= passes.len(); compiler bug",
         );
 
-        PendingRelease { buffers: transient_buffers, textures: transient_textures }
+        let pending = PendingRelease {
+            buffers  : transient_buffers,
+            textures : transient_textures,
+        };
+        let present = SurfacePresent { frame: present_target };
+        (pending, present)
     }
 }
 
@@ -1488,7 +1565,7 @@ mod tests {
 
         let mut encoder = ctx.begin_frame();
         let frame = ctx.frame_index();
-        let pending = compiled.execute(&mut encoder, frame, &mut pool, &mut tex_pool, ctx.device());
+        let (pending, _present) = compiled.execute(&mut encoder, frame, &mut pool, &mut tex_pool, ctx.device());
         ctx.end_frame(encoder);
 
         assert!(ran.load(Ordering::SeqCst), "pass closure must have run");
@@ -1550,7 +1627,7 @@ mod tests {
 
         let mut encoder = ctx.begin_frame();
         let frame = ctx.frame_index();
-        let pending = compiled.execute(&mut encoder, frame, &mut pool, &mut tex_pool, ctx.device());
+        let (pending, _present) = compiled.execute(&mut encoder, frame, &mut pool, &mut tex_pool, ctx.device());
         ctx.end_frame(encoder);
 
         // Both closures must have run in the declared order; barrier emission
