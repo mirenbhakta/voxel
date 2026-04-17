@@ -201,7 +201,7 @@ impl ApplicationHandler for App {
             LevelConfig { level: Level(1),    radius: [2, 2, 2] },
             LevelConfig { level: Level(2),    radius: [2, 2, 2] },
         ];
-        let world_view = WorldView::new(&ctx, &configs, self.pos);
+        let world_view = WorldView::new(&ctx, &mut self.buf_pool, &configs, self.pos);
         self.world_view = Some(world_view);
 
         self.ctx    = Some(ctx);
@@ -351,23 +351,6 @@ impl ApplicationHandler for App {
                     _pad1:   0.0,
                 };
 
-                // Drive residency off the current camera position before
-                // uploading per-frame GPU state. `update` handles evictions,
-                // prep synthesis, slot uploads, and instance-list rebuild.
-                // When LOD is frozen, skip the residency update — camera
-                // still moves for rendering, but sub-chunk contents stay
-                // put so the hole / artefact being inspected does not roll
-                // away under the camera.
-                if !self.lod_frozen {
-                    world_view.update(ctx, self.pos);
-                    if world_view.evicted_last_update() > 0 {
-                        eprintln!(
-                            "evicted {} sub-chunks (total {})",
-                            world_view.evicted_last_update(),
-                            world_view.evicted_total(),
-                        );
-                    }
-                }
                 world_view.renderer().write_camera(ctx, &camera);
 
                 let surface_frame = match ctx.acquire_frame() {
@@ -393,14 +376,35 @@ impl ApplicationHandler for App {
                         wgpu::TextureUsages::RENDER_ATTACHMENT,
                     ),
                 );
-                nodes::subchunk_world(&mut graph, world_view.renderer(), color, depth);
 
                 let mut fe = ctx.begin_frame();
                 let frame  = ctx.frame_index();
+
+                // Drive residency off the current camera position. `update`
+                // polls readbacks, retires completed preps, records patch
+                // and new-prep passes into the graph, and uploads the
+                // instance array + LOD mask. When LOD is frozen, skip the
+                // residency update — camera still moves for rendering, but
+                // sub-chunk contents stay put so the hole / artefact being
+                // inspected does not roll away under the camera.
+                if !self.lod_frozen {
+                    world_view.update(ctx, &mut graph, self.pos, frame);
+                    if world_view.evicted_last_update() > 0 {
+                        eprintln!(
+                            "evicted {} sub-chunks (total {})",
+                            world_view.evicted_last_update(),
+                            world_view.evicted_total(),
+                        );
+                    }
+                }
+
+                nodes::subchunk_world(&mut graph, world_view.renderer(), color, depth);
+
                 let (pending, present_token) = graph.compile()
                     .expect("render graph compile")
                     .execute(&mut fe, frame, &mut self.buf_pool, &mut self.tex_pool, ctx.device());
-                ctx.end_frame(fe);
+                let submission = ctx.end_frame(fe);
+                world_view.commit_submit(frame, submission);
                 present_token.present();
 
                 pending.release(&mut self.buf_pool, &mut self.tex_pool);

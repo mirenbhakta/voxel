@@ -286,6 +286,41 @@ impl Commands<'_> {
         cpass.dispatch_workgroups_indirect(indirect_buf, offset);
     }
 
+    /// Record a clear of `size` bytes of `buf` starting at `offset`, or
+    /// to the end of the buffer if `size` is `None`.
+    ///
+    /// Filled with zero bytes. `buf` must carry
+    /// [`wgpu::BufferUsages::COPY_DST`] at creation time, and the caller is
+    /// responsible for declaring a write on `buf` in the enclosing render-
+    /// graph pass so barriers are inserted correctly.
+    pub fn clear_buffer(
+        &mut self,
+        buf    : &wgpu::Buffer,
+        offset : u64,
+        size   : Option<u64>,
+    ) {
+        self.encoder.clear_buffer(buf, offset, size);
+    }
+
+    /// Record a buffer-to-buffer copy of `size` bytes from `src` at
+    /// `src_offset` into `dst` at `dst_offset`.
+    ///
+    /// The caller is responsible for declaring `src` as read and `dst` as
+    /// write on the enclosing render-graph pass so barriers are inserted
+    /// correctly — this method only records the copy command. `src` must
+    /// carry [`wgpu::BufferUsages::COPY_SRC`] and `dst`
+    /// [`wgpu::BufferUsages::COPY_DST`] at creation time.
+    pub fn copy_buffer_to_buffer(
+        &mut self,
+        src        : &wgpu::Buffer,
+        src_offset : u64,
+        dst        : &wgpu::Buffer,
+        dst_offset : u64,
+        size       : u64,
+    ) {
+        self.encoder.copy_buffer_to_buffer(src, src_offset, dst, dst_offset, size);
+    }
+
     /// Open a raster pass, run `f`, then end the pass.
     ///
     /// The [`RasterPass`] is scoped to the closure so its lifetime cannot

@@ -3,18 +3,25 @@
 //
 // One thread per candidate sub-chunk (MAX_CANDIDATES = 256). Thread 0
 // initialises the transient indirect-args buffer (pool hands back undefined
-// contents). After the barrier, every thread runs two cheap rejections
+// contents). After the barrier, every thread runs three cheap rejections
 // against its candidate:
+//   0. Padding sentinel: slot_mask bit 31 = `SubchunkInstance::PADDING_BIT`.
+//      Tail entries in the instance array carry this bit and are dropped
+//      before touching any per-slot buffer (so padding never depends on
+//      the contents of `g_live_exposure[0]`).
 //   1. Frustum test on the [origin, origin + 8*voxel_size]^3 AABB.
 //   2. Directional-exposure test: if none of the sub-chunk's face-exposure
 //      bits overlap the camera-visible face directions (derived from the
 //      camera position relative to the AABB), the sub-chunk contributes no
-//      visible surface from this view and is dropped.
+//      visible surface from this view and is dropped. Exposure is a
+//      per-slot value read from `g_live_exposure[slot]` — the patch pass
+//      commits it alongside the staging occupancy on every dirty slot.
 // Survivors atomically append their index to the visible list and
 // increment the indirect draw instance count.
 //
-// `slot_mask` packs slot / level / exposure; see subchunk.vs.hlsl for the
-// bit layout. Level is needed here for the per-instance cube extent.
+// `slot_mask` packs slot / level + a high-bit padding flag; see
+// subchunk.vs.hlsl for the bit layout. Level is needed here for the
+// per-instance cube extent; exposure is NOT stored in the instance.
 //
 // The draw-count buffer is a persistent constant = 1; fanout lives in
 // instance_count on the single indirect entry.
@@ -25,12 +32,13 @@
 // backend compacts BGL entries sequentially, and the SPIR-V passthrough
 // path does not remap — so HLSL binding numbers must equal their ordinal
 // position within the reflected set):
-//   0: Camera       (uniform, 64 bytes)
-//   1: instances    (StorageBuffer<Instance>, read-only)
-//   2: visible      (RWStorageBuffer<uint>)
-//   3: lod_mask     (uniform, 512 bytes) — per-level finer-shell AABB;
-//                   sub-chunks whose AABB is fully inside their level's
-//                   mask entry are dropped (the finer level renders them).
+//   0: Camera         (uniform, 64 bytes)
+//   1: instances      (StorageBuffer<Instance>, read-only)
+//   2: visible        (RWStorageBuffer<uint>)
+//   3: lod_mask       (uniform, 512 bytes) — per-level finer-shell AABB;
+//                     sub-chunks whose AABB is fully inside their level's
+//                     mask entry are dropped (the finer level renders them).
+//   4: live_exposure  (StorageBuffer<uint>, read-only, one entry per slot)
 //
 // Set 1 — owned by the cull node; the indirect-args bind group is built
 // from this pipeline's reflected set-1 layout, not supplied by the caller:
@@ -47,11 +55,11 @@ struct Camera {
     float  _pad1;
 };
 
-// slot_mask packs three fields:
-//   bits  0-21: occupancy slot index (22 bits, unused by the cull shader)
-//   bits 22-25: LOD level (4 bits)            — used here for extent
-//   bits 26-31: directional exposure mask (6) — used here for rejection
-//                 bit 0=-X, 1=+X, 2=-Y, 3=+Y, 4=-Z, 5=+Z
+// slot_mask packs two fields + a padding sentinel:
+//   bits  0-21: occupancy slot index (22 bits)  — selects `g_live_exposure` entry
+//   bits 22-25: LOD level (4 bits)              — used here for extent
+//   bits 26-30: reserved (5 bits), must be zero
+//   bit  31   : padding sentinel — matches `SubchunkInstance::PADDING_BIT`
 struct Instance {
     int3 origin;
     uint slot_mask;
@@ -70,6 +78,7 @@ struct LodMask {
 [[vk::binding(1, 0)]] StructuredBuffer<Instance> g_instances;
 [[vk::binding(2, 0)]] RWStructuredBuffer<uint>   g_visible;
 [[vk::binding(3, 0)]] ConstantBuffer<LodMask>    g_lod_mask;
+[[vk::binding(4, 0)]] StructuredBuffer<uint>     g_live_exposure;
 [[vk::binding(0, 1)]] RWStructuredBuffer<uint4>  g_indirect; // uint4 = {vertex_count, instance_count, first_vertex, first_instance}
 
 static const uint  MAX_CANDIDATES   = 256u;
@@ -156,12 +165,23 @@ void main(uint3 tid : SV_DispatchThreadID, uint ltid : SV_GroupIndex) {
         return;
     }
 
-    Instance inst         = g_instances[tid.x];
-    uint     level        = (inst.slot_mask >> 22u) & 0xFu;
-    float    voxel_size   = float(1u << level);
-    float    cube_extent  = SUBCHUNK_VOXELS * voxel_size;
-    float3   lo           = float3(inst.origin);
-    float3   hi           = lo + float3(cube_extent, cube_extent, cube_extent);
+    Instance inst = g_instances[tid.x];
+
+    // Padding sentinel: tail entries in the instance array carry bit 31
+    // (`SubchunkInstance::PADDING_BIT`). Drop them before touching any
+    // slot-indexed buffer — `inst.slot_mask`'s slot field on a padding
+    // entry has no owner, and reading `g_live_exposure[slot]` for it
+    // would conflate padding with an unused-but-valid live slot.
+    if ((inst.slot_mask & 0x80000000u) != 0u) {
+        return;
+    }
+
+    uint   slot        = inst.slot_mask & 0x3FFFFFu;
+    uint   level       = (inst.slot_mask >> 22u) & 0xFu;
+    float  voxel_size  = float(1u << level);
+    float  cube_extent = SUBCHUNK_VOXELS * voxel_size;
+    float3 lo          = float3(inst.origin);
+    float3 hi          = lo + float3(cube_extent, cube_extent, cube_extent);
 
     if (!frustum_visible(lo, hi)) {
         return;
@@ -198,14 +218,14 @@ void main(uint3 tid : SV_DispatchThreadID, uint ltid : SV_GroupIndex) {
     if (cam_pos.z <= hi.z) relevant |= 1u << 4;
     if (cam_pos.z >= lo.z) relevant |= 1u << 5;
 
-    uint exposure = inst.slot_mask >> 26u;
+    uint exposure = g_live_exposure[slot];
     if ((exposure & relevant) == 0u) {
         return;
     }
 
     // Atomically append this candidate's index to the visible list and
     // increment the instance count in the indirect-draw entry.
-    uint slot;
-    InterlockedAdd(g_indirect[0].y, 1u, slot);
-    g_visible[slot] = tid.x;
+    uint visible_idx;
+    InterlockedAdd(g_indirect[0].y, 1u, visible_idx);
+    g_visible[visible_idx] = tid.x;
 }

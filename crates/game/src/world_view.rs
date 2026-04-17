@@ -1,11 +1,11 @@
 //! Residency-driven view of the world for a single frame's render.
 //!
 //! [`WorldView`] owns the CPU residency state (a multi-level
-//! [`Residency`]) and the GPU-side [`WorldRenderer`]. It exposes a single
-//! `update` entry point that the main loop calls once per frame with the
-//! current camera position; the view handles eviction, prep synthesis,
-//! pool commits, and the CPU→GPU uploads that keep the render buffers in
-//! sync with the resident set.
+//! [`Residency`]) and the GPU-side [`WorldRenderer`]. It drives the
+//! prep/patch/readback loop every frame: retired GPU prep reports are
+//! drained into residency, then dirty slots are patched into the live
+//! occupancy buffer, then new prep requests for newly-resident sub-chunks
+//! are dispatched into the graph.
 //!
 //! # Slot namespaces
 //!
@@ -16,30 +16,40 @@
 //! the global slot for `(level_idx, pool_slot)` is `offset + pool_slot`.
 //! Sum of per-level capacities must not exceed [`SUBCHUNK_MAX_CANDIDATES`].
 //!
-//! # LOD selection (deferred)
+//! # Frame lifecycle
 //!
-//! Every level emits an instance for each of its resident sub-chunks.
-//! Coarse-level sub-chunks that overlap finer levels' shells are not yet
-//! skipped — visual overlap is a known limitation until the LOD-cascade
-//! masking pass lands.
+//! Two calls per frame, split around graph submit so the readback channel
+//! can arm its `map_async` on the real submission fence:
+//!
+//! 1. [`WorldView::update`] — top of frame. Polls wgpu, retires completed
+//!    readbacks (driving the CPU residency forward), records patch passes
+//!    for newly-dirty slots, records a prep pass for newly-issued
+//!    requests, uploads the instance array and LOD mask.
+//! 2. [`WorldView::commit_submit`] — after `ctx.end_frame` returns the
+//!    submission index. Arms the channel's map_async callback so the
+//!    retirement fence fires on the right frame.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use renderer::{
-    LodMaskUniform, RendererContext, SUBCHUNK_MAX_CANDIDATES, SUBCHUNK_MAX_LEVELS,
-    SubchunkInstance, WorldRenderer,
+    FrameIndex, LodMaskUniform, OverflowPolicy, PrepRequest as GpuPrepRequest,
+    ReadbackChannel, RendererContext, SUBCHUNK_MAX_CANDIDATES, SUBCHUNK_MAX_LEVELS,
+    SubchunkInstance, WorldRenderer, nodes,
 };
+use renderer::graph::{BufferPool, RenderGraph};
+use renderer::DirtyReport;
 
 use crate::world::coord::{Level, SubchunkCoord};
 use crate::world::pool::SlotId;
-use crate::world::residency::{LevelConfig, OccupancySummary, Residency};
-use crate::world::subchunk::{SUBCHUNK_EDGE, SubchunkOccupancy};
+use crate::world::residency::{LevelConfig, OccupancySummary, Residency, RequestId};
+use crate::world::subchunk::SUBCHUNK_EDGE;
 
 // --- WorldView ---
 
 /// Per-frame integrator between the CPU residency and the GPU render path.
 pub struct WorldView {
-    residency:   Residency<SubchunkOccupancy>,
+    residency:   Residency<()>,
     renderer:    Arc<WorldRenderer>,
     /// Cloned configs so the view can recompute shell bounds each frame.
     configs:     Vec<LevelConfig>,
@@ -48,19 +58,43 @@ pub struct WorldView {
     level_slots: Vec<LevelSlotRange>,
     /// Shadow of the GPU instance array. Rebuilt from every level's
     /// occupied pool each update; indices past the resident count are
-    /// left as sentinels with `exposure_mask = 0` so the cull shader
-    /// rejects them trivially.
+    /// filled with [`SubchunkInstance::padding`] so the cull shader
+    /// rejects them before touching any per-slot buffer.
     instances:   [SubchunkInstance; SUBCHUNK_MAX_CANDIDATES],
+
+    /// Readback channel carrying `DirtyReport`s from the prep compute
+    /// pass back to the CPU residency.
+    channel:     ReadbackChannel<DirtyReport>,
+    /// Ordered list of prep batches awaiting readback. Each entry pairs
+    /// the frame the batch was dispatched on with the `(request_id, slot)`
+    /// list; when `channel.take_ready` returns that frame's report the
+    /// front entry retires.
+    in_flight:   VecDeque<InFlightBatch>,
 
     // --- Eviction bookkeeping ---
     evicted_last_update: usize,
     evicted_total:       u64,
 }
 
+/// One outstanding prep dispatch. Pops off the front of `in_flight` when
+/// its readback retires.
+struct InFlightBatch {
+    frame:       FrameIndex,
+    completions: Vec<(RequestId, u32)>,
+}
+
 impl WorldView {
     /// Construct the view with the given levels, centered on
-    /// `initial_camera`. Runs the initial prep-and-upload cycle so the
-    /// renderer has resident data before the first frame.
+    /// `initial_camera`.
+    ///
+    /// The first frame has no retired readbacks yet, so the live GPU
+    /// occupancy buffer stays zero-initialised until the prep dispatch
+    /// recorded on frame 0 retires (typically 1–2 frames later). The
+    /// render pass still runs each frame — the cull shader reads each
+    /// slot's exposure from `live_exposure_buf`, which is zero-initialised
+    /// until a patch lands, so every slot is rejected trivially. Expect
+    /// the first one or two rendered frames to be empty before content
+    /// starts to appear.
     ///
     /// # Panics
     ///
@@ -68,6 +102,7 @@ impl WorldView {
     /// [`SUBCHUNK_MAX_CANDIDATES`].
     pub fn new(
         ctx:            &RendererContext,
+        pool:           &mut BufferPool,
         configs:        &[LevelConfig],
         initial_camera: [f32; 3],
     )
@@ -116,23 +151,23 @@ impl WorldView {
             "WorldView requires every radius component to be even and >= 2 for nested LOD",
         );
 
-        let residency = Residency::<SubchunkOccupancy>::new(configs, initial_camera);
+        let residency = Residency::<()>::new(configs, initial_camera);
         let renderer  = Arc::new(WorldRenderer::new(ctx));
+        let channel   = ReadbackChannel::<DirtyReport>::new(
+            ctx, pool, "subchunk_prep_readback", OverflowPolicy::Panic,
+        );
 
-        let mut view = Self {
+        Self {
             residency,
             renderer,
             configs:     configs.to_vec(),
             level_slots,
-            instances: [SubchunkInstance::new([0, 0, 0], 0, 0, 0); SUBCHUNK_MAX_CANDIDATES],
+            instances:   [SubchunkInstance::padding(); SUBCHUNK_MAX_CANDIDATES],
+            channel,
+            in_flight:   VecDeque::new(),
             evicted_last_update: 0,
             evicted_total:       0,
-        };
-
-        view.process_pending_prep(ctx);
-        view.rebuild_instances(ctx);
-        view.upload_lod_mask(ctx);
-        view
+        }
     }
 
     /// Borrow the GPU renderer for render-graph registration.
@@ -148,58 +183,149 @@ impl WorldView {
         self.evicted_total
     }
 
-    /// Update residency against the current camera position and resync the
-    /// GPU buffers.
-    pub fn update(&mut self, ctx: &RendererContext, world_pos: [f32; 3]) {
+    /// Top-of-frame tick.
+    ///
+    /// 1. Polls wgpu so any pending `map_async` callbacks fire.
+    /// 2. Retires completed prep readbacks into residency, patching their
+    ///    dirty slots through the graph.
+    /// 3. Recenters the residency against `world_pos`, accumulating
+    ///    evictions into the diagnostic counters.
+    /// 4. Dispatches any newly-queued prep requests through the graph,
+    ///    reserving a readback slot for the resulting dirty list.
+    /// 5. Uploads the fresh instance array and LOD mask uniform.
+    ///
+    /// The caller must call [`WorldView::commit_submit`] after
+    /// `ctx.end_frame` so the prep pass's readback gets armed on the
+    /// right submission fence.
+    pub fn update(
+        &mut self,
+        ctx       : &RendererContext,
+        graph     : &mut RenderGraph,
+        world_pos : [f32; 3],
+        frame     : FrameIndex,
+    ) {
+        // --- 1. Poll for readback callbacks ---
+        ctx.device().poll(wgpu::PollType::Poll).expect("device.poll failed");
+
+        // --- 2. Retire completed readbacks ---
+        for (ready_frame, report) in self.channel.take_ready() {
+            // FIF discipline: dispatch order matches retirement order, so
+            // the front entry is always the retiring batch.
+            let batch = self.in_flight.pop_front()
+                .expect("take_ready delivered a report with no matching in-flight batch");
+            assert_eq!(
+                batch.frame, ready_frame,
+                "in-flight batch frame {} != ready frame {}",
+                batch.frame.get(), ready_frame.get(),
+            );
+
+            // The exposure byte itself now lives in the renderer's
+            // `live_exposure_buf` and is patched by the same copy pass
+            // that commits the occupancy bytes. The CPU residency only
+            // needs to mark the slot resident — no summary payload is
+            // stored here.
+            for (id, _slot) in batch.completions {
+                self.residency.complete_prep(
+                    id,
+                    OccupancySummary::Mixed,
+                    (),
+                );
+            }
+
+            // Patch the live occupancy buffer from the staging writes the
+            // prep shader made. `entries[..count]` are the shader-reported
+            // dirty slots for this dispatch.
+            let count = (report.count as usize).min(report.entries.len());
+            let dirty_slots: Vec<u32> = report.entries[..count]
+                .iter()
+                .map(|e| e.slot)
+                .collect();
+            nodes::subchunk_patch(graph, &self.renderer, &dirty_slots);
+        }
+
+        // --- 3. Recenter residency ---
         let evictions = self.residency.update_camera(world_pos);
         self.evicted_last_update = evictions.len();
         self.evicted_total       = self.evicted_total.saturating_add(evictions.len() as u64);
         drop(evictions);
 
-        self.process_pending_prep(ctx);
+        // --- 4. Dispatch new prep requests ---
+        let new_requests = self.residency.take_prep_requests();
+        if !new_requests.is_empty() {
+            let mut gpu_requests = Vec::with_capacity(new_requests.len());
+            let mut completions  = Vec::with_capacity(new_requests.len());
+
+            for req in &new_requests {
+                let Some(level_idx) = self.level_index(req.level) else {
+                    debug_assert!(false, "prep request for unknown level {:?}", req.level);
+                    continue;
+                };
+                let global = self.global_slot(level_idx, req.slot);
+
+                gpu_requests.push(GpuPrepRequest {
+                    coord: [req.coord.x, req.coord.y, req.coord.z],
+                    level: req.level.0 as u32,
+                    slot:  global,
+                    _pad0: 0,
+                    _pad1: 0,
+                    _pad2: 0,
+                });
+                completions.push((req.id, global));
+            }
+
+            // Upload the CPU-side request list into the renderer's prep
+            // buffer so the prep compute pass reads it.
+            self.renderer.write_prep_requests(ctx, &gpu_requests);
+
+            // Reserve this frame's readback slot and wire the prep pass
+            // to write into it. Panic on overflow is appropriate: reserve
+            // returning None here would mean the previous cycle's readback
+            // never retired — a subsystem bug, not a load condition.
+            let dst = self.channel
+                .reserve(frame)
+                .expect("ReadbackChannel::reserve: previous prep readback never retired")
+                .clone();
+            let dst_h = graph.import_buffer(dst);
+            nodes::subchunk_prep(graph, &self.renderer, dst_h, gpu_requests.len() as u32);
+
+            self.in_flight.push_back(InFlightBatch { frame, completions });
+        }
+
+        // --- 5. Upload instance array + LOD mask ---
         self.rebuild_instances(ctx);
         self.upload_lod_mask(ctx);
     }
 
-    // --- internal ---
-
-    /// Drain every outstanding prep request, synthesize occupancy, upload
-    /// the result into the right global slot, and commit it into the
-    /// residency pool.
-    fn process_pending_prep(&mut self, ctx: &RendererContext) {
-        let requests = self.residency.take_prep_requests();
-        for req in requests {
-            let Some(level_idx) = self.level_index(req.level) else {
-                // Residency emitted a request for a level we don't track;
-                // safest to drop without polluting pool state.
-                debug_assert!(false, "prep request for unknown level {:?}", req.level);
-                continue;
-            };
-            let global = self.global_slot(level_idx, req.slot);
-
-            let occ     = synthesize_occupancy(req.coord, req.level);
-            let summary = summarize(&occ);
-            let bytes   = occ.to_gpu_bytes();
-
-            // Upload before commit so the GPU slot is populated before the
-            // CPU pool starts handing the coord out to consumers.
-            self.renderer.write_occupancy_slot(ctx, global, &bytes);
-            self.residency.complete_prep(req.id, summary, occ);
+    /// Post-`end_frame` tick: arm the channel's `map_async` callback on
+    /// the submission fence so the reserved slot retires at the right
+    /// time. No-op if no prep request was dispatched this frame.
+    pub fn commit_submit(&mut self, frame: FrameIndex, submission: wgpu::SubmissionIndex) {
+        // Only arm the callback if this frame's update actually reserved
+        // a slot — otherwise the channel is still in `Empty` for this
+        // slot and `commit_submit` would panic.
+        let dispatched_this_frame = self.in_flight.back()
+            .map(|b| b.frame == frame)
+            .unwrap_or(false);
+        if dispatched_this_frame {
+            self.channel.commit_submit(frame, submission);
         }
     }
+
+    // --- internal ---
 
     /// Rebuild `instances[..]` from every level's occupied slots and push
     /// the full array to the GPU.
     fn rebuild_instances(&mut self, ctx: &RendererContext) {
-        // Reset to sentinel so any unused tail is rejected by the cull shader.
-        self.instances.fill(SubchunkInstance::new([0, 0, 0], 0, 0, 0));
+        // Reset to padding so any unused tail is rejected by the cull
+        // shader before it reads any per-slot buffer.
+        self.instances.fill(SubchunkInstance::padding());
 
         let mut i = 0usize;
         for (level_idx, cfg) in self.configs.iter().enumerate() {
             let level = cfg.level;
             let Some(pool) = self.residency.pool(level) else { continue; };
             let base = self.level_slots[level_idx].offset;
-            for (coord, pool_slot, occ) in pool.occupied() {
+            for (coord, pool_slot, _) in pool.occupied() {
                 if i >= SUBCHUNK_MAX_CANDIDATES {
                     debug_assert!(false, "resident count exceeds MAX_CANDIDATES");
                     break;
@@ -208,7 +334,6 @@ impl WorldView {
                     world_origin(coord, level),
                     base + pool_slot.0,
                     level.0,
-                    occ.isolated_exposure_mask(),
                 );
                 i += 1;
             }
@@ -311,62 +436,4 @@ fn shell_world_bounds(
         (hi_c[2] * extent) as f32,
     ];
     (lo, hi)
-}
-
-fn summarize(occ: &SubchunkOccupancy) -> OccupancySummary {
-    if occ.is_empty() {
-        OccupancySummary::Empty
-    }
-    else if occ.is_full() {
-        OccupancySummary::Full
-    }
-    else {
-        OccupancySummary::Mixed
-    }
-}
-
-/// Stand-in procedural content: voxelize a continuous world-space terrain
-/// field at the sub-chunk's LOD resolution.
-///
-/// Sampling the same `terrain_density` field at every level means coarser
-/// LOD sub-chunks look like lower-resolution versions of the finer ones —
-/// LOD transitions show up as voxel-size stairstepping of the same surface
-/// rather than as unrelated content. Not a worldgen implementation; real
-/// generation will replace this once GPU-side prep lands.
-fn synthesize_occupancy(coord: SubchunkCoord, level: Level) -> SubchunkOccupancy {
-    let voxel_size_m = level.voxel_size_m();
-    let base_x = (coord.x as f32) * 8.0 * voxel_size_m;
-    let base_y = (coord.y as f32) * 8.0 * voxel_size_m;
-    let base_z = (coord.z as f32) * 8.0 * voxel_size_m;
-
-    let mut occ = SubchunkOccupancy::empty();
-    for z in 0u8..8 {
-        for y in 0u8..8 {
-            for x in 0u8..8 {
-                let wx = base_x + (x as f32 + 0.5) * voxel_size_m;
-                let wy = base_y + (y as f32 + 0.5) * voxel_size_m;
-                let wz = base_z + (z as f32 + 0.5) * voxel_size_m;
-                if terrain_occupied(wx, wy, wz) {
-                    occ.set(x, y, z, true);
-                }
-            }
-        }
-    }
-    occ
-}
-
-/// Continuous world-space terrain test: a voxel's world-space centre is
-/// solid iff it lies below a layered-sinusoid ground surface.
-///
-/// Height field: two low-frequency sinusoids (coarse rolling terrain) plus
-/// two high-frequency ones (fine detail) plus a constant offset, so the
-/// surface near the origin sits around `y = 0`. Purely a placeholder shape
-/// that varies across many wavelengths.
-fn terrain_occupied(wx: f32, wy: f32, wz: f32) -> bool {
-    let h = (wx * 0.05).sin() * 4.0
-          + (wz * 0.05).cos() * 4.0
-          + (wx * 0.20).sin() * 1.0
-          + (wz * 0.20).cos() * 1.0
-          - 5.0;
-    wy < h
 }

@@ -34,10 +34,13 @@ struct Camera {
     float  _pad1;
 };
 
-// slot_mask packs three fields (see SubchunkInstance docs):
+// slot_mask packs two fields + a padding sentinel (see SubchunkInstance docs):
 //   bits  0-21: occupancy slot index (22 bits)  — selects entry in g_occ_array
 //   bits 22-25: LOD level (4 bits)              — voxel_size = 1 << level
-//   bits 26-31: directional exposure mask (6 b) — consumed by the cull shader
+//   bits 26-30: reserved (5 bits), must be zero
+//   bit  31   : padding sentinel (consumed by the cull shader only; the
+//               cull pass drops padding instances before they can reach
+//               the vertex stage, so the VS never sees a padding entry)
 struct Instance {
     int3 origin;
     uint slot_mask;

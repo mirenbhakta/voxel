@@ -66,6 +66,14 @@ impl FrameIndex {
     pub fn slot(self, count: FrameCount) -> u32 {
         (self.0 % count.get() as u64) as u32
     }
+
+    /// A new index `offset` frames in the future. Saturates at `u64::MAX`.
+    ///
+    /// Used by frame-gated primitives (e.g. the buffer pool's delayed
+    /// release path) to express "not available until N frames from now."
+    pub fn plus(self, offset: u32) -> Self {
+        Self(self.0.saturating_add(offset as u64))
+    }
 }
 
 #[cfg(test)]

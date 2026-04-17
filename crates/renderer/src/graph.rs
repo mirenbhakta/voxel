@@ -821,9 +821,10 @@ impl CompiledGraph {
         buf_pool : &mut BufferPool,
         tex_pool : &mut TexturePool,
         device   : &wgpu::Device,
+        frame    : FrameIndex,
     ) {
         for (handle, desc, name) in &self.transient_buffer_descs {
-            let buffer = buf_pool.acquire(device, desc, Some(name.as_str()));
+            let buffer = buf_pool.acquire(device, desc, Some(name.as_str()), frame);
             self.entries[handle.0.resource as usize] = Some(ResourceEntry::Buffer(buffer));
         }
 
@@ -907,7 +908,7 @@ impl CompiledGraph {
     )
         -> (PendingRelease, SurfacePresent)
     {
-        self.allocate_transients(buf_pool, tex_pool, device);
+        self.allocate_transients(buf_pool, tex_pool, device, frame);
         self.resolve_bind_groups(device);
 
         let Self {
@@ -1482,13 +1483,13 @@ mod tests {
         let d = BufferDesc { size: 128, usage: wgpu::BufferUsages::STORAGE };
 
         // First acquire creates a fresh buffer.
-        let buf = pool.acquire(ctx.device(), &d, None);
+        let buf = pool.acquire(ctx.device(), &d, None, FrameIndex::default());
         assert_eq!(buf.size(), 128);
 
         // Release and re-acquire: same buffer returned (Arc identity).
         let reference = buf.clone();
         pool.release(buf);
-        let buf2 = pool.acquire(ctx.device(), &d, None);
+        let buf2 = pool.acquire(ctx.device(), &d, None, FrameIndex::default());
         assert_eq!(buf2, reference);
     }
 
@@ -1507,12 +1508,12 @@ mod tests {
         let d_small = BufferDesc { size: 64, usage: wgpu::BufferUsages::STORAGE };
         let d_large = BufferDesc { size: 256, usage: wgpu::BufferUsages::STORAGE };
 
-        let buf_small = pool.acquire(ctx.device(), &d_small, None);
+        let buf_small = pool.acquire(ctx.device(), &d_small, None, FrameIndex::default());
         let ref_small = buf_small.clone();
         pool.release(buf_small);
 
         // Different size — should get a new buffer, not the recycled one.
-        let buf_large = pool.acquire(ctx.device(), &d_large, None);
+        let buf_large = pool.acquire(ctx.device(), &d_large, None, FrameIndex::default());
         assert_ne!(buf_large, ref_small);
         assert_eq!(buf_large.size(), 256);
     }
@@ -1578,7 +1579,7 @@ mod tests {
         let recycled = pool.acquire(ctx.device(), &BufferDesc {
             size: 1024,
             usage: wgpu::BufferUsages::STORAGE,
-        }, None);
+        }, None, FrameIndex::default());
         assert_eq!(recycled.size(), 1024);
     }
 

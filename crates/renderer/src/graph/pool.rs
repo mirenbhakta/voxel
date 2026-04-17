@@ -9,13 +9,16 @@
 //! tracker inserts the necessary barriers when the next frame reuses the
 //! same physical resource (write-after-read between frames is safe).
 //!
-//! This is the **1-frame-lifetime** path, appropriate for resources that
-//! are fully written and consumed inside a single submission (MDI indirect
-//! buffers, transient depth targets, compute scratch).  A fence-gated
-//! multi-frame variant (e.g. `create_readback_buffer`) is not yet
-//! implemented; it will be needed for shadow-ledger retirement and any
-//! CPU-readback path where the CPU must hold the GPU-written buffer alive
-//! across frames until the fence signals.
+//! This covers the **1-frame-lifetime** path, appropriate for resources
+//! that are fully written and consumed inside a single submission (MDI
+//! indirect buffers, transient depth targets, compute scratch).
+//!
+//! Multi-frame resources (CPU readback, GPU history) go through the
+//! [`release_with_gate`](BufferPool::release_with_gate) path: on release
+//! the caller tags each buffer with an `available_at` [`FrameIndex`], and
+//! [`acquire`](BufferPool::acquire) only hands out entries whose gate has
+//! passed.  For single-frame releases the gate is [`FrameIndex::default`]
+//! (always available), preserving the pre-existing semantics exactly.
 //!
 //! Pools never shrink — they converge to steady-state over the first few
 //! frames as the graph's transient demand stabilises.
@@ -23,6 +26,7 @@
 use std::collections::HashMap;
 
 use super::resource::{BufferDesc, TextureDesc};
+use crate::frame::FrameIndex;
 
 // --- PoolKey ---
 
@@ -40,16 +44,30 @@ impl PoolKey {
     }
 }
 
+// --- BufferPoolEntry ---
+
+/// One free-list entry. `available_at` is the earliest [`FrameIndex`] at
+/// which the buffer may be handed back out; single-frame releases use
+/// [`FrameIndex::default`] (always available), multi-frame releases use
+/// `release_frame + lifetime` so the ring's slots don't get claimed by an
+/// unrelated transient before the GPU is done referencing them.
+struct BufferPoolEntry {
+    buffer       : wgpu::Buffer,
+    available_at : FrameIndex,
+}
+
 // --- BufferPool ---
 
 /// Reusable pool of GPU buffers for transient render graph resources.
 ///
 /// Keyed by exact (size, usage).  [`acquire`](Self::acquire) checks the
-/// free-list first and only creates a new buffer when the list is empty.
-/// [`release`](Self::release) returns a buffer to the free-list for future
-/// frames.
+/// free-list first and only creates a new buffer when an entry whose
+/// `available_at` gate has passed is found; otherwise it allocates a new
+/// buffer.  [`release`](Self::release) returns a buffer immediately
+/// available; [`release_with_gate`](Self::release_with_gate) defers reuse
+/// until the specified frame.
 pub struct BufferPool {
-    free : HashMap<PoolKey, Vec<wgpu::Buffer>>,
+    free : HashMap<PoolKey, Vec<BufferPoolEntry>>,
 }
 
 impl BufferPool {
@@ -58,26 +76,31 @@ impl BufferPool {
         Self { free: HashMap::new() }
     }
 
-    /// Acquire a buffer matching `desc`.
+    /// Acquire a buffer matching `desc`, available at `frame` or earlier.
     ///
-    /// Returns a recycled buffer from the free-list when available,
-    /// otherwise allocates a new one from `device` with `name` as its wgpu
-    /// debug label.  Recycled buffers keep their original label — wgpu labels
-    /// are immutable and re-labelling on acquire is not supported.  When a
-    /// buffer is recycled with a different logical role, its label reflects
-    /// the name from its first allocation.
+    /// Returns a recycled buffer from the free-list when one is available
+    /// (`entry.available_at <= frame`), otherwise allocates a new one from
+    /// `device` with `name` as its wgpu debug label.  Recycled buffers keep
+    /// their original label — wgpu labels are immutable and re-labelling on
+    /// acquire is not supported.  When a buffer is recycled with a different
+    /// logical role, its label reflects the name from its first allocation.
     pub fn acquire(
         &mut self,
         device : &wgpu::Device,
         desc   : &BufferDesc,
         name   : Option<&str>,
+        frame  : FrameIndex,
     )
         -> wgpu::Buffer
     {
         let key = PoolKey::from_desc(desc);
 
-        if let Some(buf) = self.free.get_mut(&key).and_then(|v| v.pop()) {
-            return buf;
+        if let Some(entries) = self.free.get_mut(&key) {
+            // Prefer the oldest available entry so gated entries that just
+            // cleared don't starve; swap_remove keeps this O(1).
+            if let Some(i) = entries.iter().position(|e| e.available_at.get() <= frame.get()) {
+                return entries.swap_remove(i).buffer;
+            }
         }
 
         device.create_buffer(&wgpu::BufferDescriptor {
@@ -88,14 +111,28 @@ impl BufferPool {
         })
     }
 
-    /// Return a buffer to the free-list for reuse.
+    /// Return a buffer to the free-list, immediately available for reuse.
+    ///
+    /// Equivalent to `release_with_gate(buffer, FrameIndex::default())`.
+    /// Used for single-frame transients where wgpu's inter-submission
+    /// tracker handles cross-frame hazards.
     pub fn release(&mut self, buffer: wgpu::Buffer) {
+        self.release_with_gate(buffer, FrameIndex::default());
+    }
+
+    /// Return a buffer to the free-list, deferred until `available_at`.
+    ///
+    /// For multi-frame buffers (e.g. a [`MultiBufferRing`](crate::multi_buffer::MultiBufferRing)
+    /// being dropped) whose slot may still be referenced by in-flight GPU
+    /// work.  The buffer is not handed out by [`acquire`](Self::acquire)
+    /// until the frame index has advanced to `available_at`.
+    pub fn release_with_gate(&mut self, buffer: wgpu::Buffer, available_at: FrameIndex) {
         let key = PoolKey {
             size  : buffer.size(),
             usage : buffer.usage().bits(),
         };
 
-        self.free.entry(key).or_default().push(buffer);
+        self.free.entry(key).or_default().push(BufferPoolEntry { buffer, available_at });
     }
 }
 

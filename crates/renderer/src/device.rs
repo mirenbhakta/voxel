@@ -136,16 +136,19 @@ impl RendererContext {
     ///
     /// Consumes the [`FrameEncoder`] returned by a previous
     /// [`Self::begin_frame`], calls `finish()` on it to produce a
-    /// `CommandBuffer`, submits that buffer to the queue, and advances
-    /// `frame_index` by one.
+    /// `CommandBuffer`, submits that buffer to the queue, advances
+    /// `frame_index` by one, and returns the [`wgpu::SubmissionIndex`]
+    /// from the submit.
     ///
-    /// Polling wgpu for readback map callbacks is not done here yet — it
-    /// lands alongside readback buffer support when there is something
-    /// mapped to poll for.
-    pub fn end_frame(&mut self, frame_encoder: FrameEncoder) {
+    /// The returned index is what fence-aware primitives
+    /// (e.g. [`ReadbackChannel`](crate::readback::ReadbackChannel)) arm
+    /// their per-slot `map_async` callbacks against. Callers that don't
+    /// participate in a readback ring can ignore the return value.
+    pub fn end_frame(&mut self, frame_encoder: FrameEncoder) -> wgpu::SubmissionIndex {
         let command_buffer = frame_encoder.encoder.finish();
-        self.queue.submit(std::iter::once(command_buffer));
+        let submission = self.queue.submit(std::iter::once(command_buffer));
         self.frame_index.advance();
+        submission
     }
 
     /// Construct a windowed GPU context wired to a live swapchain surface.
