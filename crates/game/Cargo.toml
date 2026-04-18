@@ -12,3 +12,14 @@ renderer.workspace = true
 wgpu.workspace     = true
 winit.workspace    = true
 pollster.workspace = true
+bytemuck.workspace = true
+
+[features]
+# Enables the per-frame CPU state ledger + GPU directory readback +
+# divergence reporter (see `src/world/state_history.rs` and
+# `src/world/divergence.rs`). Adds a `ReadbackChannel<DirectorySnapshot>`
+# and one `copy_buffer_to_buffer` per frame to blit `slot_directory_buf`
+# back to the CPU for comparison against the CPU-authored snapshot stored
+# in the history ring. Off by default — release builds pay nothing for
+# this path.
+debug-state-history = []

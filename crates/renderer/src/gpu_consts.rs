@@ -8,6 +8,7 @@
 //! slot the shader actually uses.
 
 use crate::device::RendererContext;
+use crate::subchunk::MAX_LEVELS;
 
 /// Shared constants read by all shaders via a uniform buffer bound at
 /// [`GpuConsts::SLOT`] of every pipeline's bind group layout.
@@ -65,12 +66,87 @@ pub struct GpuConstsData {
     pub _pad1: u32,
     #[doc(hidden)]
     pub _pad2: u32,
+
+    // --- Per-level sub-chunk directory metadata ---
+    //
+    // Populated once at `WorldView` construction (pool dimensions and the
+    // contiguous `global_offset` segmentation of the directory buffer are
+    // static per-run) and read by shaders that resolve a sub-chunk coord
+    // into a `DirEntry`. Step 1 writes these fields; no shader reads them
+    // yet — Step 2 adds the HLSL resolver that consumes this metadata.
+    //
+    /// Number of levels in `levels` that carry meaningful data. Entries
+    /// past `level_count` are zero-initialised and must not be read.
+    pub level_count: u32,
+    #[doc(hidden)]
+    pub _pad_level_count0: u32,
+    #[doc(hidden)]
+    pub _pad_level_count1: u32,
+    #[doc(hidden)]
+    pub _pad_level_count2: u32,
+
+    /// Per-level metadata array, indexed by level slot (0..level_count).
+    /// Each entry is 32 bytes; total = `MAX_LEVELS * 32 = 512` bytes.
+    pub levels: [LevelStatic; MAX_LEVELS],
+
+    // --- Worldgen ---
+    //
+    // Seed for `shaders/include/worldgen.hlsl`'s integer hash. Written
+    // once at `WorldView::new` and never mutated — the `(coord, seed) →
+    // density` purity invariant in `decision-world-streaming-architecture`
+    // forbids runtime seed changes once any sub-chunk has been
+    // generated. `_pad_world_seed*` carry the struct to the std140
+    // 16-byte alignment boundary.
+    /// World generation seed, consumed by the worldgen HLSL header.
+    pub world_seed: u32,
+    #[doc(hidden)]
+    pub _pad_world_seed0: u32,
+    #[doc(hidden)]
+    pub _pad_world_seed1: u32,
+    #[doc(hidden)]
+    pub _pad_world_seed2: u32,
 }
 
-// Load-bearing invariant: this struct is 32 bytes, matching the HLSL mirror.
-// A mismatch would produce silent garbage reads on the GPU side; we want the
-// loudest possible signal, which is a compile error.
-const _: () = assert!(std::mem::size_of::<GpuConstsData>() == 32);
+/// Per-level static metadata packed into [`GpuConstsData::levels`].
+///
+/// Laid out in two 16-byte chunks so a shader reading through the HLSL
+/// mirror sees the same byte offsets regardless of std140 vs D3D cbuffer
+/// packing rules (see `build.rs` — DXC is invoked with `-fvk-use-dx-layout`
+/// and the element stride is the struct's rounded-to-16 byte size).
+///
+/// Layout (32 bytes):
+/// ```text
+///   uint3 pool_dims    (+0)   // x, y, z toroidal pool dimensions
+///   uint  capacity     (+12)  // == pool_dims.x * pool_dims.y * pool_dims.z
+///   uint  global_offset(+16)  // base directory index for this level
+///   uint  _pad0        (+20)
+///   uint  _pad1        (+24)
+///   uint  _pad2        (+28)
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LevelStatic {
+    pub pool_dims:     [u32; 3],
+    pub capacity:      u32,
+    pub global_offset: u32,
+    #[doc(hidden)]
+    pub _pad0:         u32,
+    #[doc(hidden)]
+    pub _pad1:         u32,
+    #[doc(hidden)]
+    pub _pad2:         u32,
+}
+
+const _: () = assert!(std::mem::size_of::<LevelStatic>() == 32);
+
+// Load-bearing invariant: this struct's byte size matches the HLSL mirror.
+// A mismatch would produce silent garbage reads on the GPU side; we want
+// the loudest possible signal, which is a compile error.
+//
+// Layout: 32 bytes of legacy prefix + 16 bytes of level_count header +
+// MAX_LEVELS × 32-byte `LevelStatic` entries + 16 bytes of worldgen
+// block (`world_seed` + 3 pad) = 48 + 512 + 16 = 576 bytes.
+const _: () = assert!(std::mem::size_of::<GpuConstsData>() == 48 + 32 * MAX_LEVELS + 16);
 
 // Alignment must be 4 (the alignment of u32, the largest member under
 // #[repr(C)]). A change here means someone added a wider member, which
@@ -196,9 +272,15 @@ mod tests {
 
     /// Pure-CPU size assertion — mirrors the const assert above, but surfaces
     /// the number in a test report rather than a build error when it breaks.
+    ///
+    /// Layout: 48 bytes of prefix (legacy 32 + level_count 16) +
+    /// `MAX_LEVELS * size_of::<LevelStatic>()` bytes for the per-level
+    /// directory metadata + 16 bytes of worldgen block
+    /// (`world_seed` + 3 pad).
     #[test]
-    fn gpu_consts_data_is_32_bytes() {
-        assert_eq!(std::mem::size_of::<GpuConstsData>(), 32);
+    fn gpu_consts_data_size_matches_layout() {
+        let expected = 48 + MAX_LEVELS * std::mem::size_of::<LevelStatic>() + 16;
+        assert_eq!(std::mem::size_of::<GpuConstsData>(), expected);
     }
 
     /// Pure-CPU default check — `Zeroable` + `Default` derives should produce

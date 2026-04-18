@@ -1,13 +1,18 @@
 // subchunk_prep.cs.hlsl — GPU-side sub-chunk occupancy synthesis with
-// diff-vs-live dirty-list emission and isolated-exposure emission.
+// diff-vs-pool dirty-list emission and neighbour-aware exposure.
 //
 // HLSL port of `game::world_view::synthesize_occupancy` +
 // `terrain_occupied`, extended so the CPU never re-synthesizes content on
-// cache hits: after the new occupancy is voxelized into a staging slot, the
-// shader compares it against the previously-committed live occupancy and,
-// when any plane word differs, appends the slot to a compact dirty list.
-// The CPU reads the dirty list via a `ReadbackChannel` and patches only
-// those slots into residency.
+// cache hits: after the new occupancy is voxelized into a staging entry,
+// the shader compares it against the previously-committed material-pool
+// payload (if any) and, when any plane word differs — or when no live
+// entry exists yet — appends an entry to a compact dirty list.
+//
+// The CPU reads the dirty list via a `ReadbackChannel` and, for every
+// entry the retirement logic classifies as *sparse* (non-zero exposure),
+// issues a `staging_occ → material_pool` copy. The uniform-empty case
+// (exposure == 0) skips the copy entirely — the entry has no material
+// pool storage.
 //
 // # Dispatch shape
 //
@@ -15,25 +20,15 @@
 // threads). Each thread handles a 2×2×2 cube of voxels (8 density
 // evaluations per thread → 512 per sub-chunk, one per voxel).
 //
-// Occupancy is accumulated into `gs_planes[16]` using `InterlockedOr`; on
-// sync, thread 0 writes the 16 words out to `g_staging_occ[slot]`,
-// writes the slot's exposure into `g_staging_exposure[slot]`, and runs
-// the diff against `g_live_occ[slot]`. If any occupancy word differs,
-// thread 0 atomically appends `(slot, staging_offset = slot)` to
-// `g_dirty_list`.
-//
-// `g_staging_occ[slot]` and `g_staging_exposure[slot]` are both populated
-// unconditionally every dispatch — the live pool may diff against the
-// previous staging payload on a subsequent frame, so the writes must land
-// even when the content matches. The patch pass copies staging → live
-// for both buffers on every dirty slot, so emitting exposure alongside
-// occupancy is free in dirty-list bookkeeping and keeps the copy pair
-// consistent with the occupancy payload it accompanies.
-//
-// The diff check remains driven by occupancy alone. Exposure is a pure
-// function of the same occupancy bits, so "occupancy did not change"
-// implies "exposure did not change"; no separate exposure diff is needed
-// and the dirty-list entry still carries just `{slot, staging_offset}`.
+// Occupancy is accumulated into `gs_planes[16]` using `InterlockedOr`.
+// After the barrier, thread 0 writes the 16 words into
+// `g_staging_occ[gid.x]`, resolves its own directory index from
+// `req.coord`/`req.level` via `resolve_coord_to_slot`, diffs the staged
+// occupancy against `g_material_pool[direntry_get_material_slot(...)]`
+// (when the directory entry currently has a material slot), and — if the
+// occupancy differs or no live entry exists — computes a neighbour-aware
+// 6-bit exposure mask and an is_solid hint and appends a widened
+// `DirtyEntry` to `g_dirty_list`.
 //
 // # Terrain field
 //
@@ -44,38 +39,82 @@
 // Voxel is solid iff `wp.y < h`, where `h` is a layered-sinusoid surface
 // matching the CPU reference (`terrain_occupied` in `world_view.rs`).
 //
+// # Neighbour-aware exposure
+//
+// A direction bit is set iff any voxel on this sub-chunk's face at that
+// direction is solid AND the corresponding neighbour voxel is empty. For
+// each of the 6 directions we:
+//   1. Compute `nbr_coord = req.coord + dir_offset`.
+//   2. Resolve it via `resolve_and_verify` to a directory entry.
+//   3. Classify the neighbour by its DirEntry bits:
+//      - non-resident OR coord mismatch  → treat as empty (conservative,
+//                                          per `decision-world-streaming-
+//                                          architecture` intra-batch rule)
+//      - resident + is_solid             → all-ones (neighbour face full)
+//      - resident + !has_material        → empty (uniform-empty entry)
+//      - resident + has_material         → read material_pool[mslot] and
+//                                          extract the opposite face
+//   4. Test `my_face & ~nbr_face != 0` via `face_exposed`.
+//
+// Intra-batch neighbours that were dispatched this frame still see OLD
+// live (the patch hasn't landed yet); their conservative "empty"
+// interpretation produces an over-conservative exposure bit for one
+// cycle. Step 5 (exposure-only refresh) reconciles the mismatch.
+//
 // # Dirty-list layout (RWByteAddressBuffer)
 //
-//   offset  0:  uint count
-//   offset  4:  uint _pad0
-//   offset  8:  uint _pad1
-//   offset 12:  uint _pad2
-//   offset 16 + i * 8: { uint slot, uint staging_offset } for i in [0, count)
+//   offset  0: uint count       (monotonic InterlockedAdd counter)
+//   offset  4: uint _pad0
+//   offset  8: uint overflow    (set to 1 if count reaches MAX_CANDIDATES)
+//   offset 12: uint _pad2
+//   offset 16 + i * 16: DirtyEntry i for i in [0, min(count, MAX_CANDIDATES))
+//     +0:  directory_index
+//     +4:  new_bits_partial  ([0..5] exposure, [6] is_solid, [7] resident)
+//     +8:  staging_request_idx  (= gid.x)
+//     +12: _pad
 //
-// Staging and live share a 1:1 slot→payload mapping today (one live slot
-// per request). `staging_offset` is reported as `slot` for that reason;
-// the field exists so that decoupling staging from live (batched compaction
-// etc.) stays additive.
+// Mirror of Rust `renderer::DirtyEntry` (16 bytes; see `subchunk.rs`).
+//
+// The append is bounds-checked: `InterlockedAdd` returns the pre-add
+// count, and if that is >= MAX_CANDIDATES the entry store is skipped and
+// the `overflow` flag is raised via `InterlockedMax`. CPU reads the flag
+// at retirement (Step-7 shadow ledger) and surfaces it in
+// `WorldRendererStats`. Without this check the shader silently overruns
+// the `DirtyReport` buffer — the Step-7 task found the path and
+// installed the guard.
 //
 // # Binding layout
 //
-// Set 0 — contiguous slots 0..5 (wgpu-hal's Vulkan backend compacts BGL
-// entries sequentially, and the SPIR-V passthrough path does not remap, so
-// HLSL binding numbers must equal their ordinal position within the
-// reflected set):
-//   0: g_requests         (StructuredBuffer<PrepRequest>, read-only)
-//   1: g_live_occ         (StructuredBuffer<Occupancy>,   read-only — diff source)
-//   2: g_staging_occ      (RWStructuredBuffer<Occupancy>, write target)
-//   3: g_staging_exposure (RWStructuredBuffer<uint>,      write target)
-//   4: g_dirty_list       (RWByteAddressBuffer)
+// Set 0 — contiguous slots 0..6. Slot 0 is implicitly `g_consts` (pinned
+// via `include/gpu_consts.hlsl`); the explicit bindings follow from slot
+// 1 onward. The CPU side threads the consts buffer in through
+// `RenderGraph::create_bind_group(..., Some(&gpu_consts), ...)`.
+//   0: g_consts        (ConstantBuffer<GpuConsts>,      read-only)   — implicit
+//   1: g_requests      (StructuredBuffer<PrepRequest>,  read-only)
+//   2: g_material_pool (StructuredBuffer<Occupancy>,    read-only — diff source + neighbour)
+//   3: g_staging_occ   (RWStructuredBuffer<Occupancy>,  write target)
+//   4: g_dirty_list    (RWByteAddressBuffer)
+//   5: g_directory     (StructuredBuffer<DirEntry>,     read-only)
+
+// `directory.hlsl` defines `DirEntry` / `Occupancy` consumers, the
+// `direntry_*` accessors, and the `resolve_coord_to_slot` +
+// `resolve_and_verify` helpers used below. It includes
+// `gpu_consts.hlsl`, which pins `g_consts` to slot 0 — the resolver reads
+// `g_consts.levels[level_idx]`, so `g_consts` is actually referenced and
+// is not elided from SPIR-V reflection.
+#include "include/directory.hlsl"
+// `worldgen.hlsl` owns the `(coord, seed) → density` contract used by
+// `terrain_occupied`. Seed flows in via `g_consts.world_seed`, set once
+// at `WorldView::new`.
+#include "include/worldgen.hlsl"
 
 struct PrepRequest {
     int3 coord;   // sub-chunk coord at this request's LOD
     uint level;   // LOD level; voxel_size = 1 << level
-    uint slot;    // target live slot index (and 1:1 staging slot)
     uint _pad0;
     uint _pad1;
     uint _pad2;
+    uint _pad3;
 };  // 32 bytes
 
 // Matches the 16-u32 packed layout of `SubchunkOccupancy::to_gpu_bytes`
@@ -85,29 +124,45 @@ struct Occupancy {
     uint4 plane[4];
 };  // 64 bytes
 
-[[vk::binding(0, 0)]] StructuredBuffer<PrepRequest>   g_requests;
-[[vk::binding(1, 0)]] StructuredBuffer<Occupancy>     g_live_occ;
-[[vk::binding(2, 0)]] RWStructuredBuffer<Occupancy>   g_staging_occ;
-[[vk::binding(3, 0)]] RWStructuredBuffer<uint>        g_staging_exposure;
+// Face-mask extractors depend on `Occupancy` being in scope; include
+// here rather than ahead of the struct definition.
+#include "include/face_mask.hlsl"
+
+[[vk::binding(1, 0)]] StructuredBuffer<PrepRequest>   g_requests;
+[[vk::binding(2, 0)]] StructuredBuffer<Occupancy>     g_material_pool;
+[[vk::binding(3, 0)]] RWStructuredBuffer<Occupancy>   g_staging_occ;
 [[vk::binding(4, 0)]] RWByteAddressBuffer             g_dirty_list;
+[[vk::binding(5, 0)]] StructuredBuffer<DirEntry>      g_directory;
+
+// The shared neighbour-aware-exposure helper depends on `g_directory` +
+// `g_material_pool` being in scope as globals, so include it after their
+// declarations. Used by both this shader and `subchunk_exposure.cs.hlsl`
+// to keep the 6-bit exposure mask bit-for-bit consistent between the
+// full-prep dispatch and the exposure-only refresh dispatch.
+#include "include/exposure.hlsl"
 
 static const float SUBCHUNK_VOXELS = 8.0;
 static const uint  OCC_WORDS       = 16u;
+
+// Mirror of `renderer::subchunk::MAX_CANDIDATES` — ceiling on dirty-list
+// entries per dispatch. The dirty-list append guards against exceeding
+// this ceiling and raises the overflow flag instead of overrunning the
+// `DirtyReport` buffer.
+static const uint DIRTY_LIST_CAPACITY = 256u;
 
 // Shared 16-u32 occupancy accumulator for this workgroup. `InterlockedOr`
 // from per-thread bit contributions — every thread writes up to 8 bits
 // across at most 4 distinct words.
 groupshared uint gs_planes[OCC_WORDS];
 
-// Terrain density: voxel centre is solid iff `wp.y < h`. Layered sinusoids
-// matching `world_view::terrain_occupied` on the CPU side.
+// Terrain density: voxel centre is solid iff `wp.y < terrain_height(xz, seed)`.
+// The worldgen signature itself lives in `include/worldgen.hlsl` — this
+// function is the per-voxel decision that the prep shader calls 512
+// times per sub-chunk. Pure heightfield: a column is either "all above
+// surface = air" or "all below = solid", which is what the exposure /
+// is_solid / sparsity logic downstream assumes.
 bool terrain_occupied(float3 wp) {
-    float h = sin(wp.x * 0.05) * 4.0
-            + cos(wp.z * 0.05) * 4.0
-            + sin(wp.x * 0.20) * 1.0
-            + cos(wp.z * 0.20) * 1.0
-            - 5.0;
-    return wp.y < h;
+    return wp.y < terrain_height(wp.xz, g_consts.world_seed);
 }
 
 [numthreads(4, 4, 4)]
@@ -151,46 +206,122 @@ void main(uint3 ltid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint lidx : SV_
 
     GroupMemoryBarrierWithGroupSync();
 
-    // Thread 0: write staging, run the diff, and append to the dirty list.
+    // Thread 0: write staging, classify, diff, and append to the dirty list.
     // The staging write is serialized here (16 stores) rather than fanned
     // out across 16 threads — trivial cost relative to the 512 density
-    // evaluations that preceded it, and it keeps the diff + append in one
-    // linear branch with no extra barriers.
+    // evaluations that preceded it, and it keeps the classify + diff +
+    // append in one linear branch with no extra barriers.
     if (lidx == 0u) {
-        Occupancy live    = g_live_occ[req.slot];
-        uint4     staged0 = uint4(gs_planes[ 0], gs_planes[ 1], gs_planes[ 2], gs_planes[ 3]);
-        uint4     staged1 = uint4(gs_planes[ 4], gs_planes[ 5], gs_planes[ 6], gs_planes[ 7]);
-        uint4     staged2 = uint4(gs_planes[ 8], gs_planes[ 9], gs_planes[10], gs_planes[11]);
-        uint4     staged3 = uint4(gs_planes[12], gs_planes[13], gs_planes[14], gs_planes[15]);
+        // Pack staged occupancy into four uint4s.
+        uint4 staged0 = uint4(gs_planes[ 0], gs_planes[ 1], gs_planes[ 2], gs_planes[ 3]);
+        uint4 staged1 = uint4(gs_planes[ 4], gs_planes[ 5], gs_planes[ 6], gs_planes[ 7]);
+        uint4 staged2 = uint4(gs_planes[ 8], gs_planes[ 9], gs_planes[10], gs_planes[11]);
+        uint4 staged3 = uint4(gs_planes[12], gs_planes[13], gs_planes[14], gs_planes[15]);
 
+        // Staging is indexed by request (gid.x), not by directory slot —
+        // so the staging buffer can be sized to the prep dispatch width,
+        // independent of the live pool's capacity.
         Occupancy staged;
         staged.plane[0] = staged0;
         staged.plane[1] = staged1;
         staged.plane[2] = staged2;
         staged.plane[3] = staged3;
-        g_staging_occ[req.slot] = staged;
+        g_staging_occ[gid.x] = staged;
 
-        // Isolated exposure: 0 if the staged occupancy is empty, else 0x3F.
-        // Matches the CPU `SubchunkOccupancy::isolated_exposure_mask`
-        // semantics — cross-boundary refinement (neighbor-aware culling)
-        // is a later concern. `any(uint4)` returns true when any lane is
-        // nonzero (HLSL convention).
-        bool any_bit = any(staged0) || any(staged1)
-                    || any(staged2) || any(staged3);
-        uint exposure = any_bit ? 0x3Fu : 0u;
-        g_staging_exposure[req.slot] = exposure;
+        // Self-resolve the directory index from coord + level. The slot
+        // field used to ride on the prep request; Step 4 removed it and
+        // made the shader authoritative. The mapping is a pure function of
+        // `coord` and per-level `pool_dims` (from `g_consts`) — no shell
+        // corner / pool_origin involvement. See `resolve_coord_to_slot`
+        // docstring for why `pool_origin` was removed.
+        uint self_slot = resolve_coord_to_slot(req.coord, req.level);
 
-        bool dirty = any(staged0 != live.plane[0])
-                  || any(staged1 != live.plane[1])
-                  || any(staged2 != live.plane[2])
-                  || any(staged3 != live.plane[3]);
+        // Any-bit / all-bits checks on the staged occupancy. Fed back into
+        // both the exposure computation (an empty sub-chunk has no face to
+        // expose, bypass the neighbour loop) and the is_solid hint.
+        uint  or_accum  = staged0.x | staged0.y | staged0.z | staged0.w
+                        | staged1.x | staged1.y | staged1.z | staged1.w
+                        | staged2.x | staged2.y | staged2.z | staged2.w
+                        | staged3.x | staged3.y | staged3.z | staged3.w;
+        bool  any_bit   = or_accum != 0u;
+
+        uint  and_accum = staged0.x & staged0.y & staged0.z & staged0.w
+                        & staged1.x & staged1.y & staged1.z & staged1.w
+                        & staged2.x & staged2.y & staged2.z & staged2.w
+                        & staged3.x & staged3.y & staged3.z & staged3.w;
+        bool  is_fully_solid = and_accum == 0xFFFFFFFFu;
+
+        // Build the neighbour-aware exposure mask via the shared helper in
+        // `include/exposure.hlsl` (bit-for-bit shared with
+        // `subchunk_exposure.cs.hlsl` so the full-prep and exposure-only
+        // dispatches never drift). Skip the lookup when the sub-chunk is
+        // fully empty — no voxel faces the neighbour, so every bit is
+        // zero regardless of neighbour occupancy.
+        uint exposure = 0u;
+        if (any_bit) {
+            Occupancy me;
+            me.plane[0] = staged0;
+            me.plane[1] = staged1;
+            me.plane[2] = staged2;
+            me.plane[3] = staged3;
+            exposure = compute_exposure_mask(me, req.coord, req.level);
+        }
+
+        uint is_solid_bit = is_fully_solid ? 1u : 0u;
+
+        // Diff against the currently-live material pool entry, if one
+        // exists. The directory's `resident` bit is the authoritative gate:
+        //   resident  ⇒ material_slot points at a real material-pool entry
+        //   !resident ⇒ no diff source (first-time or post-eviction)
+        //
+        // Relying on `direntry_has_material` would be incorrect here: the
+        // buffer's zero-init state has material_slot == 0, which is a real
+        // pool index — reading `g_material_pool[0]` would alias an
+        // unrelated slot and silently corrupt the diff. A non-resident
+        // entry always forces `dirty = true` so the CPU retirement sees
+        // this prep and can either allocate a slot (sparse-first-time) or
+        // record a uniform-empty directory transition.
+        DirEntry d     = g_directory[self_slot];
+        bool     dirty;
+        if (direntry_is_resident(d)) {
+            uint mslot = direntry_get_material_slot(d);
+            Occupancy live = g_material_pool[mslot];
+            dirty = any(staged0 != live.plane[0])
+                 || any(staged1 != live.plane[1])
+                 || any(staged2 != live.plane[2])
+                 || any(staged3 != live.plane[3]);
+        } else {
+            dirty = true;
+        }
 
         if (dirty) {
             uint idx;
             g_dirty_list.InterlockedAdd(0u, 1u, idx);
-            uint entry_off = 16u + idx * 8u;
-            g_dirty_list.Store(entry_off + 0u, req.slot);
-            g_dirty_list.Store(entry_off + 4u, req.slot);
+            // Bounds-check. If the pre-add count already filled the
+            // buffer, raise the overflow flag and skip the store —
+            // writing at `16 + idx * 16` with `idx >= 256` would overrun
+            // the DirtyReport buffer (a silent corruption of whatever
+            // follows it in the allocator). The count header keeps
+            // incrementing so CPU can see how far past capacity the
+            // dispatch tried to go; CPU clamps reads to min(count,
+            // MAX_CANDIDATES).
+            if (idx >= DIRTY_LIST_CAPACITY) {
+                uint _prev;
+                g_dirty_list.InterlockedMax(8u, 1u, _prev);
+            } else {
+                uint entry_off = 16u + idx * 16u;
+                // new_bits_partial packs the shader-authored fields of
+                // DirEntry::bits — exposure [0..5], is_solid [6], resident
+                // (= 1). The material-slot field is authored CPU-side at
+                // retirement and must be zero in this shader-emitted word.
+                uint new_bits_partial = exposure
+                                      | (is_solid_bit << 6)
+                                      | (1u << 7);
+                g_dirty_list.Store(entry_off +  0u, self_slot);  // directory_index
+                g_dirty_list.Store(entry_off +  4u, new_bits_partial);
+                g_dirty_list.Store(entry_off +  8u, gid.x);      // staging_request_idx
+                g_dirty_list.Store(entry_off + 12u, 0u);
+            }
         }
     }
 }

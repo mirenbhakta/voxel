@@ -11,6 +11,7 @@ pub mod nodes;
 pub mod pipeline;
 pub mod readback;
 pub mod shader;
+pub mod worldgen;
 
 mod device;
 mod subchunk;
@@ -24,7 +25,7 @@ pub use commands::{
 pub use device::{FrameEncoder, RendererContext, SurfaceFrame};
 pub use error::RendererError;
 pub use frame::{FrameCount, FrameIndex};
-pub use gpu_consts::{GpuConsts, GpuConstsData};
+pub use gpu_consts::{GpuConsts, GpuConstsData, LevelStatic};
 pub use graph::PassContext;
 pub use pipeline::{BindEntry, BindKind, PipelineBindLayout};
 pub use pipeline::{ComputePipeline, ComputePipelineDescriptor};
@@ -34,9 +35,17 @@ pub use subchunk::{
     DEPTH_FORMAT as SUBCHUNK_DEPTH_FORMAT,
     MAX_CANDIDATES as SUBCHUNK_MAX_CANDIDATES,
     MAX_LEVELS as SUBCHUNK_MAX_LEVELS,
+    BITS_EXPOSURE_MASK,
+    BITS_IS_SOLID,
+    BITS_MATERIAL_SLOT_SHIFT,
+    BITS_RESIDENT,
+    DirEntry,
     DirtyEntry,
     DirtyReport,
+    EXPOSURE_STAGING_REQUEST_IDX_SENTINEL,
     LodMaskUniform,
+    MATERIAL_SLOT_INVALID,
+    PatchCopy,
     PrepRequest,
     SubchunkCamera,
     SubchunkInstance,

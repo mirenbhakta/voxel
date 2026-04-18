@@ -943,22 +943,22 @@ mod tests {
     }
 
     /// Reflects `VALIDATION_CS_SPV` and asserts the slot-0 GpuConsts uniform
-    /// buffer reflects at the same byte size as `GpuConstsData` (32).
+    /// buffer reflects at the same byte size as `GpuConstsData`.
     ///
     /// Gated for the same reason as `reflect_spirv_reports_workgroup_size`.
     #[test]
     #[ignore = "requires DXC-built SPV; run with --ignored on a machine with DXC installed"]
-    fn reflect_spirv_reports_32_byte_gpu_consts_for_validation_cs() {
+    fn reflect_spirv_reports_expected_gpu_consts_size_for_validation_cs() {
         let reflected = reflect_spirv(crate::shader::VALIDATION_CS_SPV, "main")
             .expect("reflect_spirv should succeed on a DXC-compiled validation shader");
 
+        let expected = std::mem::size_of::<crate::gpu_consts::GpuConstsData>() as u64;
         assert!(
             matches!(
                 reflected.entries.iter().find(|e| e.binding == 0).map(|e| e.kind),
-                Some(BindKind::UniformBuffer { size: 32 }),
+                Some(BindKind::UniformBuffer { size }) if size == expected,
             ),
-            "expected slot 0 UniformBuffer {{ size: 32 }} matching GpuConstsData (8 × u32); \
-             got {:?}",
+            "expected slot 0 UniformBuffer {{ size: {expected} }} matching GpuConstsData; got {:?}",
             reflected.entries.iter().find(|e| e.binding == 0),
         );
     }

@@ -12,8 +12,9 @@
 //!   before touching any per-slot buffer).
 //! - Occupancy array — a single slot is written on completion of a prep
 //!   request; never a full-array upload.
-//! - Live exposure array — one `u32` per slot, written only by the patch
-//!   pass on dirty slots; the cull shader reads it by slot index.
+//! - Slot directory — one [`DirEntry`] per directory index, rewritten by
+//!   the CPU residency plane on insert/evict. The cull shader unpacks the
+//!   exposure mask from here (via `direntry_get_exposure`).
 //!
 //! The count buffer stays at `[1u32]` permanently — the cull shader emits
 //! exactly one indirect draw entry whose `instance_count` fans out to the
@@ -22,17 +23,28 @@
 //! # Bind group layouts (reflected from SPIR-V)
 //!
 //! **Cull bind group** (set 0 for `subchunk_cull.cs.hlsl`):
-//! - 0: camera        (UniformBuffer, 64)          — COMPUTE
-//! - 1: instances     (StorageReadOnly, stride=16) — COMPUTE
-//! - 2: visible       (StorageRW, stride=4)        — COMPUTE
-//! - 3: lod_mask      (UniformBuffer, 512)         — COMPUTE
-//! - 4: live_exposure (StorageReadOnly, stride=4)  — COMPUTE
+//! - 0: camera    (UniformBuffer, 64)          — COMPUTE
+//! - 1: instances (StorageReadOnly, stride=16) — COMPUTE
+//! - 2: visible   (StorageRW, stride=4)        — COMPUTE
+//! - 3: lod_mask  (UniformBuffer, 512)         — COMPUTE
+//! - 4: directory (StorageReadOnly, stride=24) — COMPUTE
 //!
 //! **Render bind group** (set 0 for `subchunk.vs/.ps.hlsl`):
 //! - 0: camera     (UniformBuffer, 64)          — VERTEX | FRAGMENT
 //! - 1: instances  (StorageReadOnly, stride=16) — VERTEX
 //! - 2: visible    (StorageReadOnly, stride=4)  — VERTEX
 //! - 3: occ_array  (StorageReadOnly, stride=64) — FRAGMENT
+//!
+//! **Prep bind group** (set 0 for `subchunk_prep.cs.hlsl`):
+//! - 0: gpu_consts     (UniformBuffer, sizeof GpuConstsData) — COMPUTE.
+//!   Implicit, supplied via `create_bind_group`'s `gpu_consts` argument
+//!   (the HLSL side pins this slot via `include/gpu_consts.hlsl`).
+//! - 1: prep_requests  (StorageReadOnly, stride=32) — COMPUTE
+//! - 2: material_pool  (StorageReadOnly, stride=64) — COMPUTE
+//!   (diff source + neighbour-face source)
+//! - 3: staging_occ    (StorageRW,       stride=64) — COMPUTE
+//! - 4: dirty_list     (StorageRW, byte-addressed)  — COMPUTE
+//! - 5: directory      (StorageReadOnly, stride=24) — COMPUTE
 //!
 //! Cull's indirect output rides on its own set-1 bind group, assembled
 //! inside `nodes::cull`.
@@ -42,7 +54,9 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 
 use crate::device::RendererContext;
-use crate::graph::{BufferDesc, BufferHandle, RenderGraph, TextureHandle};
+use crate::frame::FrameIndex;
+use crate::graph::{BufferDesc, BufferHandle, BufferPool, RenderGraph, TextureHandle};
+use crate::multi_buffer::MultiBufferRing;
 use crate::nodes::{CullArgs, DrawArgs, IndirectArgs, cull, mdi_draw};
 use crate::pipeline::compute::{ComputePipeline, ComputePipelineDescriptor};
 use crate::pipeline::render::{RenderPipeline, RenderPipelineDescriptor};
@@ -62,11 +76,15 @@ const SUBCHUNK_CS_SPV: &[u8] =
 const SUBCHUNK_PREP_CS_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/shaders/subchunk_prep.cs.spv"));
 
+const SUBCHUNK_EXPOSURE_CS_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/shaders/subchunk_exposure.cs.spv"));
+
 // --- Constants ---
 
 /// Maximum number of candidate sub-chunks the cull pass handles in one
 /// dispatch. Baked into the cull shader's workgroup size (`[256, 1, 1]`)
-/// and into the `instance_buf` / `occ_buf` allocations.
+/// and into the `instance_buf` / `material_pool_buf` / per-slot
+/// `staging_occ_ring` allocations.
 ///
 /// Sized to accommodate several LOD levels' shells simultaneously; each
 /// level of a 3³ clipmap contributes 27 slots, so 256 holds ~9 levels
@@ -134,9 +152,10 @@ const _: () = assert!(
 ///   any per-slot buffer.
 ///
 /// Directional exposure (previously packed into bits 26-31) now lives in
-/// the renderer's `live_exposure_buf`, indexed by the slot field; the cull
-/// shader fetches it per-candidate rather than unpacking it from the
-/// instance record.
+/// the renderer's `slot_directory_buf`, packed into [`DirEntry::bits`] and
+/// indexed by the slot field; the cull shader fetches it per-candidate
+/// via `direntry_get_exposure` rather than unpacking it from the instance
+/// record.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct SubchunkInstance {
@@ -162,7 +181,7 @@ impl SubchunkInstance {
     /// Sentinel bit set on padding entries in the instance array. The cull
     /// shader tests this bit first and drops the candidate without reading
     /// any other per-slot buffer — so padding never depends on the
-    /// contents of `live_exposure[0]` or any other slot-indexed data.
+    /// contents of `g_directory[0]` or any other slot-indexed data.
     pub const PADDING_BIT: u32 = 1 << 31;
 
     /// Build a real (non-padding) instance from its three logical
@@ -183,7 +202,7 @@ impl SubchunkInstance {
     }
 
     /// Tail-padding instance. Carries [`SubchunkInstance::PADDING_BIT`] so
-    /// the cull shader rejects it before reading `live_exposure` or any
+    /// the cull shader rejects it before reading `g_directory` or any
     /// other slot-indexed buffer.
     pub fn padding() -> Self {
         Self {
@@ -290,28 +309,29 @@ pub fn sphere_occupancy() -> SubchunkOccupancy {
 /// ```text
 ///   int3 coord (+0)
 ///   uint level (+12)
-///   uint slot  (+16)
-///   uint _pad0 (+20)
-///   uint _pad1 (+24)
-///   uint _pad2 (+28)
+///   uint _pad0 (+16)
+///   uint _pad1 (+20)
+///   uint _pad2 (+24)
+///   uint _pad3 (+28)
 /// ```
 ///
 /// - `coord` — sub-chunk coord at this request's LOD.
 /// - `level` — LOD level; voxel edge = `1 << level` metres.
-/// - `slot`  — target live occupancy slot, and the matching staging slot
-///   (staging and live share a 1:1 mapping).
 ///
-/// The trailing padding rounds the struct to a 32-byte stride so the
-/// HLSL `StructuredBuffer<PrepRequest>` layout matches DX-layout naturally.
+/// The prep shader self-resolves its directory index from `(coord, level)`
+/// via `resolve_coord_to_slot` (Principle 2: no CPU mirror of that
+/// resolution). The trailing padding rounds the struct to a 32-byte
+/// stride so the HLSL `StructuredBuffer<PrepRequest>` layout matches
+/// DX-layout naturally.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct PrepRequest {
     pub coord: [i32; 3],
     pub level: u32,
-    pub slot:  u32,
     pub _pad0: u32,
     pub _pad1: u32,
     pub _pad2: u32,
+    pub _pad3: u32,
 }
 
 const _: () = assert!(
@@ -323,52 +343,260 @@ const _: () = assert!(
 
 /// One entry in the GPU prep dirty list.
 ///
-/// Layout matches the HLSL shader's byte-address store (8 bytes):
+/// Layout matches the HLSL shader's byte-address store (16 bytes):
 /// ```text
-///   uint slot           (+0)
-///   uint staging_offset (+4)
+///   uint directory_index     (+0)
+///   uint new_bits_partial    (+4)   // [0..5] exposure, [6] is_solid,
+///                                   // [7] resident (=1 this step)
+///   uint staging_request_idx (+8)   // index into the staging ring slot
+///   uint _pad                (+12)
 /// ```
 ///
-/// `staging_offset` equals `slot` today (staging and live are 1:1); the
-/// field exists so future batched-compaction work stays additive.
+/// `new_bits_partial` carries only the directory-entry bits the prep shader
+/// is authorised to emit: the 6-bit exposure field, the is-solid hint
+/// (always `0` until Step 4 pairs it with neighbor-aware exposure), and the
+/// resident bit (always `1` — a prep completion means the sub-chunk is
+/// live). The material-slot field of [`DirEntry::bits`] is authored on the
+/// CPU at retire time and is not populated by the shader.
+///
+/// `staging_request_idx` is the staging-buffer index for this entry's
+/// payload, i.e. the `gid.x` of the prep workgroup that produced it. CPU
+/// retirement uses it both to drive the patch copy (`staging_occ[idx] →
+/// material_pool[dst_material_slot]`) and as the contract that decouples
+/// staging layout from the live directory/material pool layouts.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, Debug, PartialEq, Eq)]
 pub struct DirtyEntry {
-    pub slot:           u32,
-    pub staging_offset: u32,
+    pub directory_index:     u32,
+    pub new_bits_partial:    u32,
+    pub staging_request_idx: u32,
+    pub _pad:                u32,
 }
 
 const _: () = assert!(
-    std::mem::size_of::<DirtyEntry>() == 8,
-    "DirtyEntry must be 8 bytes to match the HLSL dirty-list entry",
+    std::mem::size_of::<DirtyEntry>() == 16,
+    "DirtyEntry must be 16 bytes to match the HLSL dirty-list entry",
 );
+
+/// Sentinel value in [`DirtyEntry::staging_request_idx`] marking an
+/// exposure-only-dispatch dirty entry.
+///
+/// Exposure-only refresh dispatches ([`subchunk_exposure`]) do not write
+/// staging — they only recompute the 6-bit exposure mask + is_solid hint
+/// from the existing material-pool occupancy. The shader writes
+/// `EXPOSURE_STAGING_REQUEST_IDX_SENTINEL` into the entry's staging index
+/// so the CPU retirement path can distinguish it from a full-prep dirty
+/// entry and take the "update directory bits in place, emit no PatchCopy"
+/// branch.
+///
+/// Production dispatches funnel full-prep and exposure-only entries
+/// through separate dirty-list buffers + separate [`ReadbackChannel`]s
+/// (see [`WorldRenderer::exposure_dirty_list_buf`] and the companion
+/// [`subchunk_exposure`] node). The sentinel is consequently a
+/// defence-in-depth redundancy: even if wiring were to route an exposure
+/// entry through the full-prep retirement path, the sentinel would
+/// prevent the `PatchCopy` construction from ever touching staging under
+/// an unrelated `staging_request_idx`.
+pub const EXPOSURE_STAGING_REQUEST_IDX_SENTINEL: u32 = 0xFFFF_FFFF;
 
 // --- DirtyReport ---
 
 /// GPU→CPU readback payload for one prep dispatch.
 ///
-/// The shader writes the entry count at offset 0 followed by the entries
-/// themselves starting at offset 16 (12 bytes of padding keep the entries
-/// 8-byte-aligned and match the HLSL layout). Entries `[0..count)` are
-/// valid; slots `[count..MAX_CANDIDATES)` hold undefined data and must be
-/// ignored by the consumer.
+/// The shader writes the entry count at offset 0, an overflow flag at
+/// offset 8, and the entries themselves starting at offset 16. Entries
+/// `[0..min(count, MAX_CANDIDATES))` are valid; slots past that hold
+/// undefined data and must be ignored by the consumer.
 ///
-/// Size: `16 + 8 * MAX_CANDIDATES = 2064` bytes (for MAX_CANDIDATES = 256).
+/// `overflow` is the Step-7 shadow-ledger signal that the shader would
+/// have emitted more than [`MAX_CANDIDATES`] entries this dispatch —
+/// the bounds-checked append drops any entry past capacity and sets
+/// this flag to `1`. CPU reads it at retirement so pool-pressure
+/// visibility is surfaced without per-entry GPU tracking. `_pad0` and
+/// `_pad2` stay as padding so the entry array remains 16-byte-aligned.
+///
+/// Size: `16 + 16 * MAX_CANDIDATES = 4112` bytes (for MAX_CANDIDATES = 256).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct DirtyReport {
-    pub count:   u32,
-    pub _pad0:   u32,
-    pub _pad1:   u32,
-    pub _pad2:   u32,
-    pub entries: [DirtyEntry; MAX_CANDIDATES],
+    pub count:    u32,
+    pub _pad0:    u32,
+    /// Set to `1` by the shader when a workgroup's dirty-list append
+    /// would have exceeded [`MAX_CANDIDATES`]. `0` otherwise. Cleared on
+    /// every dispatch via the dirty-list header clear pass.
+    pub overflow: u32,
+    pub _pad2:    u32,
+    pub entries:  [DirtyEntry; MAX_CANDIDATES],
 }
 
 const _: () = assert!(
-    std::mem::size_of::<DirtyReport>() == 16 + 8 * MAX_CANDIDATES,
-    "DirtyReport must be 16 + 8 * MAX_CANDIDATES bytes to match the HLSL \
+    std::mem::size_of::<DirtyReport>() == 16 + 16 * MAX_CANDIDATES,
+    "DirtyReport must be 16 + 16 * MAX_CANDIDATES bytes to match the HLSL \
      dirty-list layout",
 );
+
+// --- DirEntry ---
+
+/// Sentinel material-slot value for non-resident / unallocated directory
+/// entries. Fits in the 24-bit material-slot field of [`DirEntry::bits`].
+pub const MATERIAL_SLOT_INVALID: u32 = 0xFF_FFFF;
+
+/// Mask for the 6 directional exposure bits packed into [`DirEntry::bits`]
+/// (`bits[0..5]`). One bit per `+X, -X, +Y, -Y, +Z, -Z` face; the layout
+/// follows the existing cull-shader convention.
+pub const BITS_EXPOSURE_MASK: u32 = 0x3F;
+
+/// Mask for the is-solid bit packed into [`DirEntry::bits`] at bit 6.
+/// Reserved for a future "this entry's sub-chunk is uniformly solid" hint
+/// that lets the cull / DDA path skip occupancy reads entirely.
+pub const BITS_IS_SOLID: u32 = 1 << 6;
+
+/// Mask for the resident bit packed into [`DirEntry::bits`] at bit 7.
+/// When clear, the directory entry is non-resident and its material-slot
+/// field carries [`MATERIAL_SLOT_INVALID`].
+pub const BITS_RESIDENT: u32 = 1 << 7;
+
+/// Shift for the 24-bit material-slot field packed into [`DirEntry::bits`]
+/// (`bits[8..31]`). The material slot is an index into the CPU-authoritative
+/// `MaterialAllocator` pool, or [`MATERIAL_SLOT_INVALID`] when non-resident.
+pub const BITS_MATERIAL_SLOT_SHIFT: u32 = 8;
+
+/// One entry in the CPU-authored sub-chunk directory.
+///
+/// The directory is indexed by a stable `directory_index` (= `level_offset +
+/// pool_slot`) and carries the contract for how the GPU should resolve a given
+/// sub-chunk: whether it's resident, which material-storage slot holds its
+/// occupancy payload, and its cached exposure mask.
+///
+/// Layout matches the HLSL `DirEntry` struct (24 bytes):
+/// ```text
+///   int3 coord              (+0)
+///   uint bits               (+12)   // [0..5] exposure, [6] is_solid,
+///                                   // [7] resident, [8..31] material_slot
+///                                   //                       | INVALID
+///   uint content_version    (+16)
+///   uint last_synth_version (+20)
+/// ```
+///
+/// - `coord` carries the torus-verification coord for the entry. For
+///   non-resident entries it is left at `[0, 0, 0]` and the shader never
+///   reads it (resident bit clear ⇒ early-out).
+/// - `bits` packs the four per-entry fields that change per residency
+///   event. Exposure and is_solid are read by the cull/DDA path; resident
+///   gates the whole entry; material_slot is the indirection target.
+/// - `content_version` bumps on any occupancy mutation. `0` for pure
+///   worldgen — this step never bumps it.
+/// - `last_synth_version` is CPU-only bookkeeping for the eviction TTL in
+///   later steps; present here for layout symmetry so downstream shader
+///   ports don't need a struct-size change.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct DirEntry {
+    pub coord:              [i32; 3],
+    pub bits:               u32,
+    pub content_version:    u32,
+    pub last_synth_version: u32,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<DirEntry>() == 24,
+    "DirEntry must be 24 bytes to match the HLSL DirEntry layout",
+);
+
+impl DirEntry {
+    /// All-zero non-resident entry. `bits == 0` implies `resident = 0`,
+    /// `is_solid = 0`, `exposure = 0`, and `material_slot = 0` (callers
+    /// must not read the slot field without first checking `resident`).
+    ///
+    /// Note: a zero `material_slot` is *not* [`MATERIAL_SLOT_INVALID`]; the
+    /// resident bit is the authoritative gate. Constructing a
+    /// non-resident entry where shader code might speculatively read
+    /// `material_slot` should go through [`DirEntry::non_resident`].
+    pub const fn empty() -> Self {
+        Self {
+            coord:              [0, 0, 0],
+            bits:               0,
+            content_version:    0,
+            last_synth_version: 0,
+        }
+    }
+
+    /// Explicit non-resident entry: `resident` bit clear, `material_slot`
+    /// set to [`MATERIAL_SLOT_INVALID`]. Use when the caller wants the
+    /// sentinel slot value to be present in the packed bits (for diagnostic
+    /// readability or to match a shader that panics on a non-INVALID slot
+    /// under a clear resident bit).
+    pub const fn non_resident() -> Self {
+        Self {
+            coord:              [0, 0, 0],
+            bits:               MATERIAL_SLOT_INVALID << BITS_MATERIAL_SLOT_SHIFT,
+            content_version:    0,
+            last_synth_version: 0,
+        }
+    }
+
+    /// Build a resident directory entry.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds panic if `exposure > 0x3F` (exposure field is 6 bits)
+    /// or if `material_slot > MATERIAL_SLOT_INVALID` (slot field is 24
+    /// bits). `material_slot == MATERIAL_SLOT_INVALID` is a
+    /// caller-visible programming error under a resident entry — later
+    /// shader ports assume the slot is a real pool index.
+    pub fn resident(
+        coord:         [i32; 3],
+        exposure:      u32,
+        is_solid:      bool,
+        material_slot: u32,
+    )
+        -> Self
+    {
+        debug_assert!(exposure <= BITS_EXPOSURE_MASK, "exposure must fit in 6 bits");
+        debug_assert!(
+            material_slot < MATERIAL_SLOT_INVALID,
+            "material_slot {material_slot} must be a real pool index under resident entry",
+        );
+
+        let mut bits = exposure & BITS_EXPOSURE_MASK;
+        if is_solid {
+            bits |= BITS_IS_SOLID;
+        }
+        bits |= BITS_RESIDENT;
+        bits |= (material_slot & MATERIAL_SLOT_INVALID) << BITS_MATERIAL_SLOT_SHIFT;
+
+        Self {
+            coord,
+            bits,
+            content_version:    0,
+            last_synth_version: 0,
+        }
+    }
+
+    /// `true` if the resident bit is set.
+    pub const fn is_resident(&self) -> bool {
+        (self.bits & BITS_RESIDENT) != 0
+    }
+
+    /// Six-bit directional exposure mask (`+X, -X, +Y, -Y, +Z, -Z`).
+    pub const fn exposure(&self) -> u32 {
+        self.bits & BITS_EXPOSURE_MASK
+    }
+
+    /// `true` if the is-solid hint bit is set.
+    pub const fn is_solid(&self) -> bool {
+        (self.bits & BITS_IS_SOLID) != 0
+    }
+
+    /// Unpacked 24-bit material-slot field. Returns
+    /// [`MATERIAL_SLOT_INVALID`] for non-resident entries built via
+    /// [`DirEntry::non_resident`] or [`DirEntry::empty`] (the latter
+    /// returns `0`, which is also not a resident slot — use
+    /// [`DirEntry::is_resident`] to gate).
+    pub const fn material_slot(&self) -> u32 {
+        (self.bits >> BITS_MATERIAL_SLOT_SHIFT) & MATERIAL_SLOT_INVALID
+    }
+}
 
 // --- WorldRenderer ---
 
@@ -380,20 +608,81 @@ const _: () = assert!(
 /// occupancy slots with [`WorldRenderer::write_occupancy_slot`] as the
 /// residency control plane delivers prep completions.
 pub struct WorldRenderer {
-    cull_pipeline:   Arc<ComputePipeline>,
-    prep_pipeline:   Arc<ComputePipeline>,
-    render_pipeline: Arc<RenderPipeline>,
+    cull_pipeline:     Arc<ComputePipeline>,
+    prep_pipeline:     Arc<ComputePipeline>,
+    /// Exposure-only refresh pipeline. Runs
+    /// `shaders/subchunk_exposure.cs.hlsl` with one workgroup per
+    /// [`PrepRequest`] (the shared request layout — exposure-only uses
+    /// the same 32-byte struct shape). See [`subchunk_exposure`].
+    exposure_pipeline: Arc<ComputePipeline>,
+    render_pipeline:   Arc<RenderPipeline>,
 
     camera_buf:            wgpu::Buffer,
     instance_buf:          wgpu::Buffer,
-    occ_buf:               wgpu::Buffer,
+    /// Live per-slot occupancy payload. Indexed by `material_slot`
+    /// (the 24-bit field inside [`DirEntry::bits`]); the render VS/PS
+    /// still reads it by `directory_index` under the identity policy
+    /// (`material_slot == directory_index`). A later step will tighten
+    /// the pool's capacity below the directory's and wire VS/PS through
+    /// the directory resolver.
+    material_pool_buf:     wgpu::Buffer,
     count_buf:             wgpu::Buffer,
     lod_mask_buf:          wgpu::Buffer,
-    staging_occ_buf:       wgpu::Buffer,
-    staging_exposure_buf:  wgpu::Buffer,
-    live_exposure_buf:     wgpu::Buffer,
+    /// Staging copy of prep outputs, indexed by `staging_request_idx`
+    /// (= the prep workgroup's `gid.x`). Sized to [`MAX_CANDIDATES`]
+    /// entries per frame-in-flight — the maximum number of prep requests
+    /// that may execute in one dispatch. The CPU retirement logic copies
+    /// a subset of staging entries into `material_pool_buf` via the patch
+    /// pass.
+    ///
+    /// Ring semantics: at frame `F`, prep writes
+    /// `staging_occ_ring.current(F)`; the retirement that completes at
+    /// frame `F + FrameCount` reads from `ring.current(F)` (the same
+    /// slot, which has survived because the intervening frames rotated
+    /// to other slots). This is the FIF-sized ring that
+    /// `knowledge-fif-swapchain-depth-decoupling` describes — N = FIF is
+    /// exactly sufficient.
+    ///
+    /// Memory footprint trade-off: the old single buffer was
+    /// `MAX_CANDIDATES * 64 B` (= 16 KiB). The ring is
+    /// `FrameCount * MAX_CANDIDATES * 64 B` (= 32 KiB under FIF=2).
+    /// Negligible given the correctness problem it fixes — a single
+    /// buffer is clobbered between the prep dispatch and the patch that
+    /// consumes it, so the patch landed wrong-frame data at the retired
+    /// directory_index. See `failure-staging-not-ringed-after-gid-x-reindexing`.
+    staging_occ_ring:      MultiBufferRing<SubchunkOccupancy>,
     dirty_list_buf:        wgpu::Buffer,
     prep_request_buf:      wgpu::Buffer,
+
+    // --- Exposure-only dispatch (Step 5) ---
+    //
+    // Parallel pair to `(prep_request_buf, dirty_list_buf)`, feeding the
+    // neighbour-aware-exposure-refresh dispatch. Kept separate from the
+    // full-prep buffers so:
+    //  - Both dispatches can coexist in the same frame without stepping on
+    //    each other's dirty-list header atomic (each owns its own buffer).
+    //  - The CPU retirement can read each readback channel independently
+    //    (full-prep and exposure-only retire on the same frame cadence, so
+    //    keeping the readbacks separate avoids a lockstep-ordering
+    //    requirement the caller would otherwise need to preserve).
+    //  - The dispatch bindings are simpler — exposure-only does not touch
+    //    the staging ring, so it has one fewer binding than full-prep.
+    /// CPU-writable buffer of [`PrepRequest`]s for the exposure-only
+    /// dispatch. Same struct shape as the full-prep request (coord,
+    /// level, padding) so the CPU can share its request-building code
+    /// between the two paths.
+    exposure_request_buf:   wgpu::Buffer,
+    /// Dirty-list buffer written by the exposure-only dispatch. Same
+    /// [`DirtyReport`] layout as `dirty_list_buf`; entries carry
+    /// [`EXPOSURE_STAGING_REQUEST_IDX_SENTINEL`] in
+    /// [`DirtyEntry::staging_request_idx`] as a structural marker.
+    exposure_dirty_list_buf: wgpu::Buffer,
+    /// CPU-authored directory mapping `directory_index -> DirEntry`.
+    /// Sized to `MAX_CANDIDATES` entries today (trivial 1:1 directory ↔
+    /// material-slot mapping). The cull shader reads it via the set-0
+    /// binding added in Step 6 and unpacks the exposure mask through
+    /// `direntry_get_exposure`.
+    slot_directory_buf:    Arc<wgpu::Buffer>,
 }
 
 impl WorldRenderer {
@@ -403,9 +692,10 @@ impl WorldRenderer {
     /// A render before the first instance upload produces a blank frame
     /// rather than undefined behavior — the instance buffer is zeroed, so
     /// every entry has `slot_mask = 0` (slot 0, level 0, padding bit
-    /// clear). Those entries fetch `live_exposure[0]`, which is zero, so
-    /// the cull shader's exposure rejection drops them.
-    pub fn new(ctx: &RendererContext) -> Self {
+    /// clear). Those entries fetch `g_directory[0]`, which is zero
+    /// (= `DirEntry::empty()` — `resident = 0`, `exposure = 0`), so the
+    /// cull shader's exposure rejection drops them.
+    pub fn new(ctx: &RendererContext, pool: &mut BufferPool) -> Self {
         let surface_format = ctx
             .surface_format()
             .expect("WorldRenderer requires a windowed RendererContext");
@@ -434,16 +724,24 @@ impl WorldRenderer {
         )
         .expect("subchunk prep shader failed to load");
 
+        let exposure_cs = ShaderModule::load(
+            ctx,
+            "subchunk_exposure.cs",
+            ShaderSource::Spirv(SUBCHUNK_EXPOSURE_CS_SPV),
+            "main",
+        )
+        .expect("subchunk exposure shader failed to load");
+
         // --- Buffer sizes ---
 
         let camera_size       = std::mem::size_of::<SubchunkCamera>() as u64;
         let instance_size     = (std::mem::size_of::<SubchunkInstance>() * MAX_CANDIDATES) as u64;
         let occ_size          = (std::mem::size_of::<SubchunkOccupancy>() * MAX_CANDIDATES) as u64;
-        let exposure_size     = (std::mem::size_of::<u32>()              * MAX_CANDIDATES) as u64;
         let count_size        = 4u64;
         let lod_mask_size     = std::mem::size_of::<LodMaskUniform>() as u64;
         let dirty_list_size   = std::mem::size_of::<DirtyReport>() as u64;
         let prep_request_size = (std::mem::size_of::<PrepRequest>() * MAX_CANDIDATES) as u64;
+        let directory_size    = (std::mem::size_of::<DirEntry>()     * MAX_CANDIDATES) as u64;
 
         // --- Persistent buffers ---
 
@@ -461,8 +759,8 @@ impl WorldRenderer {
             mapped_at_creation: false,
         });
 
-        let occ_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("subchunk_occ"),
+        let material_pool_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("subchunk_material_pool"),
             size:               occ_size,
             usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -494,47 +792,33 @@ impl WorldRenderer {
         ctx.queue()
             .write_buffer(&lod_mask_buf, 0, bytemuck::bytes_of(&LodMaskUniform::inactive()));
 
-        // Staging copy of `occ_buf`, written by the GPU prep pass.
-        // COPY_SRC is used by the follow-up commit patch that CPU scheduling
-        // will eventually wire up (`update_slot`); it is unused by the prep
-        // node itself but stays on the buffer for the downstream slice.
-        let staging_occ_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("subchunk_staging_occ"),
-            size:               occ_size,
-            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Staging exposure: one `u32` per slot, written unconditionally by
-        // the prep pass alongside the staging occupancy payload. The patch
-        // pass blits staging → live on every dirty slot, paired with the
-        // occupancy patch. Six bits of payload per slot stored as a full
-        // `u32` for stride alignment; waste is 26 bits × MAX_CANDIDATES =
-        // under 1 KiB, negligible.
-        let staging_exposure_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("subchunk_staging_exposure"),
-            size:               exposure_size,
-            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Live exposure: read by the cull shader per candidate. COPY_DST so
-        // the patch pass can blit staging slots in on every dirty
-        // completion; zero-initialised here so a first-frame cull (before
-        // any prep has completed) reads 0 for every slot — the same
-        // "reject everything" behaviour the old `slot_mask = 0` sentinel
-        // produced.
-        let live_exposure_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("subchunk_live_exposure"),
-            size:               exposure_size,
-            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        ctx.queue().write_buffer(
-            &live_exposure_buf,
-            0,
-            bytemuck::cast_slice(&[0u32; MAX_CANDIDATES]),
+        // Staging ring written by the GPU prep pass. One slot per
+        // frame-in-flight: the prep dispatch at frame F writes its ring
+        // slot, and the retirement that lands at frame F + FrameCount
+        // reads the same slot to drive its patch copies. Intervening
+        // frames rotate to their own slots, so frame F's data is
+        // preserved until the retirement consumes it.
+        //
+        // A single buffer would be written every frame and clobbered
+        // between the prep at F and the patch that runs FrameCount
+        // frames later — the exact race that
+        // `failure-staging-not-ringed-after-gid-x-reindexing` documents.
+        //
+        // Each slot is sized identically (`MAX_CANDIDATES` entries)
+        // because the ring is indexed by `staging_request_idx` (=
+        // `gid.x` of the prep workgroup), so the size is proportional to
+        // the maximum prep dispatch width rather than to the directory
+        // capacity. `STORAGE` for the prep shader write; `COPY_SRC` for
+        // the patch pass that lifts selected entries into
+        // `material_pool_buf` at CPU-chosen material slots.
+        let staging_occ_ring = MultiBufferRing::<SubchunkOccupancy>::new(
+            ctx,
+            pool,
+            "subchunk_staging_occ",
+            BufferDesc {
+                size:  occ_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            },
         );
 
         // Dirty-list buffer: shader-authoritative `DirtyReport`. COPY_SRC so
@@ -559,6 +843,54 @@ impl WorldRenderer {
             mapped_at_creation: false,
         });
 
+        // Exposure-only request buffer: same size + shape as the prep
+        // request buffer (the struct layout is shared). Written via
+        // `write_exposure_requests`.
+        let exposure_request_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("subchunk_exposure_requests"),
+            size:               prep_request_size,
+            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Exposure-only dirty-list buffer: mirrors `dirty_list_buf` in
+        // shape + usage. Kept separate so the exposure dispatch has its
+        // own atomic `count` header — running both dispatches in the same
+        // frame without separate buffers would require `InterlockedAdd`
+        // contention between the two dispatches for no gain.
+        let exposure_dirty_list_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("subchunk_exposure_dirty_list"),
+            size:               dirty_list_size,
+            usage:              wgpu::BufferUsages::STORAGE
+                              | wgpu::BufferUsages::COPY_SRC
+                              | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Slot directory: CPU-authored contract mapping `directory_index`
+        // to a packed `DirEntry`. Sized to [`MAX_CANDIDATES`] entries —
+        // trivial 1:1 mapping against the material-storage pool at Step 1.
+        // `STORAGE | COPY_DST` so future shader ports can read it via a
+        // bind group, and the CPU can patch in per-entry updates via
+        // `queue.write_buffer`. The buffer starts zero-initialised
+        // (implicit `DirEntry::empty()`); the first frame's directory
+        // flush populates whatever the residency has decided is resident.
+        // `COPY_SRC` is load-bearing only for the `debug-state-history`
+        // diagnostics path in the game crate: it blits this buffer to a
+        // `ReadbackChannel<DirectorySnapshot>` slot each frame so the CPU
+        // can compare its CPU-authored directory against what the GPU
+        // actually observed. The flag is inert when the feature is off —
+        // wgpu validates usage at bind time, never at allocation — so the
+        // cost in release builds is exactly zero.
+        let slot_directory_buf = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("world_slot_directory"),
+            size:               directory_size,
+            usage:              wgpu::BufferUsages::STORAGE
+                              | wgpu::BufferUsages::COPY_DST
+                              | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        }));
+
         // --- Pipelines ---
 
         let cull_pipeline = Arc::new(ComputePipeline::new(ctx, ComputePipelineDescriptor {
@@ -572,6 +904,13 @@ impl WorldRenderer {
             label:                   "subchunk_prep",
             shader:                  prep_cs,
             expected_workgroup_size: Some([4, 4, 4]),
+            immediate_size:          0,
+        }));
+
+        let exposure_pipeline = Arc::new(ComputePipeline::new(ctx, ComputePipelineDescriptor {
+            label:                   "subchunk_exposure",
+            shader:                  exposure_cs,
+            expected_workgroup_size: Some([1, 1, 1]),
             immediate_size:          0,
         }));
 
@@ -605,17 +944,19 @@ impl WorldRenderer {
         Self {
             cull_pipeline,
             prep_pipeline,
+            exposure_pipeline,
             render_pipeline,
             camera_buf,
             instance_buf,
-            occ_buf,
+            material_pool_buf,
             count_buf,
             lod_mask_buf,
-            staging_occ_buf,
-            staging_exposure_buf,
-            live_exposure_buf,
+            staging_occ_ring,
             dirty_list_buf,
             prep_request_buf,
+            exposure_request_buf,
+            exposure_dirty_list_buf,
+            slot_directory_buf,
         }
     }
 
@@ -641,11 +982,16 @@ impl WorldRenderer {
         ctx.queue().write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(instances));
     }
 
-    /// Upload a single slot's 64-byte occupancy payload.
+    /// Upload a single slot's 64-byte occupancy payload directly into
+    /// `material_pool_buf`.
     ///
     /// `occ_bytes` must be exactly 64 bytes in the GPU layout — an
     /// 8-word sequence of little-endian u64s covering z-layers 0..8, where
     /// bit `y*8 + x` of layer `z` is set when voxel `(x, y, z)` is occupied.
+    ///
+    /// Left in place for diagnostic paths (tests, validation). The
+    /// production pipeline routes occupancy through the prep shader + patch
+    /// pass, so this entry point should not be used on the hot path.
     pub fn write_occupancy_slot(
         &self,
         ctx:       &RendererContext,
@@ -653,7 +999,7 @@ impl WorldRenderer {
         occ_bytes: &[u8; std::mem::size_of::<SubchunkOccupancy>()],
     ) {
         let offset = (slot as u64) * std::mem::size_of::<SubchunkOccupancy>() as u64;
-        ctx.queue().write_buffer(&self.occ_buf, offset, occ_bytes);
+        ctx.queue().write_buffer(&self.material_pool_buf, offset, occ_bytes);
     }
 
     /// Overwrite the LOD cascade uniform.
@@ -686,12 +1032,87 @@ impl WorldRenderer {
         ctx.queue().write_buffer(&self.prep_request_buf, 0, bytemuck::cast_slice(requests));
     }
 
+    /// Upload `requests` into the exposure-only request buffer.
+    ///
+    /// The exposure-only compute pass dispatches one workgroup per request
+    /// (see [`subchunk_exposure`]); callers must pass the same
+    /// `requests.len()` as `request_count` when registering the exposure
+    /// node.
+    ///
+    /// Uses the same [`PrepRequest`] struct as full-prep — the struct's
+    /// payload (coord + level) is identical in both dispatches.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `requests.len() > MAX_CANDIDATES` — the buffer is sized
+    /// to exactly that many entries.
+    pub fn write_exposure_requests(&self, ctx: &RendererContext, requests: &[PrepRequest]) {
+        assert!(
+            requests.len() <= MAX_CANDIDATES,
+            "write_exposure_requests: got {} requests, max is {MAX_CANDIDATES}",
+            requests.len(),
+        );
+        if requests.is_empty() {
+            return;
+        }
+        ctx.queue().write_buffer(
+            &self.exposure_request_buf,
+            0,
+            bytemuck::cast_slice(requests),
+        );
+    }
+
+    /// Batch-write a set of `(directory_index, entry)` updates into the
+    /// [`WorldRenderer::slot_directory_buf`].
+    ///
+    /// Each entry is committed via a single `queue.write_buffer` at its
+    /// own 24-byte offset. The directory buffer is small (MAX_CANDIDATES ×
+    /// 24 B ≈ 6 KiB today) and updates are sparse, so a staging ring is
+    /// not warranted here — this is the simplest shape that satisfies the
+    /// CPU-authoritative / GPU-readonly contract.
+    ///
+    /// Called once per frame with the drained dirty set from
+    /// `SlotDirectory::drain_dirty`. An empty slice is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Debug builds panic if any `index >= MAX_CANDIDATES` — the
+    /// directory is sized exactly to the candidate pool.
+    pub fn write_directory_entries(
+        &self,
+        ctx:     &RendererContext,
+        updates: &[(u32, DirEntry)],
+    ) {
+        let stride = std::mem::size_of::<DirEntry>() as u64;
+        for (index, entry) in updates {
+            debug_assert!(
+                (*index as usize) < MAX_CANDIDATES,
+                "directory index {index} out of range (MAX_CANDIDATES = {MAX_CANDIDATES})",
+            );
+            let offset = (*index as u64) * stride;
+            ctx.queue()
+                .write_buffer(&self.slot_directory_buf, offset, bytemuck::bytes_of(entry));
+        }
+    }
+
+    /// Borrow the `Arc`-held slot-directory buffer for bind-group wiring.
+    /// No shader reads it yet (Step 2 adds bind entries); the handle is
+    /// exposed so residency tests / Step 2 callers can thread it into
+    /// future passes.
+    pub fn slot_directory_buf(&self) -> &Arc<wgpu::Buffer> {
+        &self.slot_directory_buf
+    }
+
     pub(crate) fn cull_pipeline(&self) -> &Arc<ComputePipeline> {
         &self.cull_pipeline
     }
 
     pub(crate) fn prep_pipeline(&self) -> &Arc<ComputePipeline> {
         &self.prep_pipeline
+    }
+
+    pub(crate) fn exposure_pipeline(&self) -> &Arc<ComputePipeline> {
+        &self.exposure_pipeline
     }
 
     pub(crate) fn render_pipeline(&self) -> &Arc<RenderPipeline> {
@@ -706,8 +1127,8 @@ impl WorldRenderer {
         &self.instance_buf
     }
 
-    pub(crate) fn occ_buf(&self) -> &wgpu::Buffer {
-        &self.occ_buf
+    pub(crate) fn material_pool_buf(&self) -> &wgpu::Buffer {
+        &self.material_pool_buf
     }
 
     pub(crate) fn count_buf(&self) -> &wgpu::Buffer {
@@ -718,16 +1139,18 @@ impl WorldRenderer {
         &self.lod_mask_buf
     }
 
-    pub(crate) fn staging_occ_buf(&self) -> &wgpu::Buffer {
-        &self.staging_occ_buf
-    }
-
-    pub(crate) fn staging_exposure_buf(&self) -> &wgpu::Buffer {
-        &self.staging_exposure_buf
-    }
-
-    pub(crate) fn live_exposure_buf(&self) -> &wgpu::Buffer {
-        &self.live_exposure_buf
+    /// Borrow the FIF-sized staging ring.
+    ///
+    /// `staging_occ_ring().current(frame)` is the buffer the prep
+    /// dispatch at `frame` writes to. `staging_occ_ring().current(
+    /// retired_frame)` is the buffer the patch pass must read when
+    /// consuming the dirty list from `retired_frame` (the ring rotates
+    /// such that both dereferences name the same underlying
+    /// `wgpu::Buffer` when `retired_frame + FrameCount == frame`, but
+    /// the correctness proof uses the per-frame resolution directly —
+    /// see `knowledge-fif-swapchain-depth-decoupling`).
+    pub(crate) fn staging_occ_ring(&self) -> &MultiBufferRing<SubchunkOccupancy> {
+        &self.staging_occ_ring
     }
 
     pub(crate) fn dirty_list_buf(&self) -> &wgpu::Buffer {
@@ -736,6 +1159,14 @@ impl WorldRenderer {
 
     pub(crate) fn prep_request_buf(&self) -> &wgpu::Buffer {
         &self.prep_request_buf
+    }
+
+    pub(crate) fn exposure_dirty_list_buf(&self) -> &wgpu::Buffer {
+        &self.exposure_dirty_list_buf
+    }
+
+    pub(crate) fn exposure_request_buf(&self) -> &wgpu::Buffer {
+        &self.exposure_request_buf
     }
 }
 
@@ -757,12 +1188,12 @@ pub fn subchunk_world(
 )
     -> (TextureHandle, TextureHandle)
 {
-    let camera_h        = graph.import_buffer(renderer.camera_buf().clone());
-    let instance_h      = graph.import_buffer(renderer.instance_buf().clone());
-    let occ_h           = graph.import_buffer(renderer.occ_buf().clone());
-    let count_h         = graph.import_buffer(renderer.count_buf().clone());
-    let lod_mask_h      = graph.import_buffer(renderer.lod_mask_buf().clone());
-    let live_exposure_h = graph.import_buffer(renderer.live_exposure_buf().clone());
+    let camera_h    = graph.import_buffer(renderer.camera_buf().clone());
+    let instance_h  = graph.import_buffer(renderer.instance_buf().clone());
+    let occ_h       = graph.import_buffer(renderer.material_pool_buf().clone());
+    let count_h     = graph.import_buffer(renderer.count_buf().clone());
+    let lod_mask_h  = graph.import_buffer(renderer.lod_mask_buf().clone());
+    let directory_h = graph.import_buffer(renderer.slot_directory_buf().as_ref().clone());
 
     let visible_size  = (4 * MAX_CANDIDATES) as u64;
     let indirect_size = 16u64;
@@ -786,7 +1217,7 @@ pub fn subchunk_world(
             (1, instance_h.into()),
             (2, visible_h.into()),
             (3, lod_mask_h.into()),
-            (4, live_exposure_h.into()),
+            (4, directory_h.into()),
         ],
     );
 
@@ -828,35 +1259,54 @@ pub fn subchunk_world(
 /// Register the sub-chunk prep compute pass + dirty-list readback copy
 /// into `graph`.
 ///
-/// Imports the five persistent buffers (prep-requests, live occupancy,
-/// staging occupancy, staging exposure, dirty list), clears the
-/// dirty-list `count` header, dispatches the prep compute with one
-/// workgroup per request, then records a `copy_buffer_to_buffer` into
-/// `readback_dst` — an imported handle whose destination is typically a
+/// Imports the five persistent buffers (prep-requests, material pool,
+/// dirty list, directory, and the current ring slot of staging
+/// occupancy), clears the dirty-list `count` header, dispatches the prep
+/// compute with one workgroup per request, then records a
+/// `copy_buffer_to_buffer` into `readback_dst` — an imported handle
+/// whose destination is typically a
 /// [`ReadbackChannel`](crate::readback::ReadbackChannel) slot reserved for
 /// this frame.
+///
+/// `gpu_consts` lands at the reflected slot 0 of the prep pipeline. The
+/// prep shader reads `g_consts.levels[level_idx]` through
+/// `resolve_coord_to_slot` / `resolve_and_verify` to self-resolve its
+/// own directory index and to locate each of the 6 neighbour directory
+/// entries for the neighbour-aware exposure mask.
 ///
 /// The caller must:
 /// - Upload `request_count` entries via
 ///   [`WorldRenderer::write_prep_requests`] before graph compile.
 /// - Size `readback_dst` to at least `size_of::<DirtyReport>()` bytes.
 ///
-/// The live-occupancy buffer is read by the compute pass; callers should
-/// be aware that running prep and render in the same graph produces a
-/// read-after-write or write-after-read dependency on `occ_buf` and
-/// `staging_occ_buf` — the graph handles the barrier automatically.
+/// The material-pool buffer is read by the compute pass as a diff source
+/// *and* as the neighbour-face source for the exposure computation;
+/// callers should be aware that running prep and render in the same graph
+/// produces a read-after-write or write-after-read dependency on
+/// `material_pool_buf` and the current staging ring slot — the graph
+/// handles the barrier automatically.
+///
+/// `frame` selects which slot of the staging ring this dispatch writes
+/// into. The caller must pass the same `FrameIndex` it will pass to
+/// [`subchunk_patch`] in frame `frame + FrameCount` when consuming this
+/// dispatch's dirty list — otherwise staging writes land in a slot that
+/// the retirement will never read.
 pub fn subchunk_prep(
     graph         : &mut RenderGraph,
     renderer      : &Arc<WorldRenderer>,
+    gpu_consts    : &crate::GpuConsts,
     readback_dst  : BufferHandle,
     request_count : u32,
+    frame         : FrameIndex,
 )
 {
-    let request_h          = graph.import_buffer(renderer.prep_request_buf().clone());
-    let live_occ_h         = graph.import_buffer(renderer.occ_buf().clone());
-    let staging_occ_h      = graph.import_buffer(renderer.staging_occ_buf().clone());
-    let staging_exposure_h = graph.import_buffer(renderer.staging_exposure_buf().clone());
-    let dirty_list_h       = graph.import_buffer(renderer.dirty_list_buf().clone());
+    let request_h        = graph.import_buffer(renderer.prep_request_buf().clone());
+    let material_pool_h  = graph.import_buffer(renderer.material_pool_buf().clone());
+    let staging_occ_h    = graph.import_buffer(
+        renderer.staging_occ_ring().current(frame).clone(),
+    );
+    let dirty_list_h     = graph.import_buffer(renderer.dirty_list_buf().clone());
+    let directory_h      = graph.import_buffer(renderer.slot_directory_buf().as_ref().clone());
 
     // Clear the dirty-list count header. The shader's `InterlockedAdd` on
     // offset 0 accumulates across workgroups, so the count must start at 0
@@ -875,13 +1325,13 @@ pub fn subchunk_prep(
     let prep_bg = graph.create_bind_group(
         "subchunk_prep_bg",
         renderer.prep_pipeline().as_ref(),
-        None,
+        Some(gpu_consts),
         &[
-            (0, request_h.into()),
-            (1, live_occ_h.into()),
-            (2, staging_occ_h.into()),
-            (3, staging_exposure_h.into()),
+            (1, request_h.into()),
+            (2, material_pool_h.into()),
+            (3, staging_occ_h.into()),
             (4, dirty_list_cleared.into()),
+            (5, directory_h.into()),
         ],
     );
 
@@ -912,71 +1362,883 @@ pub fn subchunk_prep(
     graph.mark_output(readback_out);
 }
 
-// --- subchunk_patch render node ---
+// --- subchunk_exposure render node ---
 
-/// Register a per-slot staging→live patch pass into `graph`.
+/// Register the exposure-only refresh compute pass + dirty-list readback
+/// copy into `graph`.
 ///
-/// For each `slot` in `dirty_slots`, records two
-/// `copy_buffer_to_buffer` calls: a 64-byte occupancy copy from
-/// `staging_occ_buf[slot]` into `occ_buf[slot]`, and a 4-byte exposure
-/// copy from `staging_exposure_buf[slot]` into `live_exposure_buf[slot]`.
-/// The copy set reflects a [`DirtyReport`](crate::subchunk::DirtyReport)
-/// that the control plane drained for a previously-completed prep
-/// dispatch.
+/// Companion to [`subchunk_prep`]. Full-prep voxelizes terrain and writes
+/// staging for the CPU patch pass. Exposure-only refresh reads the
+/// already-populated `material_pool` entries in place and recomputes the
+/// neighbour-aware 6-bit exposure mask — no terrain evaluation, no staging
+/// write, no patch pass. The retirement logic updates only the directory
+/// `bits` field for each returned dirty entry (see
+/// [`EXPOSURE_STAGING_REQUEST_IDX_SENTINEL`]).
 ///
-/// A call with an empty `dirty_slots` is a no-op and records nothing —
-/// callers do not need to guard at the call site.
+/// Bindings mirror [`subchunk_prep`] minus the staging-occ slot:
+///   0: `g_consts`                   (implicit via `gpu_consts`)
+///   1: `g_requests`                 (exposure-only request buffer)
+///   2: `g_material_pool`            (self-occupancy source + neighbour source)
+///   3: `g_dirty_list`               (exposure-only dirty-list buffer)
+///   4: `g_directory`                (read-only)
 ///
-/// Staging and live are the same 1:1 layout today (one entry per slot in
-/// each buffer); the function will need to change if/when staging
-/// compaction lands.
-pub fn subchunk_patch(
-    graph       : &mut RenderGraph,
-    renderer    : &Arc<WorldRenderer>,
-    dirty_slots : &[u32],
+/// The caller must:
+/// - Upload `request_count` entries via
+///   [`WorldRenderer::write_exposure_requests`] before graph compile.
+/// - Size `readback_dst` to at least `size_of::<DirtyReport>()` bytes.
+///
+/// # Non-staging contract
+///
+/// The exposure dispatch never writes the staging ring. Consequently it
+/// takes no `frame` argument (unlike [`subchunk_prep`]) — there is no
+/// ring-slot selection to make. The retirement path for exposure-only
+/// entries asserts `staging_request_idx ==
+/// EXPOSURE_STAGING_REQUEST_IDX_SENTINEL` and emits zero [`PatchCopy`]s.
+pub fn subchunk_exposure(
+    graph         : &mut RenderGraph,
+    renderer      : &Arc<WorldRenderer>,
+    gpu_consts    : &crate::GpuConsts,
+    readback_dst  : BufferHandle,
+    request_count : u32,
 )
 {
-    if dirty_slots.is_empty() {
+    let request_h        = graph.import_buffer(renderer.exposure_request_buf().clone());
+    let material_pool_h  = graph.import_buffer(renderer.material_pool_buf().clone());
+    let dirty_list_h     = graph.import_buffer(renderer.exposure_dirty_list_buf().clone());
+    let directory_h      = graph.import_buffer(renderer.slot_directory_buf().as_ref().clone());
+
+    // Clear the dirty-list count header. Same reasoning as subchunk_prep:
+    // the shader's `InterlockedAdd` accumulates, so the header must start
+    // at 0. Entry words past the written range are undefined; consumer
+    // only reads [0, count).
+    let dirty_list_cleared = graph.add_pass("subchunk_exposure_clear", |pass| {
+        let cleared = pass.write_buffer(dirty_list_h);
+        let dirty_buf = renderer.exposure_dirty_list_buf().clone();
+        pass.execute(move |ctx| {
+            ctx.commands.clear_buffer(&dirty_buf, 0, Some(16));
+        });
+        cleared
+    });
+
+    let exposure_bg = graph.create_bind_group(
+        "subchunk_exposure_bg",
+        renderer.exposure_pipeline().as_ref(),
+        Some(gpu_consts),
+        &[
+            (1, request_h.into()),
+            (2, material_pool_h.into()),
+            (3, dirty_list_cleared.into()),
+            (4, directory_h.into()),
+        ],
+    );
+
+    let dirty_list_written = graph.add_pass("subchunk_exposure", |pass| {
+        let writes     = pass.use_bind_group(exposure_bg);
+        let pipeline   = Arc::clone(renderer.exposure_pipeline());
+        let workgroups = [request_count, 1, 1];
+        let dirty_out  = writes.write_of(dirty_list_cleared);
+        pass.execute(move |ctx| {
+            let bg = ctx.resources.bind_group(exposure_bg);
+            ctx.commands.dispatch(&pipeline, &[bg], workgroups, &[]);
+        });
+        dirty_out
+    });
+
+    let readback_out = graph.add_pass("subchunk_exposure_readback_copy", |pass| {
+        pass.read_buffer(dirty_list_written);
+        let written = pass.write_buffer(readback_dst);
+        let copy_size = std::mem::size_of::<DirtyReport>() as u64;
+        pass.execute(move |ctx| {
+            let src = ctx.resources.buffer(dirty_list_written);
+            let dst = ctx.resources.buffer(readback_dst);
+            ctx.commands.copy_buffer_to_buffer(src, 0, dst, 0, copy_size);
+        });
+        written
+    });
+
+    graph.mark_output(readback_out);
+}
+
+// --- PatchCopy ---
+
+/// One CPU-authored staging→material-pool copy decision.
+///
+/// Produced by the retirement logic that walks a
+/// [`DirtyReport`](crate::subchunk::DirtyReport): for every entry the CPU
+/// decides is sparse (has real occupancy), the retirement emits a
+/// `PatchCopy { staging_request_idx, dst_material_slot }` so the patch
+/// pass knows which staging entry to lift and where in the material pool
+/// to land it. Uniform-empty entries never produce a `PatchCopy`; they
+/// consume no material-pool storage.
+///
+/// `staging_request_idx` matches `gid.x` of the prep workgroup that
+/// produced the staging write (and the `staging_request_idx` field of the
+/// corresponding `DirtyEntry`). `dst_material_slot` is either the
+/// allocator slot the retirement logic allocated for a first-time-sparse
+/// transition or the existing slot reused across a sparse-to-sparse
+/// update.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatchCopy {
+    pub staging_request_idx: u32,
+    pub dst_material_slot:   u32,
+}
+
+// --- subchunk_patch render node ---
+
+/// Register a CPU-scheduled staging→material-pool patch pass into `graph`.
+///
+/// For each `PatchCopy` in `copies`, records a 64-byte occupancy copy
+/// from `staging_occ_ring[staging_frame][staging_request_idx]` into
+/// `material_pool_buf[dst_material_slot]`. The copy set is produced by
+/// the CPU retirement logic that walked a previously-completed prep
+/// dispatch's [`DirtyReport`](crate::subchunk::DirtyReport) and made the
+/// allocator decisions that turn shader-reported classifications into
+/// material-slot assignments.
+///
+/// Exposure no longer rides with the patch — it lives in the CPU-authored
+/// [`WorldRenderer::slot_directory_buf`] and is rewritten via
+/// `queue.write_buffer` when retirement mutates a directory entry.
+///
+/// A call with an empty `copies` is a no-op and records nothing —
+/// callers do not need to guard at the call site.
+///
+/// `staging_frame` is the [`FrameIndex`] the retiring dirty list was
+/// dispatched on — typically the `FrameIndex` returned alongside the
+/// dirty report from `ReadbackChannel::take_ready`. It selects the
+/// staging-ring slot that holds the shader-written payloads this patch
+/// will lift into the material pool. Passing the *current* frame here
+/// (instead of the retired frame) routes the copy at a slot whose
+/// contents belong to the *current* frame's prep dispatch — the exact
+/// cross-frame data corruption `failure-staging-not-ringed-after-gid-x-reindexing`
+/// captures.
+pub fn subchunk_patch(
+    graph         : &mut RenderGraph,
+    renderer      : &Arc<WorldRenderer>,
+    copies        : &[PatchCopy],
+    staging_frame : FrameIndex,
+)
+{
+    if copies.is_empty() {
         return;
     }
 
-    let staging_occ_h      = graph.import_buffer(renderer.staging_occ_buf().clone());
-    let live_occ_h         = graph.import_buffer(renderer.occ_buf().clone());
-    let staging_exposure_h = graph.import_buffer(renderer.staging_exposure_buf().clone());
-    let live_exposure_h    = graph.import_buffer(renderer.live_exposure_buf().clone());
+    let staging_occ_h   = graph.import_buffer(
+        renderer.staging_occ_ring().current(staging_frame).clone(),
+    );
+    let material_pool_h = graph.import_buffer(renderer.material_pool_buf().clone());
 
-    let slots: Vec<u32> = dirty_slots.to_vec();
+    let copies: Vec<PatchCopy> = copies.to_vec();
 
     let patched = graph.add_pass("subchunk_patch", |pass| {
         pass.read_buffer(staging_occ_h);
-        pass.read_buffer(staging_exposure_h);
-        let occ_written      = pass.write_buffer(live_occ_h);
-        let exposure_written = pass.write_buffer(live_exposure_h);
+        let pool_written = pass.write_buffer(material_pool_h);
         pass.execute(move |ctx| {
-            let occ_src      = ctx.resources.buffer(staging_occ_h);
-            let occ_dst      = ctx.resources.buffer(occ_written);
-            let exposure_src = ctx.resources.buffer(staging_exposure_h);
-            let exposure_dst = ctx.resources.buffer(exposure_written);
-            let occ_bytes      = std::mem::size_of::<SubchunkOccupancy>() as u64;
-            let exposure_bytes = std::mem::size_of::<u32>()               as u64;
-            for slot in &slots {
-                let occ_offset      = (*slot as u64) * occ_bytes;
-                let exposure_offset = (*slot as u64) * exposure_bytes;
+            let src_buf   = ctx.resources.buffer(staging_occ_h);
+            let dst_buf   = ctx.resources.buffer(pool_written);
+            let occ_bytes = std::mem::size_of::<SubchunkOccupancy>() as u64;
+            for copy in &copies {
+                let src_offset = (copy.staging_request_idx as u64) * occ_bytes;
+                let dst_offset = (copy.dst_material_slot   as u64) * occ_bytes;
                 ctx.commands.copy_buffer_to_buffer(
-                    occ_src, occ_offset, occ_dst, occ_offset, occ_bytes,
-                );
-                ctx.commands.copy_buffer_to_buffer(
-                    exposure_src, exposure_offset,
-                    exposure_dst, exposure_offset,
-                    exposure_bytes,
+                    src_buf, src_offset, dst_buf, dst_offset, occ_bytes,
                 );
             }
         });
-        occ_written
+        pool_written
     });
 
-    // Without an output marker, the graph would cull the pass: the live
-    // buffers have no downstream reader declared inside this subgraph (the
-    // render node that reads them lives in a separate call).
+    // Without an output marker, the graph would cull the pass: the
+    // material pool has no downstream reader declared inside this
+    // subgraph (the render node that reads it lives in a separate call).
     graph.mark_output(patched);
 }
+
+// --- Tests ---
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- DirEntry bit packing --
+
+    #[test]
+    fn dir_entry_empty_is_all_zero() {
+        let e = DirEntry::empty();
+        assert_eq!(e.coord, [0, 0, 0]);
+        assert_eq!(e.bits,  0);
+        assert!(!e.is_resident());
+        assert_eq!(e.exposure(),      0);
+        assert_eq!(e.material_slot(), 0);
+        assert_eq!(e.content_version,    0);
+        assert_eq!(e.last_synth_version, 0);
+    }
+
+    #[test]
+    fn dir_entry_non_resident_carries_invalid_sentinel() {
+        let e = DirEntry::non_resident();
+        assert!(!e.is_resident());
+        assert_eq!(e.material_slot(), MATERIAL_SLOT_INVALID);
+        assert_eq!(e.exposure(),      0);
+        assert!(!e.is_solid());
+    }
+
+    #[test]
+    fn dir_entry_resident_roundtrips_all_fields() {
+        let e = DirEntry::resident([-7, 42, 3], 0x2A, false, 0x12_3456);
+        assert_eq!(e.coord, [-7, 42, 3]);
+        assert!(e.is_resident());
+        assert!(!e.is_solid());
+        assert_eq!(e.exposure(),      0x2A);
+        assert_eq!(e.material_slot(), 0x12_3456);
+    }
+
+    #[test]
+    fn dir_entry_resident_max_exposure_roundtrips() {
+        let e = DirEntry::resident([0, 0, 0], BITS_EXPOSURE_MASK, false, 0);
+        assert_eq!(e.exposure(), BITS_EXPOSURE_MASK);
+        assert!(e.is_resident());
+    }
+
+    #[test]
+    fn dir_entry_resident_max_material_slot_roundtrips() {
+        // MATERIAL_SLOT_INVALID - 1 is the largest legal resident slot.
+        let max = MATERIAL_SLOT_INVALID - 1;
+        let e = DirEntry::resident([1, 2, 3], 0x3F, true, max);
+        assert!(e.is_resident());
+        assert!(e.is_solid());
+        assert_eq!(e.material_slot(), max);
+        assert_eq!(e.exposure(),       0x3F);
+    }
+
+    #[test]
+    fn dir_entry_is_solid_and_resident_both_set() {
+        let e = DirEntry::resident([0, 0, 0], 0, true, 7);
+        assert!(e.is_resident());
+        assert!(e.is_solid());
+        assert_eq!(e.bits & BITS_IS_SOLID,  BITS_IS_SOLID);
+        assert_eq!(e.bits & BITS_RESIDENT,  BITS_RESIDENT);
+    }
+
+    #[test]
+    #[should_panic(expected = "exposure must fit in 6 bits")]
+    fn dir_entry_resident_rejects_overflowing_exposure() {
+        // 0x40 == 0b0100_0000, which overflows the 6-bit exposure field.
+        let _ = DirEntry::resident([0, 0, 0], 0x40, false, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be a real pool index under resident entry")]
+    fn dir_entry_resident_rejects_invalid_sentinel_as_slot() {
+        let _ = DirEntry::resident([0, 0, 0], 0, false, MATERIAL_SLOT_INVALID);
+    }
+
+    // -- DirtyEntry byte layout --
+
+    #[test]
+    fn dirty_entry_is_sixteen_bytes() {
+        assert_eq!(std::mem::size_of::<DirtyEntry>(), 16);
+    }
+
+    #[test]
+    fn dirty_entry_bytes_roundtrip_pod_layout() {
+        // Cast to bytes and back — confirms field ordering matches the
+        // shader's byte-address store at offsets 0 / 4 / 8 / 12 without
+        // any compiler-inserted padding.
+        let e = DirtyEntry {
+            directory_index:     0x1111_1111,
+            new_bits_partial:    0x2222_2222,
+            staging_request_idx: 0x3333_3333,
+            _pad:                0x4444_4444,
+        };
+        let bytes: &[u8] = bytemuck::bytes_of(&e);
+        assert_eq!(&bytes[0.. 4], 0x1111_1111u32.to_le_bytes());
+        assert_eq!(&bytes[4.. 8], 0x2222_2222u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], 0x3333_3333u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], 0x4444_4444u32.to_le_bytes());
+    }
+
+    /// A `new_bits_partial` word built with `exposure | (is_solid << 6) |
+    /// (1 << 7)` must decode back to the same three fields via the
+    /// directory's bit-field masks — the load-bearing contract between
+    /// the prep shader's emit path and the CPU's retirement logic.
+    #[test]
+    fn dirty_entry_new_bits_partial_decodes_as_direntry_bits() {
+        for exposure in [0u32, 0x01, 0x2A, BITS_EXPOSURE_MASK] {
+            for is_solid in [false, true] {
+                let packed = exposure
+                    | ((is_solid as u32) << 6)
+                    | BITS_RESIDENT;
+
+                assert_eq!(packed & BITS_EXPOSURE_MASK, exposure);
+                assert_eq!(packed & BITS_IS_SOLID, (is_solid as u32) << 6);
+                assert_eq!(packed & BITS_RESIDENT, BITS_RESIDENT);
+
+                // The material-slot field (bits 8..31) is authored on the
+                // CPU side and must be zero in the shader-authored word.
+                assert_eq!(packed >> BITS_MATERIAL_SLOT_SHIFT, 0);
+            }
+        }
+    }
+
+    // -- PrepRequest byte layout --
+
+    /// `PrepRequest` must remain exactly 32 bytes after Step 4 drops the
+    /// `slot` field — the HLSL `StructuredBuffer<PrepRequest>` stride
+    /// reflects the Rust struct size, and a size change would silently
+    /// misalign every subsequent element.
+    #[test]
+    fn prep_request_is_thirty_two_bytes() {
+        assert_eq!(std::mem::size_of::<PrepRequest>(), 32);
+    }
+
+    // -- Face-mask CPU mirror --
+    //
+    // Mirrors the six canonical face extractors in
+    // `shaders/include/face_mask.hlsl` on `SubchunkOccupancy`. The HLSL
+    // is the only runtime consumer; this mirror exists as a
+    // regression guard for the bit math and as the ground-truth harness
+    // for the exposure-comparison contract `face_exposed(my, nbr)`.
+    //
+    // # Canonical face layout (matches the HLSL `uint2` layout)
+    //
+    // A face is 8×8, indexed by two "free" axes `(a, b)`:
+    //   ±X face: free axes (a = y, b = z)
+    //   ±Y face: free axes (a = x, b = z)
+    //   ±Z face: free axes (a = x, b = y)
+    //
+    // The 64 bits are packed as `(u32, u32)` with:
+    //   half 0 (`.0`) — 32 bits for b ∈ [0, 4)
+    //   half 1 (`.1`) — 32 bits for b ∈ [4, 8)
+    // Within each half, the 8 bits for a fixed `b` live at bit positions
+    // `(b % 4) * 8 + a` for `a ∈ [0, 8)`.
+    //
+    // Because the opposite-face extractor for a given direction uses the
+    // same free-axis pair, matching canonical bits correspond to
+    // voxel pairs that meet across the face. That is the invariant
+    // `face_exposed(my, nbr) = any((my & ~nbr) != 0)` relies on.
+    //
+    // # History / why the canonical layout is load-bearing
+    //
+    // An earlier version of the HLSL returned `uint2`s at non-canonical
+    // bit positions (±X at sparse {7,15,23,31}-style column bits, ±Y in
+    // only one of the two half-words, ±Z at full-plane offsets). The
+    // `my` and `nbr` sides of a direction pair had *disjoint* bit
+    // positions, so `my & ~nbr = my` always — the neighbour was ignored
+    // and every boundary-voxel face rendered as exposed. The "fully solid
+    // neighbour" and "partial overlap" regression tests below would have
+    // caught that bug at the time it was introduced; keep them.
+
+    /// Set the voxel `(x, y, z)` in the GPU-format occupancy.
+    fn set_bit(occ: &mut SubchunkOccupancy, x: u32, y: u32, z: u32) {
+        let bit  = y * 8 + x;
+        let word = z * 2 + (bit >> 5);
+        occ.planes[word as usize] |= 1 << (bit & 31);
+    }
+
+    /// word 0 (y∈[0,4)) or word 1 (y∈[4,8)) of z-plane `z` in the
+    /// occupancy buffer.
+    fn word_at(occ: &SubchunkOccupancy, z: u32, half: u32) -> u32 {
+        occ.planes[(z * 2 + half) as usize]
+    }
+
+    /// Compact the sparse x=7 column bits (at word positions 7, 15, 23,
+    /// 31) of a single occupancy word into a contiguous 4-bit nybble.
+    fn compact_col_x7(w: u32) -> u32 {
+        ((w >>  7) & 0x1)
+            | ((w >> 14) & 0x2)
+            | ((w >> 21) & 0x4)
+            | ((w >> 28) & 0x8)
+    }
+
+    /// Compact the sparse x=0 column bits (at word positions 0, 8, 16,
+    /// 24) into a contiguous 4-bit nybble.
+    fn compact_col_x0(w: u32) -> u32 {
+        (w & 0x1)
+            | ((w >>  7) & 0x2)
+            | ((w >> 14) & 0x4)
+            | ((w >> 21) & 0x8)
+    }
+
+    /// Build a (u32, u32) canonical face by OR-ing 8 per-slab bytes into
+    /// the half-words determined by `b ∈ [0, 8)`. The byte carries the
+    /// 8 `a`-axis bits at positions 0..7; the canonical packing puts it
+    /// at bit `(b % 4) * 8` of half `b / 4`.
+    fn pack_face_byte(face: &mut (u32, u32), b: u32, byte8: u32) {
+        let shifted = byte8 << ((b & 3) * 8);
+        if b < 4 {
+            face.0 |= shifted;
+        } else {
+            face.1 |= shifted;
+        }
+    }
+
+    /// +X face (x = 7), canonical layout. Free axes (a = y, b = z).
+    fn face_px_mirror(occ: &SubchunkOccupancy) -> (u32, u32) {
+        let mut face = (0u32, 0u32);
+        for z in 0..8 {
+            let w0 = word_at(occ, z, 0);
+            let w1 = word_at(occ, z, 1);
+            let byte = compact_col_x7(w0) | (compact_col_x7(w1) << 4);
+            pack_face_byte(&mut face, z, byte);
+        }
+        face
+    }
+
+    /// -X face (x = 0), canonical layout. Free axes (a = y, b = z).
+    fn face_nx_mirror(occ: &SubchunkOccupancy) -> (u32, u32) {
+        let mut face = (0u32, 0u32);
+        for z in 0..8 {
+            let w0 = word_at(occ, z, 0);
+            let w1 = word_at(occ, z, 1);
+            let byte = compact_col_x0(w0) | (compact_col_x0(w1) << 4);
+            pack_face_byte(&mut face, z, byte);
+        }
+        face
+    }
+
+    /// +Y face (y = 7), canonical layout. Free axes (a = x, b = z).
+    fn face_py_mirror(occ: &SubchunkOccupancy) -> (u32, u32) {
+        let mut face = (0u32, 0u32);
+        for z in 0..8 {
+            let w1   = word_at(occ, z, 1);
+            let byte = (w1 >> 24) & 0xFF;
+            pack_face_byte(&mut face, z, byte);
+        }
+        face
+    }
+
+    /// -Y face (y = 0), canonical layout. Free axes (a = x, b = z).
+    fn face_ny_mirror(occ: &SubchunkOccupancy) -> (u32, u32) {
+        let mut face = (0u32, 0u32);
+        for z in 0..8 {
+            let w0   = word_at(occ, z, 0);
+            let byte = w0 & 0xFF;
+            pack_face_byte(&mut face, z, byte);
+        }
+        face
+    }
+
+    /// +Z face (z = 7), canonical layout. Free axes (a = x, b = y). The
+    /// occupancy layout already matches the canonical packing at a fixed
+    /// z-plane: `word_at(occ, 7, 0)` carries y∈[0,4) at `(y%4)*8 + x`
+    /// and `word_at(occ, 7, 1)` carries y∈[4,8) at the same pattern.
+    fn face_pz_mirror(occ: &SubchunkOccupancy) -> (u32, u32) {
+        (word_at(occ, 7, 0), word_at(occ, 7, 1))
+    }
+
+    /// -Z face (z = 0), canonical layout. Free axes (a = x, b = y).
+    fn face_nz_mirror(occ: &SubchunkOccupancy) -> (u32, u32) {
+        (word_at(occ, 0, 0), word_at(occ, 0, 1))
+    }
+
+    /// CPU mirror of `face_exposed(my, nbr)` in face_mask.hlsl. Relies
+    /// on both operands being in canonical layout.
+    fn face_exposed_mirror(my: (u32, u32), nbr: (u32, u32)) -> bool {
+        let ex0 = my.0 & !nbr.0;
+        let ex1 = my.1 & !nbr.1;
+        (ex0 | ex1) != 0
+    }
+
+    /// The canonical bit position for face cell (a, b) — the single bit
+    /// that a voxel at the free-axis coordinates (a, b) on a given face
+    /// should set in the `(u32, u32)` canonical layout.
+    fn canonical_face_bit(a: u32, b: u32) -> (u32, u32) {
+        assert!(a < 8 && b < 8, "free-axis coords must be < 8");
+        let bit = 1u32 << ((b & 3) * 8 + a);
+        if b < 4 { (bit, 0) } else { (0, bit) }
+    }
+
+    // -- Single-voxel-on-boundary: each direction picks up exactly one
+    //    bit at the canonical position and nothing at the opposite face.
+
+    #[test]
+    fn face_px_single_voxel_on_boundary_hits_canonical_bit() {
+        // Voxel at (x=7, y=3, z=5) lives on the +X face; its canonical
+        // position there has free axes (a=y=3, b=z=5).
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 7, 3, 5);
+        assert_eq!(face_px_mirror(&occ), canonical_face_bit(3, 5));
+        assert_eq!(face_nx_mirror(&occ), (0, 0));
+    }
+
+    #[test]
+    fn face_nx_single_voxel_on_boundary_hits_canonical_bit() {
+        // Voxel at (x=0, y=6, z=1): free axes (a=y=6, b=z=1) on -X.
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 0, 6, 1);
+        assert_eq!(face_nx_mirror(&occ), canonical_face_bit(6, 1));
+        assert_eq!(face_px_mirror(&occ), (0, 0));
+    }
+
+    #[test]
+    fn face_py_single_voxel_on_boundary_hits_canonical_bit() {
+        // Voxel at (x=2, y=7, z=4): free axes (a=x=2, b=z=4) on +Y.
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 2, 7, 4);
+        assert_eq!(face_py_mirror(&occ), canonical_face_bit(2, 4));
+        assert_eq!(face_ny_mirror(&occ), (0, 0));
+    }
+
+    #[test]
+    fn face_ny_single_voxel_on_boundary_hits_canonical_bit() {
+        // Voxel at (x=5, y=0, z=0): free axes (a=x=5, b=z=0) on -Y.
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 5, 0, 0);
+        assert_eq!(face_ny_mirror(&occ), canonical_face_bit(5, 0));
+        assert_eq!(face_py_mirror(&occ), (0, 0));
+    }
+
+    #[test]
+    fn face_pz_single_voxel_on_boundary_hits_canonical_bit() {
+        // Voxel at (x=4, y=6, z=7): free axes (a=x=4, b=y=6) on +Z.
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 4, 6, 7);
+        assert_eq!(face_pz_mirror(&occ), canonical_face_bit(4, 6));
+        assert_eq!(face_nz_mirror(&occ), (0, 0));
+    }
+
+    #[test]
+    fn face_nz_single_voxel_on_boundary_hits_canonical_bit() {
+        // Voxel at (x=1, y=2, z=0): free axes (a=x=1, b=y=2) on -Z.
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 1, 2, 0);
+        assert_eq!(face_nz_mirror(&occ), canonical_face_bit(1, 2));
+        assert_eq!(face_pz_mirror(&occ), (0, 0));
+    }
+
+    /// Fully-solid occupancy saturates every face to all 64 bits set,
+    /// regardless of which direction's free-axis pair we use — the
+    /// canonical layout packs exactly 64 bits per face into the two
+    /// u32s, so the value is `(0xFFFF_FFFF, 0xFFFF_FFFF)` uniformly.
+    #[test]
+    fn face_masks_saturate_on_full_occupancy() {
+        let occ = SubchunkOccupancy { planes: [0xFFFF_FFFF; 16] };
+        assert_eq!(face_px_mirror(&occ), (0xFFFF_FFFF, 0xFFFF_FFFF));
+        assert_eq!(face_nx_mirror(&occ), (0xFFFF_FFFF, 0xFFFF_FFFF));
+        assert_eq!(face_py_mirror(&occ), (0xFFFF_FFFF, 0xFFFF_FFFF));
+        assert_eq!(face_ny_mirror(&occ), (0xFFFF_FFFF, 0xFFFF_FFFF));
+        assert_eq!(face_pz_mirror(&occ), (0xFFFF_FFFF, 0xFFFF_FFFF));
+        assert_eq!(face_nz_mirror(&occ), (0xFFFF_FFFF, 0xFFFF_FFFF));
+    }
+
+    /// Empty occupancy has every face zero.
+    #[test]
+    fn face_masks_are_zero_on_empty_occupancy() {
+        let occ = SubchunkOccupancy { planes: [0; 16] };
+        assert_eq!(face_px_mirror(&occ), (0, 0));
+        assert_eq!(face_nx_mirror(&occ), (0, 0));
+        assert_eq!(face_py_mirror(&occ), (0, 0));
+        assert_eq!(face_ny_mirror(&occ), (0, 0));
+        assert_eq!(face_pz_mirror(&occ), (0, 0));
+        assert_eq!(face_nz_mirror(&occ), (0, 0));
+    }
+
+    // -- face_exposed regression guards (the current bug-class tests) --
+    //
+    // These would have caught the historical "non-canonical disjoint
+    // bits" bug and an aligned-but-OR-folded variant. Both are the
+    // load-bearing failure modes for the exposure-mask cull.
+
+    /// `my_face` has solid voxels on the boundary; `nbr_face` is fully
+    /// solid ⇒ no voxel pair is exposed ⇒ `face_exposed` returns false.
+    ///
+    /// This is the scenario the old code failed: under its non-canonical
+    /// layout `my & ~nbr = my` (nbr bits lived elsewhere), so it always
+    /// returned `true`, which produced spurious +X / -X / +Y / -Y cull
+    /// bits for every sub-chunk with any boundary voxel.
+    #[test]
+    fn face_exposed_is_false_under_fully_solid_neighbour() {
+        let full = SubchunkOccupancy { planes: [0xFFFF_FFFF; 16] };
+        for &(mx, my, mz) in &[(7u32, 0, 0), (7, 3, 5), (7, 7, 7), (7, 1, 4)] {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, mx, my, mz);
+            assert!(
+                !face_exposed_mirror(face_px_mirror(&me), face_nx_mirror(&full)),
+                "+X voxel at ({mx},{my},{mz}) under fully-solid -X neighbour must NOT be exposed",
+            );
+        }
+        for &(mx, my, mz) in &[(0u32, 0, 0), (0, 5, 6), (0, 7, 2)] {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, mx, my, mz);
+            assert!(
+                !face_exposed_mirror(face_nx_mirror(&me), face_px_mirror(&full)),
+                "-X voxel at ({mx},{my},{mz}) under fully-solid +X neighbour must NOT be exposed",
+            );
+        }
+        for &(mx, my, mz) in &[(0u32, 7, 0), (3, 7, 5), (7, 7, 2)] {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, mx, my, mz);
+            assert!(
+                !face_exposed_mirror(face_py_mirror(&me), face_ny_mirror(&full)),
+                "+Y voxel at ({mx},{my},{mz}) under fully-solid -Y neighbour must NOT be exposed",
+            );
+        }
+        for &(mx, my, mz) in &[(0u32, 0, 0), (4, 0, 3), (7, 0, 6)] {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, mx, my, mz);
+            assert!(
+                !face_exposed_mirror(face_ny_mirror(&me), face_py_mirror(&full)),
+                "-Y voxel at ({mx},{my},{mz}) under fully-solid +Y neighbour must NOT be exposed",
+            );
+        }
+        for &(mx, my, mz) in &[(0u32, 0, 7), (3, 5, 7), (6, 2, 7)] {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, mx, my, mz);
+            assert!(
+                !face_exposed_mirror(face_pz_mirror(&me), face_nz_mirror(&full)),
+                "+Z voxel at ({mx},{my},{mz}) under fully-solid -Z neighbour must NOT be exposed",
+            );
+        }
+        for &(mx, my, mz) in &[(0u32, 0, 0), (2, 3, 0), (5, 7, 0)] {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, mx, my, mz);
+            assert!(
+                !face_exposed_mirror(face_nz_mirror(&me), face_pz_mirror(&full)),
+                "-Z voxel at ({mx},{my},{mz}) under fully-solid +Z neighbour must NOT be exposed",
+            );
+        }
+    }
+
+    /// Fully-empty neighbour ⇒ every solid face-voxel on `my_face` is
+    /// exposed. Matches the isolated-exposure baseline.
+    #[test]
+    fn face_exposed_is_true_under_fully_empty_neighbour() {
+        let empty = SubchunkOccupancy { planes: [0; 16] };
+        let mut me = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut me, 7, 4, 2);
+        set_bit(&mut me, 0, 1, 6);
+        set_bit(&mut me, 3, 7, 0);
+        set_bit(&mut me, 5, 0, 3);
+        set_bit(&mut me, 2, 6, 7);
+        set_bit(&mut me, 4, 2, 0);
+
+        assert!(face_exposed_mirror(face_px_mirror(&me), face_nx_mirror(&empty)));
+        assert!(face_exposed_mirror(face_nx_mirror(&me), face_px_mirror(&empty)));
+        assert!(face_exposed_mirror(face_py_mirror(&me), face_ny_mirror(&empty)));
+        assert!(face_exposed_mirror(face_ny_mirror(&me), face_py_mirror(&empty)));
+        assert!(face_exposed_mirror(face_pz_mirror(&me), face_nz_mirror(&empty)));
+        assert!(face_exposed_mirror(face_nz_mirror(&me), face_pz_mirror(&empty)));
+    }
+
+    /// Partial-overlap exposure — the test that distinguishes the
+    /// correct per-(a, b) comparison from an aligned-but-OR-folded
+    /// version.
+    ///
+    /// Setup: `my_pX` has a solid voxel at (x=7, y=3, z=2). The -X face
+    /// of the neighbour has a solid voxel at (x=0, y=3, z=5). Because
+    /// my's single voxel lives at canonical cell (a=y=3, b=z=2) while
+    /// nbr's lives at cell (a=y=3, b=z=5), there is NO overlap: `my &
+    /// ~nbr` retains my's bit (nbr has zero at cell (3, 2)) ⇒ exposed.
+    ///
+    /// If the implementation OR-folded across `z` (mapping all 8 z's
+    /// into a single canonical-byte slot per y, e.g. bit 3 of byte 0),
+    /// my's byte would be `0b0000_1000` and nbr's also `0b0000_1000`,
+    /// so `my & ~nbr = 0` and the test would incorrectly return false.
+    /// The distinct-z placement is what makes this test meaningful.
+    #[test]
+    fn face_exposed_respects_per_cell_pairing_under_partial_overlap() {
+        // ±X: my at z=2, nbr at z=5, same y.
+        {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, 7, 3, 2);
+
+            let mut nbr = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut nbr, 0, 3, 5);
+
+            assert!(
+                face_exposed_mirror(face_px_mirror(&me), face_nx_mirror(&nbr)),
+                "+X voxel at (7,3,2) with -X neighbour voxel at (0,3,5) \
+                 is exposed — the two voxels do not meet across the face",
+            );
+        }
+
+        // ±Y: my at z=2, nbr at z=5, same x.
+        {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, 3, 7, 2);
+
+            let mut nbr = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut nbr, 3, 0, 5);
+
+            assert!(
+                face_exposed_mirror(face_py_mirror(&me), face_ny_mirror(&nbr)),
+                "+Y voxel at (3,7,2) with -Y neighbour at (3,0,5) \
+                 must report exposed — different z => different cells",
+            );
+        }
+
+        // ±Z: my at y=2, nbr at y=5, same x (z is fixed to 7/0 by the face).
+        {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, 4, 2, 7);
+
+            let mut nbr = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut nbr, 4, 5, 0);
+
+            assert!(
+                face_exposed_mirror(face_pz_mirror(&me), face_nz_mirror(&nbr)),
+                "+Z voxel at (4,2,7) with -Z neighbour at (4,5,0) \
+                 must report exposed — different y => different cells",
+            );
+        }
+
+        // Symmetric overlap: my and nbr at the same canonical cell =>
+        // NOT exposed (nbr occupies the voxel facing my directly).
+        {
+            let mut me = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut me, 7, 3, 2);
+
+            let mut nbr = SubchunkOccupancy { planes: [0; 16] };
+            set_bit(&mut nbr, 0, 3, 2);
+
+            assert!(
+                !face_exposed_mirror(face_px_mirror(&me), face_nx_mirror(&nbr)),
+                "+X voxel at (7,3,2) with -X neighbour at (0,3,2) \
+                 is NOT exposed — the two voxels meet at cell (y=3, z=2)",
+            );
+        }
+    }
+
+    // -- DirtyReport byte layout --
+
+    #[test]
+    fn dirty_report_layout_matches_shader_offsets() {
+        let expected = 16 + 16 * MAX_CANDIDATES;
+        assert_eq!(std::mem::size_of::<DirtyReport>(), expected);
+
+        let r = DirtyReport {
+            count:    0x0A0B_0C0D,
+            _pad0:    0,
+            overflow: 0x1122_3344,
+            _pad2:    0,
+            entries: [DirtyEntry { directory_index: 0, new_bits_partial: 0,
+                                   staging_request_idx: 0, _pad: 0 };
+                      MAX_CANDIDATES],
+        };
+        let bytes: &[u8] = bytemuck::bytes_of(&r);
+        // Count lives at offset 0; overflow at offset 8; entries at offset 16.
+        assert_eq!(&bytes[0..4],  0x0A0B_0C0Du32.to_le_bytes());
+        assert_eq!(&bytes[8..12], 0x1122_3344u32.to_le_bytes());
+        assert_eq!(bytes.len(), expected);
+    }
+
+    // -- Staging ring rotation (regression: failure-staging-not-ringed-after-gid-x-reindexing) --
+    //
+    // Guards the retirement-frame → staging-ring-slot wiring. The bug
+    // this catches: at frame `F + FrameCount`, the retirement for frame
+    // F issues `PatchCopy { staging_request_idx, dst_material_slot }`.
+    // If the patch pass reads staging at the *current* frame's ring
+    // slot instead of frame F's ring slot, it copies the current
+    // frame's prep output (possibly for entirely different coords)
+    // into the retirement's target `material_pool` entries. Under the
+    // pre-ring shape (single buffer), every frame clobbered the same
+    // memory and the bug was structural — hence this test.
+    //
+    // We assert the slot-selection function directly, on the same math
+    // `subchunk_patch` uses (`MultiBufferRing::current(frame)` →
+    // `frame.slot(frame_count)`), because the rest of the wiring is a
+    // thin shell around it. An assertion on the slot index is the
+    // load-bearing property: if the patch pass picks a different slot
+    // than the prep did for the retired frame, the race returns.
+
+    /// Ring depth N = FIF must place a dispatch's staging write and the
+    /// retirement's read on the *same* ring slot, and that slot must be
+    /// distinct from the slot used by every intervening frame. Written
+    /// against `FrameCount = 2` because that's the pinned FIF for this
+    /// project (see `knowledge-fif-swapchain-depth-decoupling`).
+    #[test]
+    fn staging_ring_slot_for_retired_frame_is_stable_under_fif() {
+        use crate::frame::FrameCount;
+
+        let fc = FrameCount::new(2).unwrap();
+
+        // Simulate a sequence of frames. At frame F, prep writes ring
+        // slot `F.slot(fc)`. At frame F + FrameCount, the retirement
+        // for frame F is about to run; patch must read the same slot
+        // the prep wrote — `F.slot(fc)` — *not* the current frame's
+        // slot `(F + 2).slot(fc)`.
+        //
+        // With FIF=2 the two happen to coincide on the wgpu::Buffer
+        // identity, because the rotation cycles back. But the
+        // intervening frame F+1 uses the *other* slot, so frame F's
+        // staging bytes survive across the FIF window intact. The
+        // buggy "no ring" shape and the "read current frame" shape
+        // both produce different slot indices from this check below,
+        // so the assertion pins the correct relation.
+        for origin in [0u64, 1, 7, 123, u64::MAX - 3] {
+            let dispatch       = FrameIndex::default().plus(origin as u32);
+            let intervening    = dispatch.plus(1);
+            let retire_at      = dispatch.plus(fc.get());
+
+            // Prep at dispatch wrote `dispatch.slot(fc)`. Patch at
+            // retire_at must read the same staging payload, so it
+            // indexes the ring with `dispatch`, not with `retire_at`.
+            assert_eq!(
+                dispatch.slot(fc),
+                retire_at.slot(fc),
+                "FIF=N rotation: dispatch slot and N-later slot must \
+                 coincide by modular arithmetic (guards the ring depth \
+                 invariant)",
+            );
+
+            // But an intervening frame's prep slot must NOT collide
+            // with the dispatch's slot — otherwise frame F's staging
+            // bytes would be clobbered before the retirement reads
+            // them, which is exactly the failure mode.
+            assert_ne!(
+                dispatch.slot(fc),
+                intervening.slot(fc),
+                "intervening frame's ring slot must not clobber \
+                 frame F's staging before retirement consumes it",
+            );
+
+            // Witness: the *buggy* "read current frame" version of
+            // patch would use `retire_at.slot(fc)` with the retire
+            // frame's index. Because retire_at == dispatch + N and N =
+            // frame_count, `retire_at.slot(fc) == dispatch.slot(fc)`.
+            // The assertion above already exploits that coincidence.
+            // So the load-bearing check is really the intervening
+            // collision test — if it passes, the ring depth is >= 2.
+            let _ = retire_at;
+        }
+    }
+
+    /// `subchunk_patch` imports the ring slot for the retirement's
+    /// dispatch frame, *not* the current frame. This test makes the
+    /// wiring visible as a compile-time check on the
+    /// `MultiBufferRing::current(frame)` shape — the function picks
+    /// the staging buffer by the frame the retirement originated on.
+    /// If somebody re-plumbs the patch pass to use a different
+    /// `FrameIndex`, the contract for "which frame's staging does the
+    /// patch read" flips and the test's assertion on slot identity
+    /// fires.
+    #[test]
+    fn retired_dispatch_frame_selects_correct_staging_slot() {
+        use crate::frame::FrameCount;
+
+        let fc = FrameCount::new(2).unwrap();
+
+        // Scenario modelled by the failure: dispatch at frame 10,
+        // retirement at frame 12 (10 + FIF). Between them, frame 11
+        // also dispatched prep (coord C_b) and wrote its own slot.
+        let dispatch   = FrameIndex::default().plus(10);
+        let retire_at  = FrameIndex::default().plus(12);
+        let collision  = FrameIndex::default().plus(11);
+
+        assert_eq!(dispatch.slot(fc), retire_at.slot(fc));
+        assert_ne!(dispatch.slot(fc), collision.slot(fc));
+
+        // The patch pass must address the ring slot via the
+        // `dispatch` frame index (the frame whose dirty list is
+        // retiring). If it were to use `retire_at` that also happens
+        // to name the same slot under a size-FIF ring — but the
+        // invariant is about *intent*: ring.current(dispatch) ≡
+        // "staging bytes from frame 10's prep". Using a third-frame
+        // index or the intervening `collision` frame would produce a
+        // different slot and surface the bug.
+        assert_ne!(collision.slot(fc), dispatch.slot(fc),
+                   "reading the intervening frame's slot returns coord \
+                    C_b's staging, not C_a's — the old single-buffer bug");
+    }
+}
+

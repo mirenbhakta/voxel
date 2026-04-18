@@ -8,7 +8,15 @@
 
 pub mod coord;
 pub mod lod;
+pub mod material_pool;
 pub mod pool;
 pub mod residency;
 pub mod shell;
+pub mod slot_directory;
 pub mod subchunk;
+
+#[cfg(feature = "debug-state-history")]
+pub mod state_history;
+
+#[cfg(feature = "debug-state-history")]
+pub mod divergence;

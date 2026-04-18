@@ -15,4 +15,4 @@ pub use cull::{CullArgs, cull};
 pub use indirect_args::IndirectArgs;
 pub use mdi_draw::{DrawArgs, mdi_draw};
 
-pub use crate::subchunk::{subchunk_patch, subchunk_prep, subchunk_world};
+pub use crate::subchunk::{subchunk_exposure, subchunk_patch, subchunk_prep, subchunk_world};
