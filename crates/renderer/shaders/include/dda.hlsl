@@ -471,34 +471,50 @@ MarchResult dda_world(float3 origin_ws, float3 dir_ws, float max_t_ws, uint leve
     return miss;
 }
 
-// --- World-space DDA across LOD levels (classical clipmap promotion). ---
+// --- World-space DDA across LOD levels (demote-and-promote clipmap). ---
 //
-// Walks a world-space ray through the overlapping clipmap occupancy grid,
-// starting at `min_level` and promoting to the next coarser level whenever
-// the outer DDA steps into a non-resident cell (= ray exited the current
-// level's shell). Does not demote back to finer levels; classical clipmap
-// rule. Terminates when the ray promotes past the coarsest resident level,
-// when `t` exceeds `max_t_ws`, or on the first occupancy hit.
+// Walks a world-space ray through the nested-shell occupancy hierarchy,
+// always marching at the *finest* level resident at the ray's current
+// position. Each outer iteration:
 //
-// # Overlapping-clipmap substrate
+//   1. If a finer level is resident at the current cell's world position,
+//      demote one level (`cell = (cell << 1) | sub_octant`).
+//   2. Resolve the cell at the current level. If non-resident, promote one
+//      level (`cell = cell >> 1`); the loop will re-evaluate residency.
+//   3. Otherwise march the inner DDA across the resident sub-chunk. On a
+//      hit, return. On a miss, advance to the next outer cell.
 //
-// Nested-shell LOD (`decision-lod-nested-shells-hierarchical-occupancy`)
-// partitions *primary-ray rendering* so each pixel comes from exactly one
-// level, but the underlying occupancy *data* at each level overlaps: a
-// region resident at L0 is also resident at L1, L2, etc. Worldgen
-// OR-propagates fine authored content up the hierarchy so coarser levels
-// are conservatively solid relative to finer. Together these make classical
-// clipmap promotion correct: once the ray exits L_n's shell, L_(n+1)
-// covers the same region (and more), and will never miss an occluder the
-// finer level would have reported.
+// Terminates when the ray promotes past the coarsest resident level, when
+// `t` exceeds `max_t_ws`, or on the first occupancy hit.
+//
+// # Why demote (departure from classical clipmap)
+//
+// Classical clipmap is promote-only — once a ray accepts coarser
+// resolution, it stays coarse. That rule is wrong for shadow rays. The
+// occupancy *data* at each level overlaps under nested-shell residency: a
+// region resident at L0 is also resident at L1, L2, etc., and worldgen
+// OR-propagates so coarser levels are conservatively solid relative to
+// finer. A promote-only ray that exits L0's shell into L1-only territory
+// stays at L1 for the rest of the march, even after re-entering L0's
+// shell — and L1's OR-reduced occupancy lights up false occluders at the
+// 2 m granularity where the actual L0 data has no occluder along the
+// ray's path. Demote restores the invariant "use the finest data
+// available at every step."
+//
+// # ≤ 1 transition per outer step
+//
+// Nested shells have distinct per-axis extents (L0: ±2 sub-chunks at 8 m =
+// ±16 m; L1: ±2 sub-chunks at 16 m = ±32 m; ...), so any single outer step
+// crosses at most one shell boundary on the stepping axis. One demote
+// probe per iteration is enough — no while-loop cascade.
 //
 // # min_level selection
 //
-// Callers should pass the finest level that is resident at the ray origin.
-// For a secondary ray spawned at a primary hit, that is the primary hit's
-// `level_idx` — L0 is not resident at coarser-level hit positions, so
-// starting there would just burn iterations on non-resident cells until
-// the ray promotes to the hit's actual level.
+// Callers can pass any level — the loop will demote down to the finest
+// resident level on iteration 0 if needed, and promote when the ray
+// leaves a level's shell. Passing `0u` is the simplest contract: start at
+// the finest, promote upward as needed. The receiver's primary-hit level
+// is also fine and saves one demote when the receiver is at L_n>0.
 //
 // # Parameters
 //
@@ -560,6 +576,63 @@ MarchResult dda_world_clipmap(
     for (uint i = 0u; i < 256u; i++) {
         if (t_outer > max_t_ws) {
             break;
+        }
+
+        // --- Demote check ---
+        //
+        // If the next-finer level is resident at the current world position,
+        // descend one level before resolving the current cell. Single probe
+        // is sufficient: nested-shell extents differ per axis, so an outer
+        // step crosses at most one shell boundary at a time and the ray can
+        // re-enter at most one finer shell per iteration.
+        //
+        // The finer-cell coord is derived via `floor(probe_pos / finer_sc_size)`
+        // on a forward-nudged position. The nudge mirrors the promote-side
+        // nudge below: at the moment of an outer step, `t_outer` sits on a
+        // coarse-cell face that coincides with a finer-voxel face, and a
+        // bare `floor(pos / finer_sc_size)` would FP-flicker between the
+        // old-side and new-side finer cells. Pushing the probe `1e-5` of the
+        // finer sc_size past the boundary pins it to the new side.
+        if (level > 0u) {
+            uint  finer_level    = level - 1u;
+            float finer_voxel_sz = float(1u << finer_level);
+            float finer_sc_size  = 8.0 * finer_voxel_sz;
+
+            float3 probe_pos  = origin_ws
+                              + (t_outer + finer_sc_size * 1e-5) * dir_ws;
+            int3   finer_cell = int3(floor(probe_pos / finer_sc_size));
+
+            uint finer_slot;
+            if (resolve_and_verify(finer_cell, finer_level, g_directory, finer_slot)) {
+                cell       = finer_cell;
+                level      = finer_level;
+                voxel_size = finer_voxel_sz;
+                sc_size    = finer_sc_size;
+
+                if (step.x != 0) {
+                    float boundary = step.x > 0 ? float(cell.x + 1) * sc_size
+                                                 : float(cell.x)     * sc_size;
+                    t_next.x  = (boundary - origin_ws.x) / dir_ws.x;
+                    t_delta.x = abs(sc_size / dir_ws.x);
+                } else { t_next.x = HUGE; t_delta.x = HUGE; }
+                if (step.y != 0) {
+                    float boundary = step.y > 0 ? float(cell.y + 1) * sc_size
+                                                 : float(cell.y)     * sc_size;
+                    t_next.y  = (boundary - origin_ws.y) / dir_ws.y;
+                    t_delta.y = abs(sc_size / dir_ws.y);
+                } else { t_next.y = HUGE; t_delta.y = HUGE; }
+                if (step.z != 0) {
+                    float boundary = step.z > 0 ? float(cell.z + 1) * sc_size
+                                                 : float(cell.z)     * sc_size;
+                    t_next.z  = (boundary - origin_ws.z) / dir_ws.z;
+                    t_delta.z = abs(sc_size / dir_ws.z);
+                } else { t_next.z = HUGE; t_delta.z = HUGE; }
+
+                // Same forward nudge as the promote branch — keeps the
+                // inner DDA's local_origin off the finer-voxel face it
+                // would otherwise land on.
+                t_outer += sc_size * 1e-5;
+            }
         }
 
         uint slot;

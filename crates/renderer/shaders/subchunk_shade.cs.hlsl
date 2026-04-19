@@ -242,15 +242,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // voxel_size so it stays meaningful across LOD levels.
     float3 shadow_origin_ws = hit_ws + normal * (voxel_size * 1e-3);
 
-    // Cast a single sun-shadow ray via classical clipmap promotion. Always
-    // start at level 0 — the finest possible level — and let
-    // `dda_world_clipmap` promote on non-resident cells. The primary hit's
-    // `level_idx` is NOT the right starting level: a primary hit rendered
-    // at L_n lives in an L_n sub-chunk that straddles out of L_(n-1)'s
-    // shell, but the shadow ray almost immediately enters adjacent sub-
-    // chunks whose finer levels may still be resident. Using L_n as the
-    // start would read OR-reduced occupancy at positions where precise L0
-    // data exists, producing conservative (false-positive) shadow hits.
+    // Cast a single sun-shadow ray. `dda_world_clipmap` demotes-and-promotes
+    // along the ray so it always marches at the finest level resident at
+    // each step. Passing `0u` is the simplest contract: the demote check on
+    // iteration 0 is a no-op (already at L0), and if L0 isn't resident at
+    // the ray origin the first step promotes to whatever level is. Whenever
+    // the ray re-enters a finer shell mid-march, it demotes back down —
+    // critical for a shadow ray fired from an L_n>0 receiver that crosses
+    // into L0-resident territory: without demote, the L_n OR-reduced
+    // occupancy reports false occluders at the coarse granularity even
+    // though precise finer data is available along the ray's actual path.
     MarchResult s = dda_world_clipmap(shadow_origin_ws, SUN_DIR_TO_LIGHT, MAX_SHADOW_T, 0u);
 
     // Shadow attenuation: 0.0 if occluded, 1.0 if unoccluded.
