@@ -150,6 +150,49 @@ pub fn terrain_height(xz: [f32; 2], seed: u32) -> f32 {
     TERRAIN_BASE_OFFSET + (n - 0.5) * TERRAIN_AMPLITUDE
 }
 
+/// Per-voxel solidity at world position `wp`. Mirrors the HLSL
+/// `terrain_occupied` predicate that `subchunk_prep.cs.hlsl` evaluates
+/// once per L_0 cell during prep voxelization.
+#[inline]
+pub fn terrain_occupied(wp: [f32; 3], seed: u32) -> bool {
+    wp[1] < terrain_height([wp[0], wp[2]], seed)
+}
+
+/// Hierarchical OR-reduction of `terrain_occupied` at level `lvl` over
+/// the 2^(3*lvl) L_0 cells covered by an L-voxel whose world-space lower
+/// corner is `coarse_base_wp`.
+///
+/// Mirrors HLSL `coarse_occupied` in `subchunk_prep.cs.hlsl`. The
+/// invariant this implements is the load-bearing one for cross-LOD
+/// `here & ~there` (step 3 of `decision-subchunk-visibility-storage-
+/// here-and-there`):
+///
+///   `coarse_occupied(lvl, p) == false` ⇒ every L_0 cell inside
+///   `[p, p + 2^lvl)^3` evaluates `terrain_occupied` == false.
+///
+/// Equivalently: a coarse voxel is solid whenever any covered finer cell
+/// is solid. Conservative-monotone reduction; the exposure / cull
+/// downstream relies on this never under-marking solidity.
+#[inline]
+pub fn coarse_occupied(lvl: u32, coarse_base_wp: [f32; 3], seed: u32) -> bool {
+    let extent = 1u32 << lvl;
+    for dz in 0..extent {
+        for dy in 0..extent {
+            for dx in 0..extent {
+                let wp = [
+                    coarse_base_wp[0] + dx as f32 + 0.5,
+                    coarse_base_wp[1] + dy as f32 + 0.5,
+                    coarse_base_wp[2] + dz as f32 + 0.5,
+                ];
+                if terrain_occupied(wp, seed) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,4 +368,123 @@ mod tests {
     /// here. Formula-change drift shows up as a test failure with the
     /// new value in the panic.
     const STABLE_SIGNATURE: u64 = 0x7423_3640_B3F8_DC29;
+
+    /// At level 0 the OR-reduction collapses to a single density sample
+    /// at the L_0 cell centre. The shader's old single-sample path is
+    /// `terrain_occupied(corner + 0.5)`; verify the new helper agrees
+    /// bit-for-bit with that prior contract for the L=0 case across a
+    /// mix of solid/empty positions.
+    #[test]
+    fn coarse_occupied_at_level_zero_matches_single_sample() {
+        let seed = 0xDEAD_BEEF_u32;
+        for ix in -4..4_i32 {
+            for iy in -16..16_i32 {
+                for iz in -4..4_i32 {
+                    let corner = [ix as f32, iy as f32, iz as f32];
+                    let centre = [corner[0] + 0.5, corner[1] + 0.5, corner[2] + 0.5];
+                    let or_reduced = coarse_occupied(0, corner, seed);
+                    let single = terrain_occupied(centre, seed);
+                    assert_eq!(
+                        or_reduced, single,
+                        "L=0 OR-reduction must equal single-sample at \
+                         corner={corner:?}, centre={centre:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Load-bearing invariant for step 3 of `decision-subchunk-
+    /// visibility-storage-here-and-there`: a coarse voxel evaluates
+    /// empty only when every finer cell it covers also evaluates empty.
+    /// This is the property that lets cross-LOD sub/super-sample
+    /// comparisons stay conservative — they may over-store material
+    /// but cannot produce voids.
+    ///
+    /// Walk a strip of corners that crosses the heightfield surface so
+    /// the test exercises both fully-empty, fully-solid, and partially-
+    /// solid coarse voxels at L=1 (extent 2) and L=2 (extent 4).
+    #[test]
+    fn coarse_occupied_empty_implies_all_finer_cells_empty() {
+        let seed = 0xDEAD_BEEF_u32;
+        for lvl in 1..=2_u32 {
+            let extent = 1u32 << lvl;
+            for ix in -3..3_i32 {
+                // y-strip wide enough to straddle the [-16, +16) m
+                // amplitude band the heightfield is bounded to.
+                for iy in -20..20_i32 {
+                    for iz in -3..3_i32 {
+                        let corner = [
+                            (ix * extent as i32) as f32,
+                            (iy * extent as i32) as f32,
+                            (iz * extent as i32) as f32,
+                        ];
+                        if coarse_occupied(lvl, corner, seed) {
+                            continue;
+                        }
+                        for dz in 0..extent {
+                            for dy in 0..extent {
+                                for dx in 0..extent {
+                                    let wp = [
+                                        corner[0] + dx as f32 + 0.5,
+                                        corner[1] + dy as f32 + 0.5,
+                                        corner[2] + dz as f32 + 0.5,
+                                    ];
+                                    assert!(
+                                        !terrain_occupied(wp, seed),
+                                        "lvl={lvl} corner={corner:?}: \
+                                         coarse_occupied returned false but \
+                                         finer cell at {wp:?} is solid"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The OR-reduction must be conservative-monotone in level: any
+    /// coarse cell that is solid at a finer level remains solid when
+    /// re-evaluated at a coarser level, because the coarser query
+    /// strictly contains the finer cell's footprint.
+    ///
+    /// Concretely, if the L=0 cell at lower-corner `c` is solid then
+    /// the L=1 cell containing it (corner = `floor(c / 2) * 2`) must
+    /// also be solid, and the L=2 cell containing that must be too.
+    #[test]
+    fn coarse_occupied_is_monotone_in_level() {
+        let seed = 0xDEAD_BEEF_u32;
+        for ix in -10..10_i32 {
+            for iy in -20..20_i32 {
+                for iz in -10..10_i32 {
+                    let corner_l0 = [ix as f32, iy as f32, iz as f32];
+                    if !coarse_occupied(0, corner_l0, seed) {
+                        continue;
+                    }
+                    let l1_corner = [
+                        ix.div_euclid(2) as f32 * 2.0,
+                        iy.div_euclid(2) as f32 * 2.0,
+                        iz.div_euclid(2) as f32 * 2.0,
+                    ];
+                    let l2_corner = [
+                        ix.div_euclid(4) as f32 * 4.0,
+                        iy.div_euclid(4) as f32 * 4.0,
+                        iz.div_euclid(4) as f32 * 4.0,
+                    ];
+                    assert!(
+                        coarse_occupied(1, l1_corner, seed),
+                        "L=0 cell at {corner_l0:?} solid but L=1 parent at \
+                         {l1_corner:?} reports empty — invariant broken"
+                    );
+                    assert!(
+                        coarse_occupied(2, l2_corner, seed),
+                        "L=0 cell at {corner_l0:?} solid but L=2 ancestor at \
+                         {l2_corner:?} reports empty — invariant broken"
+                    );
+                }
+            }
+        }
+    }
 }

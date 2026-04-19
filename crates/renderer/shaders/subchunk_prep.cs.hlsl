@@ -165,6 +165,49 @@ bool terrain_occupied(float3 wp) {
     return wp.y < terrain_height(wp.xz, g_consts.world_seed);
 }
 
+// Hierarchical OR-reduction of `terrain_occupied` at level `lvl` over the
+// 2^(3*lvl) L_0 cells covered by this L-voxel. `coarse_base_wp` is the
+// world-space lower corner of the L-voxel.
+//
+// Implements step 2 of `decision-subchunk-visibility-storage-here-and-
+// there` directly at the worldgen level: instead of point-sampling
+// `terrain_occupied` once at the L-voxel's centre (which would let thin
+// features vanish as LOD coarsens — a 2×1×2 L_0 column whose top sits
+// below the L_1 cube centre evaluates empty at L_1 while being solid at
+// L_0), we collapse the recursive `L_n cell = OR(8 covered L_{n-1}
+// cells)` reduction down to its base case: an L-voxel is solid iff any
+// L_0 cell it covers is solid.
+//
+// L_0 cells inside the L-voxel sit at integer world-space lower corners
+// in `[0, 2^lvl)^3` relative to `coarse_base_wp`. Centres are offset by
+// `+ 0.5` along each axis (matching `terrain_occupied`'s "voxel centre"
+// contract on the L_0 grid).
+//
+// Property (load-bearing for step 3 — cross-LOD sub/super-sample):
+//   coarse_occupied(lvl, p) == false ⇒ every L_0 cell inside the L-voxel
+//   at `p` evaluates `terrain_occupied` == false.
+// Equivalently, the predicate is monotone-conservative: an L-voxel is
+// guaranteed to be solid whenever any covered finer cell is solid.
+//
+// Cost: O(8^lvl) density evals per L-voxel. At lvl=0 this collapses to
+// the old single-sample path (extent=1, exactly one iteration). Early-out
+// on first solid keeps heightfield columns cheap — typical solid-bottom
+// L_2 voxels return after one eval.
+bool coarse_occupied(uint lvl, float3 coarse_base_wp) {
+    uint extent = 1u << lvl;
+    [loop] for (uint dz = 0u; dz < extent; ++dz) {
+        [loop] for (uint dy = 0u; dy < extent; ++dy) {
+            [loop] for (uint dx = 0u; dx < extent; ++dx) {
+                float3 wp = coarse_base_wp + float3(dx, dy, dz) + 0.5;
+                if (terrain_occupied(wp)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
 [numthreads(4, 4, 4)]
 void main(uint3 ltid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint lidx : SV_GroupIndex) {
     // Zero the shared accumulator. 16 words / 64 threads → first 16 threads
@@ -189,8 +232,15 @@ void main(uint3 ltid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint lidx : SV_
                 uint y = origin.y + dy;
                 uint z = origin.z + dz;
 
-                float3 wp = base + (float3(x, y, z) + 0.5) * voxel_size;
-                if (!terrain_occupied(wp)) {
+                // World-space lower corner of this L-voxel. The hierarchical
+                // OR-reduction (`coarse_occupied`) walks the 2^(3*level)
+                // L_0 cells inside the cube `[corner, corner + voxel_size)`
+                // and OR-folds their density samples — at L=0, a single
+                // eval at `corner + 0.5` matches the previous path
+                // bit-for-bit. See the helper's docstring for the
+                // load-bearing monotonicity property this gives step 3.
+                float3 coarse_base = base + float3(x, y, z) * voxel_size;
+                if (!coarse_occupied(req.level, coarse_base)) {
                     continue;
                 }
 
