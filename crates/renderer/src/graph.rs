@@ -20,7 +20,8 @@ mod resource;
 pub use compile::{Barrier, CompileError};
 pub use pool::{BufferPool, PendingRelease, TexturePool};
 pub use resource::{
-    Access, BindGroupHandle, BufferDesc, BufferHandle, ResourceId, TextureDesc, TextureHandle,
+    Access, BindGroupHandle, BindResource, BufferDesc, BufferHandle, ResourceId, TextureDesc,
+    TextureHandle,
 };
 use resource::ResourceHandle;
 
@@ -44,6 +45,35 @@ enum ResourceEntry {
     Texture(wgpu::Texture, wgpu::TextureView),
 }
 
+// --- BindResource helpers ---
+
+/// Return the inner [`ResourceId`] of a [`BindResource::Single`], or
+/// panic with a context message. Used in bind-group-template paths that
+/// know the kind is scalar but the enum carries both variants.
+fn expect_single(res: &BindResource, ctx: &str) -> ResourceId {
+    match res {
+        BindResource::Single(id) => *id,
+        BindResource::Array(_) => panic!(
+            "{ctx}: expected a single resource, got a BindResource::Array — \
+             layout/template mismatch (did you use create_bind_group_arrays \
+             with a scalar BindKind?)",
+        ),
+    }
+}
+
+/// Return the inner `&[ResourceId]` of a [`BindResource::Array`], or panic
+/// with a context message.
+fn expect_array<'a>(res: &'a BindResource, ctx: &str) -> &'a [ResourceId] {
+    match res {
+        BindResource::Array(ids) => ids,
+        BindResource::Single(_) => panic!(
+            "{ctx}: expected a BindResource::Array, got a single resource — \
+             layout/template mismatch (binding-array slots must be wrapped in \
+             BindResource::Array)",
+        ),
+    }
+}
+
 // --- BindGroupTemplate ---
 
 /// Deferred bind-group description registered at graph-build time.
@@ -62,7 +92,7 @@ struct BindGroupTemplate {
     /// the caller supplies every slot — notably for set-N bind groups (N > 0)
     /// owned by a node.
     gpu_consts_buf : Option<wgpu::Buffer>,
-    entries        : Vec<(u32, ResourceId)>,
+    entries        : Vec<(u32, BindResource)>,
 }
 
 // --- ResourceMap ---
@@ -348,7 +378,41 @@ impl RenderGraph {
             bg_layout      : pipeline.bg_layout().clone(),
             bind_entries   : pipeline.bind_entries().to_vec(),
             gpu_consts_buf : gpu_consts.map(|c| c.buffer().clone()),
-            entries        : entries.to_vec(),
+            entries        : entries.iter()
+                .map(|&(b, r)| (b, BindResource::Single(r)))
+                .collect(),
+        });
+        handle
+    }
+
+    /// Like [`create_bind_group`](Self::create_bind_group) but accepts
+    /// [`BindResource`] slots — which may carry either a single
+    /// [`ResourceId`] (scalar binding) or an ordered list
+    /// ([`BindResource::Array`]) for binding-array slots such as the
+    /// material-data pool.
+    ///
+    /// The array slot must correspond to a
+    /// [`BindKind::StorageBufferReadOnlyArray`](crate::pipeline::BindKind::StorageBufferReadOnlyArray)
+    /// entry in the pipeline's reflected layout; resolution panics
+    /// otherwise. The array length may be less than the declared `count`
+    /// (under `PARTIALLY_BOUND_BINDING_ARRAY`); unbound descriptors stay
+    /// legal at read time.
+    pub fn create_bind_group_arrays(
+        &mut self,
+        label      : &str,
+        pipeline   : &dyn PipelineBindLayout,
+        gpu_consts : Option<&GpuConsts>,
+        entries    : Vec<(u32, BindResource)>,
+    )
+        -> BindGroupHandle
+    {
+        let handle = BindGroupHandle(self.bind_group_templates.len() as u32);
+        self.bind_group_templates.push(BindGroupTemplate {
+            label          : label.to_string(),
+            bg_layout      : pipeline.bg_layout().clone(),
+            bind_entries   : pipeline.bind_entries().to_vec(),
+            gpu_consts_buf : gpu_consts.map(|c| c.buffer().clone()),
+            entries,
         });
         handle
     }
@@ -383,7 +447,39 @@ impl RenderGraph {
                 .clone(),
             bind_entries   : pipeline.bind_entries_set1().to_vec(),
             gpu_consts_buf : None,
-            entries        : entries.to_vec(),
+            entries        : entries.iter()
+                .map(|&(b, r)| (b, BindResource::Single(r)))
+                .collect(),
+        });
+        handle
+    }
+
+    /// Array-capable sibling of [`create_bind_group_set1`]. Accepts
+    /// `BindResource` slots so binding-array-backed entries
+    /// (e.g. the shade pass's material-data pool) can land in set 1
+    /// — the only place they can live alongside uniform buffers, which
+    /// wgpu's validator refuses to co-locate with binding arrays in the
+    /// same set.
+    pub fn create_bind_group_arrays_set1(
+        &mut self,
+        label    : &str,
+        pipeline : &dyn PipelineBindLayout,
+        entries  : Vec<(u32, BindResource)>,
+    )
+        -> BindGroupHandle
+    {
+        let handle = BindGroupHandle(self.bind_group_templates.len() as u32);
+        self.bind_group_templates.push(BindGroupTemplate {
+            label          : label.to_string(),
+            bg_layout      : pipeline.bg_layout_set1()
+                .expect(
+                    "create_bind_group_arrays_set1: pipeline does not declare set 1 \
+                     — check shader has [[vk::binding(N, 1)]] entries",
+                )
+                .clone(),
+            bind_entries   : pipeline.bind_entries_set1().to_vec(),
+            gpu_consts_buf : None,
+            entries,
         });
         handle
     }
@@ -628,34 +724,47 @@ impl<'g> PassBuilder<'g> {
     pub fn use_bind_group(&mut self, bg: BindGroupHandle) -> BindGroupWrites {
         // One borrow over the template to build a work list, then a second
         // pass to record accesses without holding the borrow.
-        let work: Vec<(ResourceId, BindKind)> = {
+        let work: Vec<(BindResource, BindKind)> = {
             let tpl = &self.graph.bind_group_templates[bg.0 as usize];
-            tpl.entries.iter().map(|&(binding, res_id)| {
+            tpl.entries.iter().map(|(binding, res)| {
                 let entry = tpl.bind_entries.iter()
-                    .find(|e| e.binding == binding)
+                    .find(|e| e.binding == *binding)
                     .unwrap_or_else(|| panic!(
                         "bind group template entry at slot {binding} has no \
                          matching layout entry — layout/template mismatch is \
                          a programmer error",
                     ));
-                (res_id, entry.kind)
+                (res.clone(), entry.kind)
             }).collect()
         };
 
         let mut writes: Vec<(u32, u32)> = Vec::new();
-        for (res_id, kind) in work {
+        for (res, kind) in work {
             match kind {
                 BindKind::UniformBuffer { .. }
                 | BindKind::StorageBufferReadOnly { .. }
                 | BindKind::SampledTexture { .. } => {
+                    let res_id = expect_single(&res, "scalar read-only binding");
                     let version = self.graph.resource_versions[res_id.0 as usize];
                     self.record_access(
                         ResourceHandle { resource: res_id.0, version },
                         Access::Read,
                     );
                 }
+                BindKind::StorageBufferReadOnlyArray { .. } => {
+                    let ids = expect_array(&res, "StorageBufferReadOnlyArray");
+                    for res_id in ids {
+                        let version =
+                            self.graph.resource_versions[res_id.0 as usize];
+                        self.record_access(
+                            ResourceHandle { resource: res_id.0, version },
+                            Access::Read,
+                        );
+                    }
+                }
                 BindKind::StorageBufferReadWrite { .. }
                 | BindKind::StorageTexture { .. } => {
+                    let res_id = expect_single(&res, "read-write binding");
                     let new_version = self.next_version(res_id.0);
                     self.record_access(
                         ResourceHandle { resource: res_id.0, version: new_version },
@@ -891,23 +1000,87 @@ impl CompiledGraph {
                 });
             }
 
-            // User slots: resolve each ResourceId via entries array.
-            for &(binding, res_id) in &tpl.entries {
-                let entry = self.entries[res_id.0 as usize]
-                    .as_ref()
-                    .unwrap_or_else(|| panic!(
-                        "bind group '{}' references resource {} which has \
-                         no backing GPU resource — import it, call \
-                         allocate_transients, or remove the reference",
-                        tpl.label, res_id.0,
-                    ));
+            // Owners for `BufferBinding` / `BufferArray` — wgpu's
+            // `BindingResource::BufferArray(&[BufferBinding])` borrows a
+            // slice; we need a stable place to store the vectors for the
+            // duration of `create_bind_group`.
+            let mut array_bindings: Vec<Vec<wgpu::BufferBinding>> = Vec::new();
 
-                let resource = match entry {
-                    ResourceEntry::Buffer(b)      => b.as_entire_binding(),
-                    ResourceEntry::Texture(_, v)  => wgpu::BindingResource::TextureView(v),
-                };
+            // User slots: resolve each entry through the graph's
+            // `entries` table. Scalar slots emit `as_entire_binding`; array
+            // slots collect `BufferBinding`s and emit `BufferArray`.
+            for (binding, res) in &tpl.entries {
+                let binding_slot = *binding;
+                match res {
+                    BindResource::Single(res_id) => {
+                        let entry = self.entries[res_id.0 as usize]
+                            .as_ref()
+                            .unwrap_or_else(|| panic!(
+                                "bind group '{}' references resource {} which has \
+                                 no backing GPU resource — import it, call \
+                                 allocate_transients, or remove the reference",
+                                tpl.label, res_id.0,
+                            ));
 
-                bg_entries.push(wgpu::BindGroupEntry { binding, resource });
+                        let resource = match entry {
+                            ResourceEntry::Buffer(b)     => b.as_entire_binding(),
+                            ResourceEntry::Texture(_, v) =>
+                                wgpu::BindingResource::TextureView(v),
+                        };
+
+                        bg_entries.push(wgpu::BindGroupEntry {
+                            binding: binding_slot,
+                            resource,
+                        });
+                    }
+                    BindResource::Array(res_ids) => {
+                        let mut buf_bindings: Vec<wgpu::BufferBinding> =
+                            Vec::with_capacity(res_ids.len());
+                        for res_id in res_ids {
+                            let entry = self.entries[res_id.0 as usize]
+                                .as_ref()
+                                .unwrap_or_else(|| panic!(
+                                    "bind group '{}' array slot {binding_slot} \
+                                     references resource {} which has no backing \
+                                     GPU resource — import it, call \
+                                     allocate_transients, or remove the reference",
+                                    tpl.label, res_id.0,
+                                ));
+                            let buffer = match entry {
+                                ResourceEntry::Buffer(b) => b,
+                                ResourceEntry::Texture(..) => panic!(
+                                    "bind group '{}' array slot {binding_slot} \
+                                     references a texture — texture binding arrays \
+                                     are not yet supported",
+                                    tpl.label,
+                                ),
+                            };
+                            buf_bindings.push(wgpu::BufferBinding {
+                                buffer,
+                                offset: 0,
+                                size:   None,
+                            });
+                        }
+                        array_bindings.push(buf_bindings);
+                    }
+                }
+            }
+
+            // Emit a BindGroupEntry for each array slot. The ordering of
+            // array_bindings matches the ordering of BindResource::Array
+            // entries in tpl.entries, so a second pass over tpl.entries
+            // + an index into array_bindings reproduces the binding numbers.
+            let mut array_idx = 0usize;
+            for (binding, res) in &tpl.entries {
+                if matches!(res, BindResource::Array(_)) {
+                    bg_entries.push(wgpu::BindGroupEntry {
+                        binding  : *binding,
+                        resource : wgpu::BindingResource::BufferArray(
+                            &array_bindings[array_idx],
+                        ),
+                    });
+                    array_idx += 1;
+                }
             }
 
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {

@@ -60,7 +60,7 @@
 //! Cull's indirect output rides on its own set-1 bind group, assembled
 //! inside `nodes::cull`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
 
@@ -118,6 +118,38 @@ pub const MAX_LEVELS: usize = 16;
 /// Depth format used by the sub-chunk pipeline's `DepthStencilState`.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// Number of entries in the global material descriptor table.
+///
+/// Mirrors `MATERIAL_DESC_CAPACITY` in `shaders/include/material.hlsl`.
+/// 256 is the M1 ceiling — raise in both places simultaneously if a world
+/// ever registers more block types.
+pub const MATERIAL_DESC_CAPACITY: usize = 256;
+
+/// Number of per-voxel material-data slots in one 64 MB pool segment.
+///
+/// Matches `SLOTS_PER_SEGMENT` in
+/// [`crates/game/src/world/material_data_pool.rs`](../../game/src/world/material_data_pool.rs)
+/// and the shader-side `SLOTS_PER_SEGMENT` in `material.hlsl`. Each slot
+/// holds a `MaterialBlock` (1024 bytes = 512 × u16 packed into 256 × u32),
+/// so segment size = `SLOTS_PER_SEGMENT × 1024` = 64 MiB.
+pub const MATERIAL_POOL_SLOTS_PER_SEGMENT: u32 = 65536;
+
+/// Compile-time maximum number of live 64 MB segments in the material-data
+/// pool. Matches `MAX_SEGMENTS` in the game allocator and the shader's
+/// binding-array declaration `StructuredBuffer<MaterialBlock>
+/// material_data_pool[MAX_MATERIAL_POOL_SEGMENTS]`. Raising requires a
+/// shader recompile.
+pub const MAX_MATERIAL_POOL_SEGMENTS: u32 = 16;
+
+/// Byte size of a single slot in the material-data pool. 512 voxels × 2 B
+/// per u16 ID = 1 KiB. Byte-identical to HLSL `MaterialBlock`.
+pub const MATERIAL_BLOCK_BYTES: u64 = 1024;
+
+/// Byte size of one 64 MB material-data pool segment =
+/// `MATERIAL_POOL_SLOTS_PER_SEGMENT × MATERIAL_BLOCK_BYTES`.
+pub const MATERIAL_SEGMENT_BYTES: u64 =
+    MATERIAL_POOL_SLOTS_PER_SEGMENT as u64 * MATERIAL_BLOCK_BYTES;
+
 /// Format of the transient `shaded_color` texture the shade compute pass
 /// writes and the phase-1.5 blit pass consumes.
 ///
@@ -130,6 +162,89 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// this through `[[vk::image_format("rgba8")]]` — the two must stay in
 /// sync or the pipeline layout validation fires on construction.
 pub const SHADED_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+// --- MaterialBlock ---
+
+/// One 1 KB material-data block: 512 u16 per-voxel material IDs packed
+/// two-per-u32 into 256 u32 words. Byte-identical to the HLSL
+/// `MaterialBlock` struct in `shaders/include/material.hlsl`.
+///
+/// `packed_ids[w]` holds voxels `(2*w, 2*w + 1)`:
+/// - Low 16 bits: voxel `2*w`.
+/// - High 16 bits: voxel `2*w + 1`.
+///
+/// The voxel linearisation is `x + 8*y + 64*z` (same as occupancy).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct MaterialBlock {
+    pub packed_ids: [u32; 256],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<MaterialBlock>() == 1024,
+    "MaterialBlock must be 1 KB to match HLSL layout + MATERIAL_BLOCK_BYTES",
+);
+
+impl MaterialBlock {
+    /// All-air block. Safe default for unused staging slots — any shader
+    /// read returns material id 0 (air), which is never produced by a
+    /// primary hit.
+    #[allow(dead_code)]
+    pub const fn zero() -> Self {
+        Self { packed_ids: [0u32; 256] }
+    }
+}
+
+// --- MaterialDesc ---
+
+/// One entry in the global material descriptor table.
+///
+/// Layout matches HLSL `MaterialDesc` in `shaders/include/material.hlsl`
+/// (32 bytes):
+/// ```text
+///   float4 albedo   (+0)    // sRGB RGBA, decoded to linear at fetch.
+///   uint4  _reserved(+16)   // M3 PBR: albedo_tex, normal_tex, pbr_tex, flags.
+/// ```
+///
+/// M1 uses only `albedo.rgb` for diffuse shading; alpha and the reserved
+/// quad are populated as zero and read by nothing. The shader's
+/// `material_fetch` is the single reader and decodes sRGB → linear on
+/// every read — keep `albedo.rgb` in sRGB space on CPU.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct MaterialDesc {
+    pub albedo:    [f32; 4],
+    pub _reserved: [u32; 4],
+}
+
+const _: () = assert!(
+    std::mem::size_of::<MaterialDesc>() == 32,
+    "MaterialDesc must be 32 bytes to match HLSL layout",
+);
+
+impl MaterialDesc {
+    /// All-zero descriptor. Shader fetch returns black (`float3(0)`
+    /// albedo) after sRGB→linear, which is never returned for a resident
+    /// sub-chunk — but the buffer starts zero-initialised and is a safe
+    /// default for unused slots.
+    pub const fn zero() -> Self {
+        Self { albedo: [0.0; 4], _reserved: [0; 4] }
+    }
+
+    /// Construct a descriptor from 8-bit sRGB RGB components. Alpha is
+    /// stored as `1.0`; the reserved fields are zeroed.
+    pub fn from_srgb_rgb(r: u8, g: u8, b: u8) -> Self {
+        Self {
+            albedo: [
+                r as f32 / 255.0,
+                g as f32 / 255.0,
+                b as f32 / 255.0,
+                1.0,
+            ],
+            _reserved: [0; 4],
+        }
+    }
+}
 
 // --- SubchunkCamera ---
 
@@ -474,6 +589,19 @@ const _: () = assert!(
 /// entries. Fits in the 24-bit material-slot field of [`DirEntry::bits`].
 pub const MATERIAL_SLOT_INVALID: u32 = 0xFF_FFFF;
 
+/// Sentinel value stored in [`DirEntry::material_data_slot`] when a
+/// directory entry has not yet been paired with a slot in the
+/// material-data pool. Observed by the shade shader as the
+/// "draw magenta" trigger — either because the entry is non-resident
+/// (`resident == 0`), or because the pool was exhausted this frame and
+/// the allocation is deferred to the next frame, or because the pool
+/// ceiling was hit.
+///
+/// This is the *material-data* pool's invalid sentinel, not the
+/// occupancy pool's. The two pools are independent; see
+/// `decision-material-system-m1-sparse`.
+pub const MATERIAL_DATA_SLOT_INVALID: u32 = 0xFFFF_FFFF;
+
 /// Mask for the 6 directional exposure bits packed into [`DirEntry::bits`]
 /// (`bits[0..5]`). One bit per `+X, -X, +Y, -Y, +Z, -Z` face; the layout
 /// follows the existing cull-shader convention.
@@ -501,7 +629,7 @@ pub const BITS_MATERIAL_SLOT_SHIFT: u32 = 8;
 /// sub-chunk: whether it's resident, which material-storage slot holds its
 /// occupancy payload, and its cached exposure mask.
 ///
-/// Layout matches the HLSL `DirEntry` struct (24 bytes):
+/// Layout matches the HLSL `DirEntry` struct (28 bytes):
 /// ```text
 ///   int3 coord              (+0)
 ///   uint bits               (+12)   // [0..5] exposure, [6] is_solid,
@@ -509,6 +637,8 @@ pub const BITS_MATERIAL_SLOT_SHIFT: u32 = 8;
 ///                                   //                       | INVALID
 ///   uint content_version    (+16)
 ///   uint last_synth_version (+20)
+///   uint material_data_slot (+24)   // flat-global MaterialDataPool slot,
+///                                   // or MATERIAL_DATA_SLOT_INVALID.
 /// ```
 ///
 /// - `coord` carries the torus-verification coord for the entry. For
@@ -516,12 +646,21 @@ pub const BITS_MATERIAL_SLOT_SHIFT: u32 = 8;
 ///   reads it (resident bit clear ⇒ early-out).
 /// - `bits` packs the four per-entry fields that change per residency
 ///   event. Exposure and is_solid are read by the cull/DDA path; resident
-///   gates the whole entry; material_slot is the indirection target.
+///   gates the whole entry; material_slot is the indirection target for
+///   the *occupancy* pool (NOT the material-data pool).
 /// - `content_version` bumps on any occupancy mutation. `0` for pure
 ///   worldgen — this step never bumps it.
 /// - `last_synth_version` is CPU-only bookkeeping for the eviction TTL in
 ///   later steps; present here for layout symmetry so downstream shader
 ///   ports don't need a struct-size change.
+/// - `material_data_slot` is the flat-global slot index into the
+///   segmented material-data pool (64 MB × N segments). Carries
+///   [`MATERIAL_DATA_SLOT_INVALID`] when the entry has no allocation
+///   (non-resident, deferred mid-grow, or pool ceiling reached). The
+///   shade shader reads it and decodes `(segment_idx, local_idx)` on the
+///   GPU via `div/mod SLOTS_PER_SEGMENT`; the division point is this
+///   field so the decode never leaks to non-shade callsites. See
+///   `decision-material-system-m1-sparse`.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct DirEntry {
@@ -529,17 +668,23 @@ pub struct DirEntry {
     pub bits:               u32,
     pub content_version:    u32,
     pub last_synth_version: u32,
+    /// Material-data pool slot, or [`MATERIAL_DATA_SLOT_INVALID`]. See
+    /// the struct-level docs.
+    pub material_data_slot: u32,
 }
 
 const _: () = assert!(
-    std::mem::size_of::<DirEntry>() == 24,
-    "DirEntry must be 24 bytes to match the HLSL DirEntry layout",
+    std::mem::size_of::<DirEntry>() == 28,
+    "DirEntry must be 28 bytes to match the HLSL DirEntry layout",
 );
 
 impl DirEntry {
-    /// All-zero non-resident entry. `bits == 0` implies `resident = 0`,
-    /// `is_solid = 0`, `exposure = 0`, and `material_slot = 0` (callers
-    /// must not read the slot field without first checking `resident`).
+    /// All-zero non-resident entry except for `material_data_slot`, which
+    /// starts at [`MATERIAL_DATA_SLOT_INVALID`] so the shade shader emits
+    /// magenta rather than dereferencing a stale slot. `bits == 0`
+    /// implies `resident = 0`, `is_solid = 0`, `exposure = 0`, and the
+    /// packed `material_slot` (occupancy pool) is `0`; callers must not
+    /// read those fields without first checking `resident`.
     ///
     /// Note: a zero `material_slot` is *not* [`MATERIAL_SLOT_INVALID`]; the
     /// resident bit is the authoritative gate. Constructing a
@@ -551,24 +696,31 @@ impl DirEntry {
             bits:               0,
             content_version:    0,
             last_synth_version: 0,
+            material_data_slot: MATERIAL_DATA_SLOT_INVALID,
         }
     }
 
     /// Explicit non-resident entry: `resident` bit clear, `material_slot`
-    /// set to [`MATERIAL_SLOT_INVALID`]. Use when the caller wants the
-    /// sentinel slot value to be present in the packed bits (for diagnostic
-    /// readability or to match a shader that panics on a non-INVALID slot
-    /// under a clear resident bit).
+    /// set to [`MATERIAL_SLOT_INVALID`], and `material_data_slot` set to
+    /// [`MATERIAL_DATA_SLOT_INVALID`]. Use when the caller wants the
+    /// sentinel slot values to be present for diagnostic readability or
+    /// to match a shader that panics on a non-INVALID slot under a clear
+    /// resident bit.
     pub const fn non_resident() -> Self {
         Self {
             coord:              [0, 0, 0],
             bits:               MATERIAL_SLOT_INVALID << BITS_MATERIAL_SLOT_SHIFT,
             content_version:    0,
             last_synth_version: 0,
+            material_data_slot: MATERIAL_DATA_SLOT_INVALID,
         }
     }
 
-    /// Build a resident directory entry.
+    /// Build a resident directory entry. The `material_data_slot` field
+    /// is initialised to [`MATERIAL_DATA_SLOT_INVALID`]; the materializer
+    /// populates it on a separate, asynchronous code path (see
+    /// `decision-material-system-m1-sparse`) and writes the updated
+    /// entry via [`DirEntry::with_material_data_slot`].
     ///
     /// # Panics
     ///
@@ -603,7 +755,21 @@ impl DirEntry {
             bits,
             content_version:    0,
             last_synth_version: 0,
+            material_data_slot: MATERIAL_DATA_SLOT_INVALID,
         }
+    }
+
+    /// Return a copy of `self` with [`DirEntry::material_data_slot`] set
+    /// to `slot`. Builder-style so the materializer can rewrite a
+    /// resident entry's slot in one expression:
+    ///
+    /// ```ignore
+    /// let new_entry = old_entry.with_material_data_slot(allocated_slot);
+    /// directory.set(index, new_entry);
+    /// ```
+    pub const fn with_material_data_slot(mut self, slot: u32) -> Self {
+        self.material_data_slot = slot;
+        self
     }
 
     /// `true` if the resident bit is set.
@@ -697,6 +863,17 @@ pub struct WorldRenderer {
     /// consumes it, so the patch landed wrong-frame data at the retired
     /// directory_index. See `failure-staging-not-ringed-after-gid-x-reindexing`.
     staging_occ_ring:      MultiBufferRing<SubchunkOccupancy>,
+    /// Parallel staging ring for per-voxel material IDs the prep shader
+    /// emits alongside occupancy. One 1 KB [`MaterialBlock`]-shaped entry
+    /// per prep request; indexed by the same `staging_request_idx`
+    /// (`gid.x`) as `staging_occ_ring` so a given `req_idx` points at
+    /// byte-symmetric occupancy + material-id payloads.
+    ///
+    /// Ring semantics identical to [`staging_occ_ring`]: prep at frame F
+    /// writes slot `F % FrameCount`; the retirement at frame
+    /// `F + FrameCount` reads the same slot. See
+    /// `knowledge-fif-swapchain-depth-decoupling`.
+    staging_material_ids_ring: MultiBufferRing<MaterialBlock>,
     dirty_list_buf:        wgpu::Buffer,
     prep_request_buf:      wgpu::Buffer,
 
@@ -729,6 +906,34 @@ pub struct WorldRenderer {
     /// binding added in Step 6 and unpacks the exposure mask through
     /// `direntry_get_exposure`.
     slot_directory_buf:    Arc<wgpu::Buffer>,
+
+    /// Global descriptor table: `[MaterialDesc; MATERIAL_DESC_CAPACITY]`.
+    /// Published once at startup via [`write_materials`](
+    /// WorldRenderer::write_materials) from the game side's
+    /// `BlockRegistry`. Read by the shade compute pass at fetch time; the
+    /// shader decodes sRGB → linear on every read so the CPU side stores
+    /// sRGB directly.
+    material_desc_buf:     wgpu::Buffer,
+
+    /// Live 64 MB segments of the material-data pool. Each segment is a
+    /// `StructuredBuffer<MaterialBlock>` of
+    /// [`MATERIAL_POOL_SLOTS_PER_SEGMENT`] entries, bound as element
+    /// `segments_live[i]` of the shade shader's binding-array slot. The
+    /// renderer grows this list lazily — starts with a single segment at
+    /// construction so the first frame has a populated binding even when
+    /// nothing's been allocated yet; subsequent segments come from
+    /// [`append_material_segment`](WorldRenderer::append_material_segment)
+    /// when the CPU allocator returns `None`. Capped at
+    /// [`MAX_MATERIAL_POOL_SEGMENTS`]; exceeding that is an error in the
+    /// materializer.
+    ///
+    /// Wrapped in a `Mutex` because the renderer is held as
+    /// `Arc<WorldRenderer>` across the render-graph and ownership paths,
+    /// but the segment list needs mutation after construction (from the
+    /// materializer at frame start). A `Mutex` is the smallest concession
+    /// — the contention window is one push per grow event, which is
+    /// measured in seconds of play.
+    material_segment_bufs: Mutex<Vec<wgpu::Buffer>>,
 }
 
 impl WorldRenderer {
@@ -822,6 +1027,8 @@ impl WorldRenderer {
         let dirty_list_size   = std::mem::size_of::<DirtyReport>() as u64;
         let prep_request_size = (std::mem::size_of::<PrepRequest>() * MAX_CANDIDATES) as u64;
         let directory_size    = (std::mem::size_of::<DirEntry>()     * MAX_CANDIDATES) as u64;
+        let material_desc_size =
+            (std::mem::size_of::<MaterialDesc>() * MATERIAL_DESC_CAPACITY) as u64;
 
         // --- Persistent buffers ---
 
@@ -901,6 +1108,22 @@ impl WorldRenderer {
             },
         );
 
+        // Parallel staging ring for per-voxel material IDs. Same ring
+        // semantics + sizing policy as `staging_occ_ring` — one entry per
+        // prep request, indexed by the same `gid.x`. Stride is
+        // `MATERIAL_BLOCK_BYTES` per request.
+        let staging_material_ids_size =
+            MATERIAL_BLOCK_BYTES * MAX_CANDIDATES as u64;
+        let staging_material_ids_ring = MultiBufferRing::<MaterialBlock>::new(
+            ctx,
+            pool,
+            "subchunk_staging_material_ids",
+            BufferDesc {
+                size:  staging_material_ids_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            },
+        );
+
         // Dirty-list buffer: shader-authoritative `DirtyReport`. COPY_SRC so
         // the prep graph pass can blit it into a `ReadbackChannel` slot;
         // COPY_DST so the prep node can clear the atomic `count` header
@@ -970,6 +1193,26 @@ impl WorldRenderer {
                               | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         }));
+
+        // Global material descriptor table. Populated once via
+        // `write_materials`; zero-initialised until then so any speculative
+        // fetch hits a well-defined (albedo = [0,0,0,0]) entry.
+        let material_desc_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("material_desc_table"),
+            size:               material_desc_size,
+            usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Material-data pool — initial segment created up front so every
+        // shade dispatch has at least one bound element in the binding
+        // array slot. Subsequent segments come from
+        // `append_material_segment` when the CPU allocator signals grow.
+        // 64 MiB per segment; `PARTIALLY_BOUND_BINDING_ARRAY` permits
+        // fewer-than-count bound elements at the remaining slots.
+        let material_segment_bufs = Mutex::new(vec![
+            create_material_segment_buf(device, 0),
+        ]);
 
         // --- Pipelines ---
 
@@ -1077,12 +1320,130 @@ impl WorldRenderer {
             count_buf,
             lod_mask_buf,
             staging_occ_ring,
+            staging_material_ids_ring,
             dirty_list_buf,
             prep_request_buf,
             exposure_request_buf,
             exposure_dirty_list_buf,
             slot_directory_buf,
+            material_desc_buf,
+            material_segment_bufs,
         }
+    }
+
+    /// Overwrite the global material descriptor table.
+    ///
+    /// Intended to be called once at startup after the game side's
+    /// [`BlockRegistry`] has been built. The buffer is sized to
+    /// [`MATERIAL_DESC_CAPACITY`] entries; passing fewer leaves trailing
+    /// slots zero-initialised (safe — the shade shader never fetches
+    /// slots it wasn't told about). Passing more than
+    /// [`MATERIAL_DESC_CAPACITY`] panics.
+    pub fn write_materials(&self, ctx: &RendererContext, descs: &[MaterialDesc]) {
+        assert!(
+            descs.len() <= MATERIAL_DESC_CAPACITY,
+            "write_materials: got {} descs, max is {MATERIAL_DESC_CAPACITY}",
+            descs.len(),
+        );
+        if descs.is_empty() {
+            return;
+        }
+        ctx.queue()
+            .write_buffer(&self.material_desc_buf, 0, bytemuck::cast_slice(descs));
+    }
+
+    /// Append a new 64 MB material-data pool segment.
+    ///
+    /// Called by the materializer at frame boundary when the CPU
+    /// allocator's [`MaterialDataPool::grow`] succeeds. The new GPU buffer
+    /// is zero-initialised — the first writer that lands a patch into one
+    /// of its slots is what gives the segment's slots defined contents;
+    /// before that, a speculative fetch returns `uint(0)` which the
+    /// shader treats as material id 0 (air / default).
+    ///
+    /// The bind-group for the shade dispatch is rebuilt every frame
+    /// (render graph is rebuilt from scratch per frame), so the new
+    /// segment naturally picks up in the next dispatch after this call —
+    /// no explicit descriptor rebind is needed here beyond pushing the
+    /// buffer into `material_segment_bufs`.
+    ///
+    /// Takes `&self` (not `&mut self`) so callers can hold the renderer
+    /// behind an `Arc`; the segment list is guarded by an internal
+    /// `Mutex`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the pool has already reached
+    /// [`MAX_MATERIAL_POOL_SEGMENTS`]. The CPU allocator is the
+    /// authoritative ceiling-enforcer; this helper is the renderer-side
+    /// double-check in case of bookkeeping drift.
+    pub fn append_material_segment(&self, ctx: &RendererContext) {
+        let mut segs = self
+            .material_segment_bufs
+            .lock()
+            .expect("material_segment_bufs mutex poisoned");
+        let segments_now = segs.len() as u32;
+        assert!(
+            segments_now < MAX_MATERIAL_POOL_SEGMENTS,
+            "append_material_segment: already at MAX_MATERIAL_POOL_SEGMENTS \
+             ({MAX_MATERIAL_POOL_SEGMENTS})",
+        );
+        let buf = create_material_segment_buf(ctx.device(), segments_now);
+        segs.push(buf);
+    }
+
+    /// Number of live material-data pool segments. Equal to the CPU
+    /// allocator's `segments_live()` under correct bookkeeping.
+    pub fn material_segments_live(&self) -> u32 {
+        self.material_segment_bufs
+            .lock()
+            .expect("material_segment_bufs mutex poisoned")
+            .len() as u32
+    }
+
+    /// Copy a single prepared 1 KB material block into the material-data
+    /// pool at `global_slot`. The slot is decomposed into (segment, local)
+    /// on the CPU; the target segment must already exist. Safe to call
+    /// concurrently with a material-pool bind: the graph's access
+    /// tracking will emit a barrier when the shade dispatch reads the
+    /// written segment this frame.
+    ///
+    /// `bytes` must be exactly [`MATERIAL_BLOCK_BYTES`] long (1024 B =
+    /// 512 × u16 per-voxel material IDs).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the slot's segment is past
+    /// [`material_segments_live`](WorldRenderer::material_segments_live)
+    /// or when `bytes.len() != MATERIAL_BLOCK_BYTES`. Both are CPU-side
+    /// bookkeeping bugs.
+    pub fn write_material_block(
+        &self,
+        ctx:         &RendererContext,
+        global_slot: u32,
+        bytes:       &[u8],
+    ) {
+        assert_eq!(
+            bytes.len() as u64,
+            MATERIAL_BLOCK_BYTES,
+            "write_material_block: expected {MATERIAL_BLOCK_BYTES} bytes, got {}",
+            bytes.len(),
+        );
+        let segment_idx = global_slot / MATERIAL_POOL_SLOTS_PER_SEGMENT;
+        let local_idx   = global_slot % MATERIAL_POOL_SLOTS_PER_SEGMENT;
+        let segs = self
+            .material_segment_bufs
+            .lock()
+            .expect("material_segment_bufs mutex poisoned");
+        let seg_buf = segs.get(segment_idx as usize)
+            .unwrap_or_else(|| panic!(
+                "write_material_block: slot {global_slot} → segment {segment_idx} \
+                 not live (segments_live = {}); caller must append_material_segment \
+                 before routing slots into it",
+                segs.len(),
+            ));
+        let offset = local_idx as u64 * MATERIAL_BLOCK_BYTES;
+        ctx.queue().write_buffer(seg_buf, offset, bytes);
     }
 
     /// Overwrite the camera uniform. Call once per frame before building
@@ -1286,6 +1647,10 @@ impl WorldRenderer {
         &self.staging_occ_ring
     }
 
+    pub(crate) fn staging_material_ids_ring(&self) -> &MultiBufferRing<MaterialBlock> {
+        &self.staging_material_ids_ring
+    }
+
     pub(crate) fn dirty_list_buf(&self) -> &wgpu::Buffer {
         &self.dirty_list_buf
     }
@@ -1301,6 +1666,37 @@ impl WorldRenderer {
     pub(crate) fn exposure_request_buf(&self) -> &wgpu::Buffer {
         &self.exposure_request_buf
     }
+
+    pub(crate) fn material_desc_buf(&self) -> &wgpu::Buffer {
+        &self.material_desc_buf
+    }
+
+    /// Snapshot the current segment list as a `Vec<wgpu::Buffer>` clone.
+    /// Each `wgpu::Buffer` is `Arc`-backed and cheap to clone; the clone
+    /// is required because callers (like `subchunk_world`) need stable
+    /// handles to import into the render graph for the frame's bind-group
+    /// resolution.
+    pub(crate) fn material_segment_bufs_snapshot(&self) -> Vec<wgpu::Buffer> {
+        self.material_segment_bufs
+            .lock()
+            .expect("material_segment_bufs mutex poisoned")
+            .clone()
+    }
+}
+
+/// Allocate one 64 MB material-data-pool segment GPU buffer. Label
+/// embeds `segment_idx` so RenderDoc captures distinguish them at a
+/// glance.
+fn create_material_segment_buf(
+    device:      &wgpu::Device,
+    segment_idx: u32,
+) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label:              Some(&format!("material_segment_{segment_idx}")),
+        size:               MATERIAL_SEGMENT_BYTES,
+        usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
 }
 
 // --- subchunk_world render node ---
@@ -1448,6 +1844,24 @@ pub fn subchunk_world(
     );
     let vis_written = color_outs[0];
 
+    // Material descriptor table (scalar, set 0 slot 7) + binding-array
+    // of per-sub-chunk material-data pool segments (set 1 slot 0). The
+    // pool's live-segment list drives the array length per frame;
+    // slots past `segments_live` stay partially bound
+    // (`PARTIALLY_BOUND_BINDING_ARRAY`). The pool is kept on set 1
+    // because wgpu's validator refuses to co-locate a binding array
+    // with uniform buffers (`g_consts`, `g_camera`) in one set.
+    let material_desc_h = graph.import_buffer(renderer.material_desc_buf().clone());
+    let material_segment_handles: Vec<crate::graph::BufferHandle> = renderer
+        .material_segment_bufs_snapshot()
+        .into_iter()
+        .map(|b| graph.import_buffer(b))
+        .collect();
+    let material_segment_res: Vec<crate::graph::ResourceId> = material_segment_handles
+        .iter()
+        .map(|h| (*h).into())
+        .collect();
+
     // Shade bind group is built after the draw pass so that `depth_out`
     // (the post-draw version of the depth texture) is available. The
     // shade pass reads the depth buffer written by the draw pass, so
@@ -1464,6 +1878,18 @@ pub fn subchunk_world(
             (4, occ_h.into()),
             (5, camera_h.into()),
             (6, depth_out.into()),
+            (7, material_desc_h.into()),
+        ],
+    );
+
+    // Set-1 bind group holds the material-data pool binding array.
+    // Caller-composed (no implicit `gpu_consts`), produced via
+    // `create_bind_group_arrays` + set-1 helper below.
+    let shade_bg_set1 = graph.create_bind_group_arrays_set1(
+        "subchunk_shade_bg_set1",
+        renderer.shade_pipeline().as_ref(),
+        vec![
+            (0, crate::graph::BindResource::Array(material_segment_res)),
         ],
     );
 
@@ -1476,13 +1902,18 @@ pub fn subchunk_world(
     let shade_pipeline = Arc::clone(renderer.shade_pipeline());
     let shaded_out = graph.add_pass("subchunk_shade", |pass| {
         let writes   = pass.use_bind_group(shade_bg);
+        // Record reads against set-1's binding-array entries (material
+        // segments) so the graph's access tracking pairs them with the
+        // material patch pass's writes.
+        pass.use_bind_group(shade_bg_set1);
         let shaded_v = writes.write_texture_of(shaded_h);
         // `vis_written` and `depth_out` are already recorded as reads
         // via their `SampledTexture` bindings in the shade bind group —
         // no additional explicit declaration required.
         pass.execute(move |ctx| {
-            let bg = ctx.resources.bind_group(shade_bg);
-            ctx.commands.dispatch(&shade_pipeline, &[bg], [wg_x, wg_y, 1], &[]);
+            let bg0 = ctx.resources.bind_group(shade_bg);
+            let bg1 = ctx.resources.bind_group(shade_bg_set1);
+            ctx.commands.dispatch(&shade_pipeline, &[bg0, bg1], [wg_x, wg_y, 1], &[]);
         });
         shaded_v
     });
@@ -1555,6 +1986,9 @@ pub fn subchunk_prep(
     let staging_occ_h    = graph.import_buffer(
         renderer.staging_occ_ring().current(frame).clone(),
     );
+    let staging_mat_ids_h = graph.import_buffer(
+        renderer.staging_material_ids_ring().current(frame).clone(),
+    );
     let dirty_list_h     = graph.import_buffer(renderer.dirty_list_buf().clone());
     let directory_h      = graph.import_buffer(renderer.slot_directory_buf().as_ref().clone());
 
@@ -1582,6 +2016,7 @@ pub fn subchunk_prep(
             (3, staging_occ_h.into()),
             (4, dirty_list_cleared.into()),
             (5, directory_h.into()),
+            (6, staging_mat_ids_h.into()),
         ],
     );
 
@@ -1800,6 +2235,116 @@ pub fn subchunk_patch(
     // Without an output marker, the graph would cull the pass: the
     // material pool has no downstream reader declared inside this
     // subgraph (the render node that reads it lives in a separate call).
+    graph.mark_output(patched);
+}
+
+// --- MaterialPatchCopy ---
+
+/// One CPU-authored staging_material_ids → material-data-pool copy.
+///
+/// Parallel to [`PatchCopy`] but targets the binding-array segmented
+/// material-data pool. `dst_global_slot` is the flat
+/// [`MaterialDataPool`](crate::MaterialDataPool) slot the retirement
+/// chose for this sub-chunk; the patch node decomposes it into
+/// `(segment_idx, local_offset)` and does one `copy_buffer_to_buffer`
+/// per entry.
+///
+/// `staging_request_idx` matches `gid.x` of the prep workgroup that
+/// produced the material-id payload, identical to the occupancy patch
+/// pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MaterialPatchCopy {
+    pub staging_request_idx: u32,
+    pub dst_global_slot:     u32,
+}
+
+// --- subchunk_material_patch render node ---
+
+/// Register a CPU-scheduled staging_material_ids → material-data-pool
+/// patch pass into `graph`.
+///
+/// For each [`MaterialPatchCopy`], records a 1 KB
+/// [`MATERIAL_BLOCK_BYTES`](MATERIAL_BLOCK_BYTES) copy from
+/// `staging_material_ids_ring[staging_frame][staging_request_idx]` into
+/// the appropriate segment buffer at
+/// `(dst_global_slot % SLOTS_PER_SEGMENT) * 1024`. The destination
+/// segment is resolved from `dst_global_slot / SLOTS_PER_SEGMENT` and
+/// looked up in the renderer's live segment list.
+///
+/// An empty `copies` slice is a no-op.
+///
+/// `staging_frame` selects the ring slot; same semantics as
+/// [`subchunk_patch`]'s `staging_frame` — pass the retired frame, not the
+/// current one.
+pub fn subchunk_material_patch(
+    graph         : &mut RenderGraph,
+    renderer      : &Arc<WorldRenderer>,
+    copies        : &[MaterialPatchCopy],
+    staging_frame : FrameIndex,
+)
+{
+    if copies.is_empty() {
+        return;
+    }
+
+    let staging_mat_ids_h = graph.import_buffer(
+        renderer.staging_material_ids_ring().current(staging_frame).clone(),
+    );
+
+    // Import every live segment buffer. The pass issues per-copy
+    // `copy_buffer_to_buffer` into the segment identified by each copy's
+    // `dst_global_slot / SLOTS_PER_SEGMENT`, so every segment the copy
+    // set touches must appear as an imported buffer.
+    let segments: Vec<wgpu::Buffer> = renderer.material_segment_bufs_snapshot();
+    let segment_handles: Vec<crate::graph::BufferHandle> = segments
+        .iter()
+        .map(|b| graph.import_buffer(b.clone()))
+        .collect();
+    let segment_count = segment_handles.len();
+
+    let copies: Vec<MaterialPatchCopy> = copies.to_vec();
+
+    let patched = graph.add_pass("subchunk_material_patch", |pass| {
+        pass.read_buffer(staging_mat_ids_h);
+        // Record a write access on every segment we might touch; the
+        // graph will pessimistically barrier all of them, which is fine
+        // — the grow rate is O(1 per minute of play).
+        let segment_writes: Vec<crate::graph::BufferHandle> = segment_handles
+            .iter()
+            .map(|h| pass.write_buffer(*h))
+            .collect();
+        let first_write = segment_writes[0];
+        let segment_writes_for_exec = segment_writes.clone();
+
+        pass.execute(move |ctx| {
+            let src_buf = ctx.resources.buffer(staging_mat_ids_h);
+            let block_bytes = MATERIAL_BLOCK_BYTES;
+            for copy in &copies {
+                let seg_idx = (copy.dst_global_slot
+                    / MATERIAL_POOL_SLOTS_PER_SEGMENT) as usize;
+                let local_slot = copy.dst_global_slot
+                    % MATERIAL_POOL_SLOTS_PER_SEGMENT;
+                debug_assert!(
+                    seg_idx < segment_count,
+                    "subchunk_material_patch: dst_global_slot {} -> segment {} \
+                     but only {} segment(s) imported",
+                    copy.dst_global_slot, seg_idx, segment_count,
+                );
+                let dst_buf = ctx.resources.buffer(segment_writes_for_exec[seg_idx]);
+                let src_offset = (copy.staging_request_idx as u64) * block_bytes;
+                let dst_offset = (local_slot as u64) * block_bytes;
+                ctx.commands.copy_buffer_to_buffer(
+                    src_buf, src_offset, dst_buf, dst_offset, block_bytes,
+                );
+            }
+        });
+
+        // Return any one written handle as the pass's output marker. The
+        // graph only needs *some* output for liveness; downstream passes
+        // read from the segment buffers directly.
+        first_write
+    });
+
     graph.mark_output(patched);
 }
 

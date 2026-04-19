@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 renderer.workspace = true
+voxel.workspace    = true
 wgpu.workspace     = true
 winit.workspace    = true
 pollster.workspace = true

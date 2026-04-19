@@ -20,7 +20,9 @@ pub struct BindEntry {
 
 /// Kind of resource exposed by a [`BindEntry`].
 ///
-/// The first three variants cover buffers; the texture variants are added
+/// The first three variants cover scalar buffers; the binding-array variant
+/// covers fixed-count arrays of read-only storage buffers
+/// (`StructuredBuffer<T> a[N]` in HLSL); the texture variants are added
 /// for primitives that read a vis buffer or write a storage image (the
 /// first of which is the subchunk shade compute pass — see
 /// `shaders/subchunk_shade.cs.hlsl`). Samplers remain deferred until a
@@ -36,6 +38,19 @@ pub enum BindKind {
     /// A read-write storage buffer of the given size in bytes. Maps to wgpu's
     /// `BufferBindingType::Storage { read_only: false }`.
     StorageBufferReadWrite { size: u64 },
+    /// A fixed-count binding array of read-only storage buffers. HLSL source:
+    /// `StructuredBuffer<T> a[N]`. Maps to wgpu's
+    /// `BufferBindingType::Storage { read_only: true }` paired with
+    /// `count: Some(count)` on the `BindGroupLayoutEntry`; under
+    /// `PARTIALLY_BOUND_BINDING_ARRAY` the runtime bind list may carry fewer
+    /// than `count` entries. `element_size` is the reflected element stride
+    /// (stride of the struct's runtime-array member) and is wired into
+    /// `min_binding_size` so wgpu validates per-element.
+    ///
+    /// Runtime-sized variants (`OpTypeRuntimeArray` of struct-buffer) are
+    /// intentionally not supported; reflection rejects them with a clear
+    /// error pointing at the missing array length.
+    StorageBufferReadOnlyArray { count: u32, element_size: u64 },
     /// A sampled (SRV) texture. HLSL source: `Texture2D<T>` (plus future
     /// array / cube variants via [`view_dimension`](Self::SampledTexture::view_dimension)).
     /// Read-only from the shader. Maps to wgpu's `BindingType::Texture`.

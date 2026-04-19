@@ -17,4 +17,6 @@ pub use indirect_args::IndirectArgs;
 pub use mdi_draw::{ColorTarget, DrawArgs, mdi_draw};
 pub use present_blit::present_blit;
 
-pub use crate::subchunk::{subchunk_exposure, subchunk_patch, subchunk_prep, subchunk_world};
+pub use crate::subchunk::{
+    subchunk_exposure, subchunk_material_patch, subchunk_patch, subchunk_prep, subchunk_world,
+};

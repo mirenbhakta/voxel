@@ -9,6 +9,7 @@ edition = "2024"
 [workspace.dependencies]
 eden-math = { path = "../eden/eden-engine/lib/eden-math", default-features = false }
 renderer  = { path = "crates/renderer" }
+voxel     = { path = "crates/voxel" }
 thiserror = "1"
 wgpu      = { version = "29", default-features = false, features = ["wgsl", "spirv", "vulkan"] }
 bytemuck  = { version = "1", features = ["derive"] }

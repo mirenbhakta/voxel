@@ -19,7 +19,7 @@
 use crate::device::RendererContext;
 use crate::pipeline::PipelineBindLayout;
 use crate::pipeline::binding::{BindEntry, BindKind};
-use crate::pipeline::bind_kind_to_wgpu_ty;
+use crate::pipeline::{bind_kind_to_wgpu_count, bind_kind_to_wgpu_ty};
 use crate::shader::ShaderModule;
 
 // --- RenderPipelineDescriptor ---
@@ -103,7 +103,7 @@ impl RenderPipeline {
                 binding   : e.binding,
                 visibility: e.visibility,
                 ty        : bind_kind_to_wgpu_ty(e.kind),
-                count     : None,
+                count     : bind_kind_to_wgpu_count(e.kind),
             })
             .collect();
 
@@ -123,7 +123,7 @@ impl RenderPipeline {
                         binding   : e.binding,
                         visibility: e.visibility,
                         ty        : bind_kind_to_wgpu_ty(e.kind),
-                        count     : None,
+                        count     : bind_kind_to_wgpu_count(e.kind),
                     })
                     .collect();
 

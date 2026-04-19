@@ -392,11 +392,80 @@ fn classify_var(module: &Module, var_id: Word, binding: u32)
         return classify_image(module, pointee_id, binding);
     }
 
-    let struct_id = find_type(module, Op::TypePointer, ptr_id)
+    let pointee_id = find_type(module, Op::TypePointer, ptr_id)
         .and_then(|i| as_id(i.operands.get(1)))
         .ok_or_else(|| refl_err!(
-            "binding {binding}: cannot follow pointer type {ptr_id} to a struct",
+            "binding {binding}: cannot follow pointer type {ptr_id} to a pointee",
         ))?;
+
+    // Binding-array shape: the pointer points at OpTypeArray (or
+    // OpTypeRuntimeArray) whose element is a Block-decorated struct.
+    // Runtime-array-of-struct-buffer descriptor arrays are rejected
+    // explicitly — the renderer uses fixed-count arrays so reflection can
+    // report the count up front.
+    if let Some(rta_inst) = find_type(module, Op::TypeRuntimeArray, pointee_id) {
+        let element_type = as_id(rta_inst.operands.first()).unwrap_or(0);
+        if struct_block_decoration(module, element_type).is_some() {
+            return Err(refl_err!(
+                "binding {binding}: runtime-array descriptor arrays \
+                 (`StructuredBuffer<T> a[]` with no size) are not supported; \
+                 declare a fixed array length — e.g. `StructuredBuffer<T> a[N]` \
+                 — so reflection can pin the count",
+            ));
+        }
+        // Non-struct runtime array on a descriptor variable shouldn't arise
+        // from DXC output; fall through to the error below.
+    }
+
+    if let Some(array_inst) = find_type(module, Op::TypeArray, pointee_id) {
+        let element_type = as_id(array_inst.operands.first()).ok_or_else(|| refl_err!(
+            "binding {binding}: OpTypeArray has no element-type operand",
+        ))?;
+        let length_const = as_id(array_inst.operands.get(1)).ok_or_else(|| refl_err!(
+            "binding {binding}: OpTypeArray has no length-constant operand",
+        ))?;
+        let count = find_constant_u32(module, length_const).ok_or_else(|| refl_err!(
+            "binding {binding}: OpTypeArray length constant {length_const} is not a u32",
+        ))?;
+
+        if find_type(module, Op::TypeStruct, element_type).is_some() {
+            let block = struct_block_decoration(module, element_type);
+            match (sc, block) {
+                (StorageClass::StorageBuffer, Some(Decoration::Block))
+                | (StorageClass::Uniform,       Some(Decoration::BufferBlock)) => {
+                    let element_size = storage_buffer_size_from_struct(module, element_type)
+                        .ok_or_else(|| refl_err!(
+                            "binding {binding}: array-element struct {element_type} has no \
+                             runtime-array last member with ArrayStride decoration",
+                        ))?;
+
+                    // Binding arrays of storage buffers are read-only in M1
+                    // (`StructuredBuffer<T> a[N]`). A read-write binding
+                    // array would need a distinct BindKind and the shader
+                    // has no source form for it today; reject it loudly if
+                    // it ever appears (no `NonWritable` ⇒ rw).
+                    let read_only = var_is_non_writable(module, var_id)
+                        || struct_member_is_non_writable(module, element_type);
+                    if !read_only {
+                        return Err(refl_err!(
+                            "binding {binding}: read-write descriptor arrays of storage \
+                             buffers are not supported; declare \
+                             `StructuredBuffer<T> a[N]` (read-only) for binding arrays",
+                        ));
+                    }
+
+                    return Ok(BindKind::StorageBufferReadOnlyArray {
+                        count,
+                        element_size,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Scalar storage/uniform buffer: pointee is the struct directly.
+    let struct_id = pointee_id;
 
     let block = struct_block_decoration(module, struct_id);
 
@@ -1428,6 +1497,170 @@ mod tests {
             "slot 1 should be StorageBufferReadWrite {{ size: 4 }}, got {:?}",
             reflected.entries[1].kind,
         );
+    }
+
+    /// Build a SPIR-V compute shader with a read-only storage-buffer
+    /// *binding array* at `(set=0, binding=0)`, count `array_count`, struct
+    /// stride `element_stride`. The inner storage-buffer struct carries
+    /// `Block` + `NonWritable` on member 0 (the DXC emission shape for
+    /// read-only `StructuredBuffer<T>`); the outer array is `OpTypeArray`
+    /// with a constant length.
+    ///
+    /// IDs: %1=void, %2=voidfn, %3=main, %4=label,
+    ///      %5=uint, %6=rta, %7=struct_block, %8=count_constant,
+    ///      %9=array_type, %10=ptr, %11=var. Bound=12.
+    fn compute_spirv_with_storage_binding_array(
+        array_count    : u32,
+        element_stride : u32,
+    ) -> Vec<u8> {
+        let mut w: Vec<u32> = Vec::new();
+
+        // Header (bound = 12)
+        w.extend_from_slice(&[0x07230203, 0x00010100, 0x00000000, 0x0000000C, 0x00000000]);
+
+        // OpCapability Shader
+        w.extend_from_slice(&[0x00020011, 0x00000001]);
+
+        // OpMemoryModel Logical GLSL450
+        w.extend_from_slice(&[0x0003000E, 0x00000000, 0x00000001]);
+
+        // OpEntryPoint GLCompute %3 "main"
+        w.extend_from_slice(&[0x0005000F, 0x00000005, 0x00000003, 0x6E69616D, 0x00000000]);
+
+        // OpExecutionMode %3 LocalSize 64 1 1
+        w.extend_from_slice(&[0x00060010, 0x00000003, 0x00000011, 64, 1, 1]);
+
+        // --- Annotations ---
+
+        // OpDecorate %11 DescriptorSet 0
+        w.extend_from_slice(&[0x00040047, 0x0000000B, 0x00000022, 0x00000000]);
+        // OpDecorate %11 Binding 0
+        w.extend_from_slice(&[0x00040047, 0x0000000B, 0x00000021, 0x00000000]);
+        // OpDecorate %7 Block  (modern storage buffer — element struct)
+        w.extend_from_slice(&[0x00030047, 0x00000007, 0x00000002]);
+        // OpDecorate %6 ArrayStride element_stride  (runtime array stride inside struct)
+        w.extend_from_slice(&[0x00040047, 0x00000006, 0x00000006, element_stride]);
+        // OpMemberDecorate %7 0 NonWritable  — marks the inner RTA member
+        // as read-only, reproducing DXC's StructuredBuffer<T> shape.
+        w.extend_from_slice(&[0x00040048, 0x00000007, 0x00000000, 0x00000018]);
+
+        // --- Types / constants ---
+
+        // %1 = OpTypeVoid
+        w.extend_from_slice(&[0x00020013, 0x00000001]);
+        // %2 = OpTypeFunction %1
+        w.extend_from_slice(&[0x00030021, 0x00000002, 0x00000001]);
+        // %5 = OpTypeInt 32 0
+        w.extend_from_slice(&[0x00040015, 0x00000005, 0x00000020, 0x00000000]);
+        // %6 = OpTypeRuntimeArray %5
+        w.extend_from_slice(&[0x0003001D, 0x00000006, 0x00000005]);
+        // %7 = OpTypeStruct %6   — the Block-decorated storage-buffer struct
+        w.extend_from_slice(&[0x0003001E, 0x00000007, 0x00000006]);
+        // %8 = OpConstant %5 <array_count>   (array length)
+        w.extend_from_slice(&[0x0004002B, 0x00000005, 0x00000008, array_count]);
+        // %9 = OpTypeArray %7 %8
+        w.extend_from_slice(&[0x0004001C, 0x00000009, 0x00000007, 0x00000008]);
+        // %10 = OpTypePointer StorageBuffer %9
+        w.extend_from_slice(&[0x00040020, 0x0000000A, 0x0000000C, 0x00000009]);
+        // %11 = OpVariable %10 StorageBuffer
+        w.extend_from_slice(&[0x0004003B, 0x0000000A, 0x0000000B, 0x0000000C]);
+
+        // --- Function ---
+        w.extend_from_slice(&[0x00050036, 0x00000001, 0x00000003, 0x00000000, 0x00000002]);
+        w.extend_from_slice(&[0x000200F8, 0x00000004]);
+        w.push(0x000100FD);
+        w.push(0x00010038);
+
+        w.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// A fixed-count binding array of read-only storage buffers reflects
+    /// as [`BindKind::StorageBufferReadOnlyArray`] with the declared count
+    /// and the inner struct's element stride.
+    #[test]
+    fn reflect_spirv_binding_array_of_structured_buffers_reflects_as_array() {
+        let spv = compute_spirv_with_storage_binding_array(8, 4);
+        let reflected = reflect_spirv(&spv, "main")
+            .expect("reflect_spirv should succeed on a storage-buffer binding array");
+
+        assert_eq!(reflected.entries.len(), 1);
+        assert_eq!(reflected.entries[0].binding, 0);
+        assert!(
+            matches!(
+                reflected.entries[0].kind,
+                BindKind::StorageBufferReadOnlyArray { count: 8, element_size: 4 },
+            ),
+            "expected StorageBufferReadOnlyArray {{ count: 8, element_size: 4 }}, \
+             got {:?}",
+            reflected.entries[0].kind,
+        );
+    }
+
+    /// Build a SPIR-V compute shader with an OpTypeRuntimeArray of a
+    /// Block-decorated struct at `(set=0, binding=0)` — the shape that
+    /// corresponds to HLSL `StructuredBuffer<T> a[]` with no size. This
+    /// is explicitly unsupported and must error.
+    fn compute_spirv_with_runtime_sized_binding_array() -> Vec<u8> {
+        let mut w: Vec<u32> = Vec::new();
+
+        // Header (bound = 11)
+        w.extend_from_slice(&[0x07230203, 0x00010100, 0x00000000, 0x0000000B, 0x00000000]);
+        w.extend_from_slice(&[0x00020011, 0x00000001]);
+        w.extend_from_slice(&[0x0003000E, 0x00000000, 0x00000001]);
+        w.extend_from_slice(&[0x0005000F, 0x00000005, 0x00000003, 0x6E69616D, 0x00000000]);
+        w.extend_from_slice(&[0x00060010, 0x00000003, 0x00000011, 64, 1, 1]);
+
+        // DescriptorSet 0, Binding 0 on var %10
+        w.extend_from_slice(&[0x00040047, 0x0000000A, 0x00000022, 0x00000000]);
+        w.extend_from_slice(&[0x00040047, 0x0000000A, 0x00000021, 0x00000000]);
+        // Block on %7 (inner storage-buffer struct)
+        w.extend_from_slice(&[0x00030047, 0x00000007, 0x00000002]);
+        w.extend_from_slice(&[0x00040047, 0x00000006, 0x00000006, 0x00000004]);
+        w.extend_from_slice(&[0x00040048, 0x00000007, 0x00000000, 0x00000018]);
+
+        // Types: %1 void, %2 voidfn, %5 uint, %6 RTA uint, %7 struct RTA,
+        //        %8 RTA-of-struct (the unbounded binding array), %9 ptr,
+        //        %10 var.
+        w.extend_from_slice(&[0x00020013, 0x00000001]);
+        w.extend_from_slice(&[0x00030021, 0x00000002, 0x00000001]);
+        w.extend_from_slice(&[0x00040015, 0x00000005, 0x00000020, 0x00000000]);
+        w.extend_from_slice(&[0x0003001D, 0x00000006, 0x00000005]);
+        w.extend_from_slice(&[0x0003001E, 0x00000007, 0x00000006]);
+        // %8 = OpTypeRuntimeArray %7
+        w.extend_from_slice(&[0x0003001D, 0x00000008, 0x00000007]);
+        // %9 = OpTypePointer StorageBuffer %8
+        w.extend_from_slice(&[0x00040020, 0x00000009, 0x0000000C, 0x00000008]);
+        // %10 = OpVariable %9 StorageBuffer
+        w.extend_from_slice(&[0x0004003B, 0x00000009, 0x0000000A, 0x0000000C]);
+
+        w.extend_from_slice(&[0x00050036, 0x00000001, 0x00000003, 0x00000000, 0x00000002]);
+        w.extend_from_slice(&[0x000200F8, 0x00000004]);
+        w.push(0x000100FD);
+        w.push(0x00010038);
+
+        w.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    /// Runtime-sized descriptor arrays (`StructuredBuffer<T> a[]`) are
+    /// explicitly unsupported — reflection must return a clear error
+    /// rather than silently reporting a bogus count.
+    #[test]
+    fn reflect_spirv_runtime_sized_binding_array_errors() {
+        let spv = compute_spirv_with_runtime_sized_binding_array();
+        let result = reflect_spirv(&spv, "main");
+
+        match result {
+            Err(RendererError::ShaderReflectionFailed(msg)) => {
+                assert!(
+                    msg.contains("runtime-array") || msg.contains("fixed array length"),
+                    "expected runtime-array error message, got: {msg}",
+                );
+            }
+            other => panic!(
+                "expected ShaderReflectionFailed for runtime-sized binding array, \
+                 got {other:?}",
+            ),
+        }
     }
 
     /// Uniform buffer entries show up in `entries` at the correct slot and

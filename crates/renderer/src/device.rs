@@ -7,6 +7,56 @@
 use crate::error::RendererError;
 use crate::frame::{FrameCount, FrameIndex};
 
+// --- Device feature/limit policy ---
+
+/// The wgpu feature set the renderer requires on every device.
+///
+/// Separated from the two adapter-request sites (windowed / headless) so
+/// both constructors stay in sync. If an adapter cannot advertise these,
+/// device creation fails — the renderer does not have a feature-detect
+/// fallback path.
+///
+/// Notes on the binding-array group:
+///
+/// - `BUFFER_BINDING_ARRAY` enables fixed-count arrays of uniform / storage
+///   buffers in a single bind group slot (`StructuredBuffer<T> a[N]`). Base
+///   capability.
+/// - `STORAGE_RESOURCE_BINDING_ARRAY` extends the above to storage-class
+///   buffers and images specifically. Required because the material-data
+///   pool is a storage buffer array.
+/// - `PARTIALLY_BOUND_BINDING_ARRAY` allows binding fewer than the
+///   declared `count` buffers at a time. Required because the material-data
+///   pool declares `[MAX_SEGMENTS]` but only `segments_live` entries are
+///   populated before the first grow event.
+///
+/// See `decision-material-system-m1-sparse` and
+/// `failure-binding-array-limit-zero`.
+fn required_features() -> wgpu::Features {
+    wgpu::Features::PASSTHROUGH_SHADERS
+        | wgpu::Features::IMMEDIATES
+        | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+        | wgpu::Features::BUFFER_BINDING_ARRAY
+        | wgpu::Features::STORAGE_RESOURCE_BINDING_ARRAY
+        | wgpu::Features::PARTIALLY_BOUND_BINDING_ARRAY
+}
+
+/// The wgpu limits the renderer explicitly raises above
+/// [`wgpu::Limits::default`] defaults.
+///
+/// - `max_immediate_size: 8` — the renderer uses 8-byte immediate blocks.
+/// - `max_binding_array_elements_per_shader_stage: 16` — matches the
+///   material-data pool's `MAX_SEGMENTS = 16`. The wgpu default is 0; any
+///   device that advertises the binding-array features will supply at
+///   least 500_000, so the raise is safe on any real adapter (see
+///   `failure-binding-array-limit-zero`).
+fn required_limits() -> wgpu::Limits {
+    wgpu::Limits {
+        max_immediate_size: 8,
+        max_binding_array_elements_per_shader_stage: 16,
+        ..wgpu::Limits::default()
+    }
+}
+
 // --- WindowedState ---
 
 /// Surface state owned by a windowed [`RendererContext`].  Absent for
@@ -70,13 +120,8 @@ impl RendererContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("renderer_headless_device"),
-                required_features: wgpu::Features::PASSTHROUGH_SHADERS
-                    | wgpu::Features::IMMEDIATES
-                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
-                required_limits: wgpu::Limits {
-                    max_immediate_size: 8,
-                    ..wgpu::Limits::default()
-                },
+                required_features: required_features(),
+                required_limits: required_limits(),
                 ..Default::default()
             })
             .await
@@ -177,13 +222,8 @@ impl RendererContext {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label            : Some("renderer_windowed_device"),
-                required_features: wgpu::Features::PASSTHROUGH_SHADERS
-                    | wgpu::Features::IMMEDIATES
-                    | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT,
-                required_limits  : wgpu::Limits {
-                    max_immediate_size: 8,
-                    ..wgpu::Limits::default()
-                },
+                required_features: required_features(),
+                required_limits  : required_limits(),
                 ..Default::default()
             })
             .await

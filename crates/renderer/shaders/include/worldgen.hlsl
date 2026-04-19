@@ -156,4 +156,44 @@ float terrain_height(float2 xz, uint seed) {
     return base_offset + (n - 0.5) * amplitude;
 }
 
+// -----------------------------------------------------------------------
+// Block-ID aliases for M1's three-material terrain. Must stay in lockstep
+// with the Rust-side `BLOCK_ID_{GRASS,DIRT,STONE}` constants in
+// `crates/game/src/world_view.rs`; the registry registration order there
+// is what assigns these raw ids.
+// -----------------------------------------------------------------------
+#define BLOCK_ID_AIR    0u
+#define BLOCK_ID_GRASS  1u
+#define BLOCK_ID_DIRT   2u
+#define BLOCK_ID_STONE  3u
+
+// Per-voxel material ID at world-space point `wp` for the M1 three-block
+// heightfield terrain.
+//
+//   y == floor(terrain_height(xz)) → grass (surface cell)
+//   y in [height - 3, height)      → dirt  (subsoil band, 2 cells thick)
+//   y <  height - 3                → stone (deeper bedrock)
+//   y >= height                    → air   (above the local surface)
+//
+// Called only at wp positions that were already classified as solid by
+// `terrain_occupied` — see the fused `coarse_occupied` walker in
+// `subchunk_prep.cs.hlsl` which pairs each solid-cell discovery with
+// its material sample. Defensive AIR return for `delta < 0` guards
+// against future callers sampling above the surface.
+uint terrain_material(float3 wp, uint seed) {
+    float h     = terrain_height(wp.xz, seed);
+    float delta = h - wp.y;   // positive when wp is below the surface.
+
+    if (delta < 0.0) {
+        return BLOCK_ID_AIR;
+    }
+    if (delta < 1.0) {
+        return BLOCK_ID_GRASS;
+    }
+    if (delta < 3.0) {
+        return BLOCK_ID_DIRT;
+    }
+    return BLOCK_ID_STONE;
+}
+
 #endif // RENDERER_WORLDGEN_HLSL

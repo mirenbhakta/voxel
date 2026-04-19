@@ -88,6 +88,49 @@ impl From<TextureHandle> for ResourceId {
     }
 }
 
+// --- BindResource ---
+
+/// A bind-group slot's resource: either a single resource (scalar binding)
+/// or a list of resources (binding array).
+///
+/// Scalar slots (uniform / storage buffer, sampled / storage texture) carry
+/// a single [`ResourceId`]; binding-array slots (currently only
+/// [`BindKind::StorageBufferReadOnlyArray`](crate::pipeline::BindKind::StorageBufferReadOnlyArray))
+/// carry an ordered list whose length may be less than the declared array
+/// count — under `PARTIALLY_BOUND_BINDING_ARRAY` the remaining descriptors
+/// stay unbound.
+///
+/// `BindResource: From<ResourceId>` so existing scalar call sites keep
+/// writing `(binding, some_handle.into())`.
+///
+/// [`BindKind::StorageBufferReadOnlyArray`]: crate::pipeline::BindKind::StorageBufferReadOnlyArray
+#[derive(Clone, Debug)]
+pub enum BindResource {
+    /// A single resource occupies the slot. The common case.
+    Single(ResourceId),
+    /// An ordered list of resources. Used for binding-array slots such as
+    /// the material-data pool.
+    Array(Vec<ResourceId>),
+}
+
+impl From<ResourceId> for BindResource {
+    fn from(id: ResourceId) -> Self {
+        BindResource::Single(id)
+    }
+}
+
+impl From<BufferHandle> for BindResource {
+    fn from(h: BufferHandle) -> Self {
+        BindResource::Single(h.into())
+    }
+}
+
+impl From<TextureHandle> for BindResource {
+    fn from(h: TextureHandle) -> Self {
+        BindResource::Single(h.into())
+    }
+}
+
 // --- Access ---
 
 /// How a pass accesses a resource.

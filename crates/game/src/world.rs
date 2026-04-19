@@ -8,6 +8,7 @@
 
 pub mod coord;
 pub mod lod;
+pub mod material_data_pool;
 pub mod material_pool;
 pub mod pool;
 pub mod residency;

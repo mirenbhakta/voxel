@@ -10,7 +10,7 @@ pub use compute::{ComputePipeline, ComputePipelineDescriptor};
 pub use reflect::Reflected;
 pub use render::{RenderPipeline, RenderPipelineDescriptor};
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 
 // --- PipelineBindLayout ---
 
@@ -43,6 +43,12 @@ pub trait PipelineBindLayout {
 // --- bind_kind_to_wgpu_ty ---
 
 /// Convert a [`BindKind`] to the corresponding `wgpu::BindingType`.
+///
+/// For binding-array kinds (currently just
+/// [`BindKind::StorageBufferReadOnlyArray`]) the returned `BindingType`
+/// describes a single element; the array count lives on the
+/// `BindGroupLayoutEntry::count` field and is retrieved separately via
+/// [`bind_kind_to_wgpu_count`].
 pub(crate) fn bind_kind_to_wgpu_ty(kind: BindKind) -> wgpu::BindingType {
     match kind {
         BindKind::UniformBuffer { size } => wgpu::BindingType::Buffer {
@@ -60,6 +66,12 @@ pub(crate) fn bind_kind_to_wgpu_ty(kind: BindKind) -> wgpu::BindingType {
             has_dynamic_offset: false,
             min_binding_size: NonZeroU64::new(size),
         },
+        BindKind::StorageBufferReadOnlyArray { element_size, .. } =>
+            wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: NonZeroU64::new(element_size),
+            },
         BindKind::SampledTexture { sample_type, view_dimension } =>
             wgpu::BindingType::Texture {
                 sample_type,
@@ -72,5 +84,19 @@ pub(crate) fn bind_kind_to_wgpu_ty(kind: BindKind) -> wgpu::BindingType {
                 format,
                 view_dimension,
             },
+    }
+}
+
+// --- bind_kind_to_wgpu_count ---
+
+/// Return the `BindGroupLayoutEntry::count` value for a [`BindKind`].
+///
+/// Array-flavored binding kinds (currently just
+/// [`BindKind::StorageBufferReadOnlyArray`]) return `Some(count)`; every
+/// other kind returns `None` (scalar binding).
+pub(crate) fn bind_kind_to_wgpu_count(kind: BindKind) -> Option<NonZeroU32> {
+    match kind {
+        BindKind::StorageBufferReadOnlyArray { count, .. } => NonZeroU32::new(count),
+        _ => None,
     }
 }

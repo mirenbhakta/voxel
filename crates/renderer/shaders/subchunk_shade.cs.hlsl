@@ -32,13 +32,19 @@
 // `gpu_consts.hlsl` which pins it to [[vk::binding(0, 0)]]. The Rust side
 // must pass `Some(gpu_consts)` to `create_bind_group` for this pass.
 //
-//   set 0 binding 0 : `g_consts`    — implicit from `directory.hlsl`.
-//   set 0 binding 1 : `g_vis`       — `Texture2D<uint>` vis buffer.
-//   set 0 binding 2 : `g_out`       — `RWTexture2D<float4>` storage image.
-//   set 0 binding 3 : `g_directory` — `StructuredBuffer<DirEntry>`, read-only.
-//   set 0 binding 4 : `g_occ_array` — `StructuredBuffer<SubchunkOcc>`, read-only.
-//   set 0 binding 5 : `g_camera`    — `ConstantBuffer<Camera>`, per-frame camera.
-//   set 0 binding 6 : `g_depth`     — `Texture2D<float>` depth buffer (Depth32Float).
+//   set 0 binding 0 : `g_consts`           — implicit from `directory.hlsl`.
+//   set 0 binding 1 : `g_vis`              — `Texture2D<uint>` vis buffer.
+//   set 0 binding 2 : `g_out`              — `RWTexture2D<float4>` storage image.
+//   set 0 binding 3 : `g_directory`        — `StructuredBuffer<DirEntry>`, read-only.
+//   set 0 binding 4 : `g_occ_array`        — `StructuredBuffer<SubchunkOcc>`, read-only.
+//   set 0 binding 5 : `g_camera`           — `ConstantBuffer<Camera>`, per-frame camera.
+//   set 0 binding 6 : `g_depth`            — `Texture2D<float>` depth buffer (Depth32Float).
+//   set 0 binding 7 : `g_materials`        — `StructuredBuffer<MaterialDesc>`, descriptor table.
+//   set 1 binding 0 : `material_data_pool` — `StructuredBuffer<MaterialBlock>[MAX_MATERIAL_POOL_SEGMENTS]`,
+//                                            per-sub-chunk material IDs; partially bound.
+//                                            Kept in set 1 because wgpu disallows mixing a binding
+//                                            array with uniform buffers in one set (the set-0
+//                                            `g_consts` + `g_camera` are uniforms).
 //
 // The workgroup size is 8×8 — one thread per output pixel. The dispatch
 // grid is `(w + 7)/8 × (h + 7)/8` so right/bottom edge threads may read
@@ -48,6 +54,7 @@
 // slot 0. It also brings in `DirEntry`, `direntry_*` accessors,
 // `resolve_coord_to_slot`, and `resolve_and_verify` needed by `dda_world`.
 #include "include/directory.hlsl"
+#include "include/material.hlsl"
 
 // SubchunkOcc must be declared before including dda.hlsl. Matches the
 // layout in subchunk.ps.hlsl and the 64-byte GPU representation of
@@ -98,6 +105,26 @@ struct Camera {
 // `Depth32Float` — accessed here as a plain float sampled texture.
 [[vk::binding(6, 0)]] Texture2D<float> g_depth;
 
+// Global material descriptor table (`MaterialDesc[MATERIAL_DESC_CAPACITY]`).
+// Populated once at startup from the BlockRegistry. Fetched by
+// `material_fetch_albedo_linear` on every shaded pixel.
+[[vk::binding(7, 0)]] StructuredBuffer<MaterialDesc> g_materials;
+
+// Per-sub-chunk material-data pool — binding array of 64 MB segments.
+// Lives in set 1 (not set 0) so it can coexist with the uniform
+// buffers in set 0 — wgpu rejects "binding array + uniform buffer in
+// the same set" (validation error 'Bind groups may not contain both a
+// binding array and a uniform buffer').
+//
+// Indexed as `material_data_pool[segment_idx][local_idx]` after the
+// `material_data_slot` from DirEntry is decomposed into
+// `(segment_idx, local_idx) = (slot / SLOTS_PER_SEGMENT,
+// slot % SLOTS_PER_SEGMENT)`. See `decision-material-system-m1-sparse`
+// for the reads-through-DirEntry-indirection invariant; the compute
+// shader body is the only place that performs the div/mod decode.
+[[vk::binding(0, 1)]]
+StructuredBuffer<MaterialBlock> material_data_pool[MAX_MATERIAL_POOL_SEGMENTS];
+
 // Projection constants — must match `subchunk.vs.hlsl` and
 // `subchunk.ps.hlsl` exactly.
 static const float NEAR_PLANE = 0.1;
@@ -119,9 +146,12 @@ static const float3 SUN_COLOR    = float3(1.00, 0.95, 0.85);
 static const float3 SKY_COLOR    = float3(0.50, 0.70, 0.95);
 static const float3 GROUND_COLOR = float3(0.15, 0.12, 0.10);
 
-// Constant grey until per-voxel material lookup lands. Picked low enough
-// that `albedo * (sun + sky)` stays in the displayable range.
-static const float3 ALBEDO       = float3(0.50, 0.50, 0.50);
+// Sentinel colour drawn when `DirEntry.material_data_slot ==
+// MATERIAL_DATA_SLOT_INVALID`. Two causes: (1) the materializer was
+// allocator-exhausted this frame and the grow is deferred to next frame;
+// (2) the pool ceiling has been reached and no more segments can be
+// appended. Either way the user-visible magenta is the signal.
+static const float3 MAGENTA_SENTINEL = float3(1.00, 0.00, 1.00);
 
 // Maximum shadow-ray distance in world units. Well past the horizon at
 // level 0 and still meaningful at coarser levels — any occluder further
@@ -226,7 +256,34 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Shadow attenuation: 0.0 if occluded, 1.0 if unoccluded.
     float shadow = s.hit ? 0.0 : 1.0;
 
-    float3 lit = ALBEDO * (SUN_COLOR * ndotl * shadow + ambient);
+    // --- Per-voxel albedo via DirEntry.material_data_slot ---
+    //
+    // Read the material-data slot through the authoritative indirection
+    // (`direntry_get_material_data_slot`). Must never substitute
+    // `occ_slot` in the pool decode — that re-introduces the
+    // failure-allocator-identity-drift bug class that M1 explicitly
+    // builds away from (see `decision-material-system-m1-sparse`).
+    DirEntry de  = g_directory[occ_slot];
+    uint     mds = direntry_get_material_data_slot(de);
+
+    float3 albedo;
+    if (mds == MATERIAL_DATA_SLOT_INVALID) {
+        // Deferred-grow or ceiling-reached sub-chunk. Surface the state
+        // visually so the user + RenderDoc can trace it.
+        albedo = MAGENTA_SENTINEL;
+    } else {
+        // The flat slot decodes to `(segment, local)` at this single
+        // point — div/mod on `mds` (never on `occ_slot`). `local_idx`
+        // unpacked from the vis buffer above is the sub-chunk-local
+        // voxel index (0..511); it parameterises `material_block_read_id`.
+        uint          seg_idx   = mds / SLOTS_PER_SEGMENT;
+        uint          pool_slot = mds - seg_idx * SLOTS_PER_SEGMENT;
+        MaterialBlock mb        = material_data_pool[seg_idx][pool_slot];
+        uint          mat_id    = material_block_read_id(mb, local_idx);
+        albedo = material_fetch_albedo_linear(g_materials, mat_id);
+    }
+
+    float3 lit = albedo * (SUN_COLOR * ndotl * shadow + ambient);
 
     g_out[tid.xy] = float4(lit, 1.0);
 }

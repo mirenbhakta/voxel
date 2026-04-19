@@ -134,6 +134,15 @@ struct Occupancy {
 [[vk::binding(4, 0)]] RWByteAddressBuffer             g_dirty_list;
 [[vk::binding(5, 0)]] StructuredBuffer<DirEntry>      g_directory;
 
+// Parallel staging buffer for per-voxel material IDs. One 1 KB
+// `MaterialBlock` per request (= 256 u32 packing 2 u16 IDs each). Indexed
+// by `gid.x`, byte-symmetric with `g_staging_occ`. See `material.hlsl`
+// for the on-disk layout.
+//
+// Declared at slot 6 so reflection picks it up deterministically.
+#include "include/material.hlsl"
+[[vk::binding(6, 0)]] RWStructuredBuffer<MaterialBlock> g_staging_material_ids;
+
 // The shared neighbour-aware-exposure helper depends on `g_directory` +
 // `g_material_pool` being in scope as globals, so include it after their
 // declarations. Used by both this shader and `subchunk_exposure.cs.hlsl`
@@ -178,6 +187,14 @@ bool terrain_occupied(float3 wp) {
 // cells)` reduction down to its base case: an L-voxel is solid iff any
 // L_0 cell it covers is solid.
 //
+// This fused variant *additionally* returns the **plurality** material
+// ID across all solid L_0 cells in the footprint (ties broken by lower
+// block id), so the caller doesn't need a second pass. Choosing by
+// plurality is position-agnostic — it doesn't privilege any axis, so
+// it works for heightfields, 3D-noise worlds, asteroid fields, caves,
+// and overhangs alike. `out_mat` is `BLOCK_ID_AIR` when the return
+// value is false.
+//
 // L_0 cells inside the L-voxel sit at integer world-space lower corners
 // in `[0, 2^lvl)^3` relative to `coarse_base_wp`. Centres are offset by
 // `+ 0.5` along each axis (matching `terrain_occupied`'s "voxel centre"
@@ -190,22 +207,50 @@ bool terrain_occupied(float3 wp) {
 // guaranteed to be solid whenever any covered finer cell is solid.
 //
 // Cost: O(8^lvl) density evals per L-voxel. At lvl=0 this collapses to
-// the old single-sample path (extent=1, exactly one iteration). Early-out
-// on first solid keeps heightfield columns cheap — typical solid-bottom
-// L_2 voxels return after one eval.
-bool coarse_occupied(uint lvl, float3 coarse_base_wp) {
+// a single eval (extent=1, one iteration). Coarser LODs walk the full
+// footprint without early-out because the plurality needs the full
+// count — this is roughly `64 · 8^lvl` ALU cycles per L-voxel
+// (dominant cost is the FBM evaluation inside `terrain_occupied`). At
+// L=2 that's ~4k cycles per voxel; M1 doesn't go coarser than this.
+// When a future LOD ceiling makes this painful, swap the count loop
+// for a stratified subsample or hash-selected representative cell.
+bool coarse_occupied(uint lvl, float3 coarse_base_wp, out uint out_mat) {
     uint extent = 1u << lvl;
+
+    // Counts per block id. The registry has up to 4 entries in M1
+    // (air / grass / dirt / stone); resize this array if the registry
+    // grows. Index 0 (AIR) is never incremented — air cells fall out
+    // of `terrain_occupied`.
+    uint counts[4] = { 0u, 0u, 0u, 0u };
+
     [loop] for (uint dz = 0u; dz < extent; ++dz) {
         [loop] for (uint dy = 0u; dy < extent; ++dy) {
             [loop] for (uint dx = 0u; dx < extent; ++dx) {
                 float3 wp = coarse_base_wp + float3(dx, dy, dz) + 0.5;
                 if (terrain_occupied(wp)) {
-                    return true;
+                    uint mat = terrain_material(wp, g_consts.world_seed);
+                    if (mat < 4u) {
+                        counts[mat] += 1u;
+                    }
                 }
             }
         }
     }
-    return false;
+
+    // Plurality pick, skipping AIR. A solid L-voxel has at least one
+    // non-AIR count > 0; an empty L-voxel leaves all counts at 0 and
+    // out_mat falls through to AIR + return false.
+    uint best_mat   = BLOCK_ID_AIR;
+    uint best_count = 0u;
+    [unroll] for (uint i = 1u; i < 4u; ++i) {
+        if (counts[i] > best_count) {
+            best_count = counts[i];
+            best_mat   = i;
+        }
+    }
+
+    out_mat = best_mat;
+    return best_mat != BLOCK_ID_AIR;
 }
 
 [numthreads(4, 4, 4)]
@@ -225,6 +270,29 @@ void main(uint3 ltid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint lidx : SV_
     // Each thread covers a 2×2×2 voxel cube starting at (ltid * 2).
     uint3 origin = ltid * 2u;
 
+    // Per-thread pack of the 4 u32 words this thread contributes to the
+    // material-id staging block. Initialised to 0 (all-air); each voxel
+    // that resolves to solid overwrites its 16-bit lane with the block
+    // id chosen by `terrain_material`.
+    //
+    // Thread coverage within the 2×2×2 cube at `origin = ltid * 2`:
+    //   - Word layout in `MaterialBlock.packed_ids` is
+    //       word[(voxel_idx) / 2]: low = voxel 2k, high = voxel 2k+1,
+    //     and `voxel_idx = x + 8y + 64z`. Pairs (dx=0, dx=1) share a word.
+    //   - Each thread owns exactly 4 words: (dy, dz) ∈ {0,1}² at the
+    //     even dx. Precompute their indices so the final writes are
+    //     loop-free.
+    uint pack_word_idx[4];
+    [unroll] for (uint pw = 0u; pw < 4u; ++pw) {
+        uint dy_p = pw & 1u;
+        uint dz_p = pw >> 1u;
+        uint even_voxel_idx = origin.x
+                            + 8u  * (origin.y + dy_p)
+                            + 64u * (origin.z + dz_p);
+        pack_word_idx[pw] = even_voxel_idx >> 1u;
+    }
+    uint pack_word_val[4] = { 0u, 0u, 0u, 0u };
+
     [unroll] for (uint dz = 0u; dz < 2u; ++dz) {
         [unroll] for (uint dy = 0u; dy < 2u; ++dy) {
             [unroll] for (uint dx = 0u; dx < 2u; ++dx) {
@@ -239,8 +307,16 @@ void main(uint3 ltid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint lidx : SV_
                 // eval at `corner + 0.5` matches the previous path
                 // bit-for-bit. See the helper's docstring for the
                 // load-bearing monotonicity property this gives step 3.
+                //
+                // The fused helper also returns the material ID of the
+                // first solid L_0 cell it encounters, so the coarse
+                // L-voxel is guaranteed to take the material of an
+                // actual solid cell in its footprint (a 2×2×2 L_1 voxel
+                // whose only solid cell is grass renders as grass, not
+                // stone, not air).
                 float3 coarse_base = base + float3(x, y, z) * voxel_size;
-                if (!coarse_occupied(req.level, coarse_base)) {
+                uint   coarse_mat_id;
+                if (!coarse_occupied(req.level, coarse_base, coarse_mat_id)) {
                     continue;
                 }
 
@@ -250,11 +326,28 @@ void main(uint3 ltid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint lidx : SV_
 
                 uint unused;
                 InterlockedOr(gs_planes[word], 1u << bit_in_word, unused);
+
+                // Pack the per-voxel material ID into the appropriate
+                // 16-bit lane of this thread's cache. `coarse_mat_id`
+                // is always a solid-cell material for a solid L-voxel
+                // (see `coarse_occupied` docstring).
+                uint   mat_id    = coarse_mat_id & 0xFFFFu;
+                uint   pw        = dy + 2u * dz;
+                uint   hi        = dx;   // dx==0 → low 16, dx==1 → high 16
+                pack_word_val[pw] |= mat_id << (hi * 16u);
             }
         }
     }
 
     GroupMemoryBarrierWithGroupSync();
+
+    // Each thread stores its 4 u32 words into the material-id staging
+    // block. Every `pack_word_idx` is unique per thread (no collision
+    // across threads — the even_voxel_idx pairing guarantees this), so
+    // a direct `[]` store is safe without InterlockedOr.
+    [unroll] for (uint pw2 = 0u; pw2 < 4u; ++pw2) {
+        g_staging_material_ids[gid.x].packed_ids[pack_word_idx[pw2]] = pack_word_val[pw2];
+    }
 
     // Thread 0: write staging, classify, diff, and append to the dirty list.
     // The staging write is serialized here (16 stores) rather than fanned

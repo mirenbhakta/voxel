@@ -35,11 +35,14 @@ use std::sync::Arc;
 use renderer::{
     BITS_EXPOSURE_MASK, BITS_IS_SOLID, BITS_MATERIAL_SLOT_SHIFT, BITS_RESIDENT,
     DirEntry, DirtyEntry, EXPOSURE_STAGING_REQUEST_IDX_SENTINEL, FrameIndex,
-    GpuConsts, GpuConstsData, LevelStatic, LodMaskUniform, MATERIAL_SLOT_INVALID,
+    GpuConsts, GpuConstsData, LevelStatic, LodMaskUniform, MATERIAL_DESC_CAPACITY,
+    MATERIAL_SLOT_INVALID, MaterialDesc,
+    MaterialPatchCopy as RendererMaterialPatchCopy,
     PatchCopy, OverflowPolicy, PrepRequest as GpuPrepRequest, ReadbackChannel,
     RendererContext, SUBCHUNK_MAX_CANDIDATES, SUBCHUNK_MAX_LEVELS, SubchunkInstance,
     WorldRenderer, nodes,
 };
+use voxel::block::{BlockId, BlockRegistry, Material as BlockMaterial};
 use renderer::graph::{BufferPool, RenderGraph};
 use renderer::DirtyReport;
 
@@ -52,6 +55,7 @@ use crate::world::state_history::{
 use crate::world::divergence::{compare_directory_snapshots, DivergenceReport};
 
 use crate::world::coord::{Level, SubchunkCoord};
+use crate::world::material_data_pool::{MaterialDataPool, MATERIAL_DATA_SLOT_INVALID};
 use crate::world::material_pool::MaterialAllocator;
 use crate::world::pool::{SlotId, cpu_compute_directory_index};
 use crate::world::residency::{LevelConfig, OccupancySummary, Residency, RequestId};
@@ -68,6 +72,47 @@ use crate::world::subchunk::SUBCHUNK_EDGE;
 /// future work — this step only needs a stable, non-zero default so
 /// the FBM actually decorrelates across runs.
 const DEFAULT_WORLD_SEED: u32 = 0xDEAD_BEEF;
+
+/// M1 block-id aliases. Set during `WorldView::new`, read by the shader
+/// mirror on the Rust side if it ever needs them (today the GPU prep
+/// shader hardcodes the same IDs — kept in lockstep manually).
+///
+/// The shader's `terrain_material(xyz)` emits these three IDs directly:
+/// surface → grass, 0-2 below surface → dirt, deeper → stone.
+pub const BLOCK_ID_GRASS: u16 = 1;
+pub const BLOCK_ID_DIRT:  u16 = 2;
+pub const BLOCK_ID_STONE: u16 = 3;
+
+/// Build the default three-block registry used by M1's terrain worldgen.
+/// IDs are dense starting from 1 (0 = air) and line up with
+/// `BLOCK_ID_{GRASS,DIRT,STONE}` above.
+fn build_default_block_registry() -> BlockRegistry {
+    let mut reg = BlockRegistry::new();
+    let grass = reg.register("grass", BlockMaterial::from_rgb( 90, 160,  70));
+    let dirt  = reg.register("dirt",  BlockMaterial::from_rgb(139,  90,  43));
+    let stone = reg.register("stone", BlockMaterial::from_rgb(128, 128, 128));
+    debug_assert_eq!(grass.raw(), BLOCK_ID_GRASS);
+    debug_assert_eq!(dirt.raw(),  BLOCK_ID_DIRT);
+    debug_assert_eq!(stone.raw(), BLOCK_ID_STONE);
+    reg
+}
+
+/// Convert the game-side `BlockRegistry` to the dense
+/// `Vec<MaterialDesc>` the renderer's descriptor table expects. Indexed
+/// by `BlockId::raw()` directly; `BlockId::AIR` (index 0) lands as the
+/// zero descriptor — which is safe because the shade shader only reads
+/// descriptors for voxels it actually hit, and air voxels can never
+/// produce a primary hit.
+fn build_material_descs_from_registry(registry: &BlockRegistry) -> Vec<MaterialDesc> {
+    let n = registry.len().min(MATERIAL_DESC_CAPACITY);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let mat    = registry.get(BlockId::new(i as u16)).material();
+        let [r, g, b, _a] = mat.color();
+        out.push(MaterialDesc::from_srgb_rgb(r, g, b));
+    }
+    out
+}
 
 /// Per-frame integrator between the CPU residency and the GPU render path.
 pub struct WorldView {
@@ -127,6 +172,21 @@ pub struct WorldView {
     // (Step 2 adds the HLSL header and bind-group entry).
     directory:   SlotDirectory,
     allocator:   MaterialAllocator,
+
+    // --- M1 material-data pool ---
+    //
+    // Non-identity allocator over 1 KB slots in the segmented GPU
+    // material-data pool. See `decision-material-system-m1-sparse` for
+    // the architecture; the authoritative slot for each resident
+    // sub-chunk is threaded through `DirEntry.material_data_slot`.
+    material_data_pool:          MaterialDataPool,
+    /// Deferred-grow signal — set when the materializer observed
+    /// `try_allocate() -> None` this frame. Consumed at the TOP of the
+    /// NEXT frame's `update()`: the renderer appends a new 64 MB segment,
+    /// the allocator calls `grow()`, and the flag resets. Grow-at-frame-
+    /// start (rather than end-of-current-frame) keeps the descriptor-
+    /// array mutation outside any in-flight command buffer.
+    material_pool_grow_needed:   bool,
     /// Per-run static metadata (pool dims, capacities, global offsets).
     /// Populated once at construction; not mutated afterwards — pool
     /// sizing and the directory segmentation are static for the life of
@@ -308,6 +368,18 @@ impl WorldView {
 
         let residency = Residency::<()>::new(configs, initial_camera);
         let renderer  = Arc::new(WorldRenderer::new(ctx, pool));
+
+        // --- Publish the material descriptor table (Step 4) ---
+        //
+        // Build the M1 block registry (air + grass + dirt + stone), convert
+        // it into `Vec<MaterialDesc>`, and upload once. The shade shader
+        // reads this via slot 7 of its set-0 bind group; subsequent frames
+        // reuse the upload without dirty tracking. Extending the registry
+        // at runtime is a future-work item — see
+        // `decision-material-system-m1-sparse` non-goals.
+        let block_registry = build_default_block_registry();
+        let material_descs = build_material_descs_from_registry(&block_registry);
+        renderer.write_materials(ctx, &material_descs);
         let channel   = ReadbackChannel::<DirtyReport>::new(
             ctx, pool, "subchunk_prep_readback", OverflowPolicy::Panic,
         );
@@ -331,6 +403,17 @@ impl WorldView {
         let total_capacity = offset;
         let directory = SlotDirectory::new(total_capacity);
         let allocator = MaterialAllocator::new(total_capacity);
+
+        // M1 material-data pool: non-identity allocator, one segment live
+        // at construction to mirror the renderer's initial segment
+        // allocation in `WorldRenderer::new`. The allocator's free list
+        // starts with SLOTS_PER_SEGMENT entries; subsequent growth is
+        // driven by the materializer's exhaustion signal. See
+        // `decision-material-system-m1-sparse`.
+        let mut material_data_pool = MaterialDataPool::new();
+        material_data_pool
+            .grow()
+            .expect("first material-data-pool grow always succeeds under MAX_SEGMENTS");
 
         // Build the per-level static metadata that will land in the
         // `GpuConsts` uniform. One entry per configured level; the
@@ -399,6 +482,10 @@ impl WorldView {
             exposure_dispatches_this_frame: 0,
             dirty_appends_this_frame_full:     0,
             dirty_appends_this_frame_exposure: 0,
+            material_data_segments_live:         1,
+            material_data_grow_events:           1,
+            material_data_active_slots:          0,
+            material_data_sentinel_patches_this_frame: 0,
         };
 
         Self {
@@ -414,6 +501,8 @@ impl WorldView {
             in_flight_exposure:       VecDeque::new(),
             directory,
             allocator,
+            material_data_pool,
+            material_pool_grow_needed: false,
             consts,
             evicted_last_update: 0,
             evicted_total:       0,
@@ -512,6 +601,51 @@ impl WorldView {
         self.exposure_dispatches_this_frame         = 0;
         self.stats.dirty_appends_this_frame_full     = 0;
         self.stats.dirty_appends_this_frame_exposure = 0;
+        self.material_data_pool.reset_frame_sentinel_counter();
+
+        // --- 0. Resolve any deferred material-data-pool growth ---
+        //
+        // Grow-at-frame-start rather than end-of-previous-frame: the
+        // renderer's segment list is a plain `Vec<wgpu::Buffer>`, not
+        // shared across threads or frames-in-flight, so `push` is free
+        // here. The bind group rebuild happens naturally — the render
+        // graph is rebuilt from scratch per frame and imports fresh
+        // segment handles at graph-construction time (see
+        // `subchunk_world`). Keeping the grow in the active frame's
+        // update, before the rest of this frame's passes are recorded,
+        // guarantees the new segment lands in the next dispatch's
+        // binding array.
+        //
+        // Note: deferred sub-chunks from the previous frame stay at
+        // `DirEntry.material_data_slot == MATERIAL_DATA_SLOT_INVALID`
+        // until the residency cycle re-issues a prep for them (the
+        // natural path — the user's camera motion triggers re-prep).
+        // For the narrow "paused camera, exhaustion this frame" case,
+        // those sub-chunks remain magenta until the user nudges residency.
+        // Acceptable for M1 given the 1 GB ceiling; revisit if it bites.
+        if self.material_pool_grow_needed {
+            match self.material_data_pool.grow() {
+                Ok(()) => {
+                    // Renderer-side segment list is `Arc<Mutex<...>>`-
+                    // guarded, so the push through `&Arc<WorldRenderer>`
+                    // is safe without a mutable borrow of `self.renderer`.
+                    self.renderer.append_material_segment(ctx);
+                    eprintln!(
+                        "[material-pool] grew to {} segment(s) (cumulative grow_events = {})",
+                        self.material_data_pool.segments_live(),
+                        self.material_data_pool.stats().grow_events,
+                    );
+                }
+                Err(_ceiling) => {
+                    eprintln!(
+                        "[material-pool] ceiling hit at {} segments — \
+                         accepting persistent magenta on un-allocatable sub-chunks",
+                        self.material_data_pool.segments_live(),
+                    );
+                }
+            }
+            self.material_pool_grow_needed = false;
+        }
 
         // --- 1. Poll for readback callbacks ---
         ctx.device().poll(wgpu::PollType::Poll).expect("device.poll failed");
@@ -664,13 +798,19 @@ impl WorldView {
             #[cfg(feature = "debug-state-history")]
             let mut trace: Vec<crate::world::state_history::RetiredDirtyEntry> =
                 Vec::with_capacity(inputs.len());
-            let copies = apply_dirty_entries_traced(
+            let retire_out = apply_dirty_entries_traced(
                 &inputs,
                 &mut self.directory,
                 &mut self.allocator,
+                &mut self.material_data_pool,
                 #[cfg(feature = "debug-state-history")]
                 Some(&mut trace),
             );
+            let copies           = retire_out.occupancy_patches;
+            let material_patches = retire_out.material_patches;
+            if retire_out.grow_needed {
+                self.material_pool_grow_needed = true;
+            }
 
             #[cfg(feature = "debug-state-history")]
             if let Some(b) = self.state_history.builder_mut() {
@@ -725,6 +865,17 @@ impl WorldView {
             // output, which is the bug
             // `failure-staging-not-ringed-after-gid-x-reindexing` captures.
             nodes::subchunk_patch(graph, &self.renderer, &copies, ready_frame);
+
+            // Material-id patch pass. Parallel to the occupancy patch:
+            // reads the same `staging_material_ids_ring` slot the prep
+            // shader wrote on frame `ready_frame` and lands each 1 KB
+            // block at its assigned material-data-pool slot.
+            nodes::subchunk_material_patch(
+                graph,
+                &self.renderer,
+                &material_patches,
+                ready_frame,
+            );
 
             // Every retired full-prep dirty entry represents a real
             // occupancy change at `input.coord` (the shader only emits a
@@ -824,6 +975,12 @@ impl WorldView {
             let existing = *self.directory.get(directory_index);
             if existing.is_resident() {
                 self.allocator.free(existing.material_slot());
+            }
+            // Free the non-identity material-data slot (if any) back to
+            // the pool. Independent of the occupancy-allocator free
+            // above: the two pools carry separate identities.
+            if existing.material_data_slot != MATERIAL_DATA_SLOT_INVALID {
+                self.material_data_pool.free(existing.material_data_slot);
             }
             self.directory.set(directory_index, DirEntry::empty());
 
@@ -1141,6 +1298,7 @@ impl WorldView {
     /// test-ability.
     fn refresh_stats(&mut self, frame: FrameIndex) {
         let alloc_stats = self.allocator.stats();
+        let mpool_stats = self.material_data_pool.stats();
         self.stats.frame                          = frame;
         self.stats.active_material_slots          = alloc_stats.active;
         self.stats.pool_capacity                  = alloc_stats.capacity;
@@ -1152,6 +1310,23 @@ impl WorldView {
         self.stats.in_flight_exposure_batches     = self.in_flight_exposure.len() as u32;
         self.stats.prep_dispatches_this_frame     = self.prep_dispatches_this_frame;
         self.stats.exposure_dispatches_this_frame = self.exposure_dispatches_this_frame;
+        self.stats.material_data_segments_live                 = mpool_stats.segments_live;
+        self.stats.material_data_grow_events                   = mpool_stats.grow_events;
+        self.stats.material_data_active_slots                  = mpool_stats.active;
+        self.stats.material_data_sentinel_patches_this_frame   =
+            mpool_stats.sentinel_patches_this_frame;
+
+        // Log-once-per-transition on the `0 → non-zero` edge of the
+        // sentinel counter. Avoids per-call spam while a sub-chunk is
+        // stuck at INVALID.
+        if mpool_stats.sentinel_patches_this_frame > 0 {
+            eprintln!(
+                "[material-pool] {} sub-chunk(s) deferred this frame \
+                 (pool full — grow pending at next frame's top; segments_live={})",
+                mpool_stats.sentinel_patches_this_frame,
+                mpool_stats.segments_live,
+            );
+        }
     }
 
     /// Emit a one-line `[stats]` summary every [`Self::STATS_LOG_INTERVAL`]
@@ -1171,7 +1346,8 @@ impl WorldView {
             "[stats] frame={} pool={}/{} dir_resident={} \
              dirty_full={}{} dirty_exp={}{} \
              in_flight=(f{}/e{}) disp=(f{}/e{}) \
-             pend_exp_refresh={} alloc_refused={} alloc_evict={}",
+             pend_exp_refresh={} alloc_refused={} alloc_evict={} \
+             mpool=(segs={} grows={} active={})",
             s.frame.get(),
             s.active_material_slots, s.pool_capacity,
             s.directory_resident,
@@ -1181,6 +1357,9 @@ impl WorldView {
             s.prep_dispatches_this_frame, s.exposure_dispatches_this_frame,
             s.pending_exposure_refresh,
             s.alloc_refused_cum, s.alloc_evictions_cum,
+            s.material_data_segments_live,
+            s.material_data_grow_events,
+            s.material_data_active_slots,
         );
     }
 
@@ -1605,6 +1784,20 @@ pub struct WorldRendererStats {
     /// Dirty-list appends retired this frame (exposure). Same shape as
     /// [`Self::dirty_appends_this_frame_full`].
     pub dirty_appends_this_frame_exposure: u32,
+
+    // --- M1 material-data pool ---
+    /// Number of 64 MB segments currently live in the material-data
+    /// pool. Mirrors [`MaterialDataPool::segments_live`].
+    pub material_data_segments_live:       u32,
+    /// Cumulative `MaterialDataPool::grow` success events. Monotonic.
+    pub material_data_grow_events:         u64,
+    /// Slots currently held across the material-data pool (all live
+    /// segments).
+    pub material_data_active_slots:        u32,
+    /// Number of `try_allocate()` → `None` events this frame. Flushed
+    /// at the top of each `update` via
+    /// [`MaterialDataPool::reset_frame_sentinel_counter`].
+    pub material_data_sentinel_patches_this_frame: u32,
 }
 
 /// Count resident entries in the directory. O(capacity); called once per
@@ -1887,6 +2080,7 @@ pub(crate) fn apply_exposure_dirty_entries(
             bits,
             content_version:    old.content_version,
             last_synth_version: old.last_synth_version,
+            material_data_slot: old.material_data_slot,
         };
         // `SlotDirectory::set` dirties the entry only if it differs from
         // the current value, so an unchanged-bits refresh is free — the
@@ -1907,6 +2101,24 @@ pub(crate) fn apply_exposure_dirty_entries(
 pub(crate) struct DirtyRetireInput {
     pub(crate) entry: DirtyEntry,
     pub(crate) coord: [i32; 3],
+}
+
+/// Local type alias for the renderer-side [`MaterialPatchCopy`][r]. The
+/// retirement logic builds the list on the CPU; the graph pass
+/// `subchunk_material_patch` consumes it verbatim.
+///
+/// [r]: renderer::MaterialPatchCopy
+pub(crate) type MaterialPatchCopy = RendererMaterialPatchCopy;
+
+/// Return value of [`apply_dirty_entries_traced`] when the materializer
+/// is threaded through with a material-data pool. Bundles the legacy
+/// occupancy patches, the new material-id patches, and the pool's
+/// grow-needed signal for the caller to act on at frame boundary.
+#[derive(Clone, Debug)]
+pub(crate) struct DirtyRetireOutput {
+    pub occupancy_patches: Vec<PatchCopy>,
+    pub material_patches:  Vec<MaterialPatchCopy>,
+    pub grow_needed:       bool,
 }
 
 /// Apply a batch of dirty entries to the CPU-authored directory +
@@ -1945,17 +2157,20 @@ pub(crate) struct DirtyRetireInput {
 // unused.
 #[allow(dead_code)]
 pub(crate) fn apply_dirty_entries(
-    inputs:    &[DirtyRetireInput],
-    directory: &mut SlotDirectory,
-    allocator: &mut MaterialAllocator,
+    inputs:             &[DirtyRetireInput],
+    directory:          &mut SlotDirectory,
+    allocator:          &mut MaterialAllocator,
+    material_data_pool: &mut MaterialDataPool,
 ) -> Vec<PatchCopy> {
-    apply_dirty_entries_traced(
+    let out = apply_dirty_entries_traced(
         inputs,
         directory,
         allocator,
+        material_data_pool,
         #[cfg(feature = "debug-state-history")]
         None,
-    )
+    );
+    out.occupancy_patches
 }
 
 /// Inner implementation shared by the production path
@@ -1966,13 +2181,16 @@ pub(crate) fn apply_dirty_entries(
 /// transition that just landed. When the feature is off the extra
 /// parameter does not exist.
 pub(crate) fn apply_dirty_entries_traced(
-    inputs:    &[DirtyRetireInput],
-    directory: &mut SlotDirectory,
-    allocator: &mut MaterialAllocator,
+    inputs:             &[DirtyRetireInput],
+    directory:          &mut SlotDirectory,
+    allocator:          &mut MaterialAllocator,
+    material_data_pool: &mut MaterialDataPool,
     #[cfg(feature = "debug-state-history")]
     mut trace: Option<&mut Vec<crate::world::state_history::RetiredDirtyEntry>>,
-) -> Vec<PatchCopy> {
-    let mut copies = Vec::with_capacity(inputs.len());
+) -> DirtyRetireOutput {
+    let mut occupancy_patches = Vec::with_capacity(inputs.len());
+    let mut material_patches  = Vec::with_capacity(inputs.len());
+    let mut grow_needed       = false;
 
     for input in inputs {
         let e     = &input.entry;
@@ -2002,8 +2220,9 @@ pub(crate) fn apply_dirty_entries_traced(
         // `is_resident` is the authoritative "sparse entry exists" gate.
         // `direntry_has_material` would misclassify the buffer-zero state
         // (material_slot == 0, not INVALID) as sparse.
-        let was_sparse = old.is_resident();
+        let was_sparse        = old.is_resident();
         let old_material_slot = old.material_slot();
+        let old_mds           = old.material_data_slot;
 
         let new_material_slot = if is_uniform_new {
             if was_sparse {
@@ -2023,14 +2242,52 @@ pub(crate) fn apply_dirty_entries_traced(
             )
         };
 
+        // Material-data pool allocation runs in parallel to the
+        // occupancy allocator, but is *non-identity* — slot identity
+        // lives inside `MaterialDataPool` and is read back through the
+        // directory's `material_data_slot` field (see
+        // `decision-material-system-m1-sparse`).
+        let new_mds = if is_uniform_new {
+            // Transitioning to non-resident (uniform-empty): release the
+            // material-data slot back to the pool.
+            if old_mds != MATERIAL_DATA_SLOT_INVALID {
+                material_data_pool.free(old_mds);
+            }
+            MATERIAL_DATA_SLOT_INVALID
+        } else if old_mds != MATERIAL_DATA_SLOT_INVALID {
+            // Reuse the existing material-data slot (sparse update or a
+            // prior-frame magenta that resolved after an earlier alloc
+            // success). A material-id patch is still emitted — the new
+            // staging payload overwrites the old slot contents.
+            old_mds
+        } else {
+            // First-time sparse OR prior-frame exhaustion: ask the pool
+            // for a fresh slot.
+            match material_data_pool.try_allocate() {
+                Some(slot) => slot,
+                None => {
+                    // Pool exhausted. Leave the entry at INVALID (shade
+                    // shader draws magenta) and signal the caller to
+                    // grow + retry next frame.
+                    material_data_pool.note_sentinel_patch();
+                    grow_needed = true;
+                    MATERIAL_DATA_SLOT_INVALID
+                }
+            }
+        };
+
         // Author the new directory entry. Uniform-empty entries land as
         // `DirEntry::empty()` so `is_resident` stays clear and the cull
         // shader drops the candidate before reading the material pool.
+        // `material_data_slot` is threaded separately; `resident(...)` /
+        // `empty()` both default it to INVALID, so we set it explicitly
+        // via `with_material_data_slot`.
         let new_entry = match new_material_slot {
             Some(slot) => {
                 let mut de = DirEntry::resident(coord, new_exposure, new_is_solid, slot);
                 de.content_version    = old.content_version;
                 de.last_synth_version = old.content_version;
+                de = de.with_material_data_slot(new_mds);
                 de
             }
             None => DirEntry::empty(),
@@ -2038,9 +2295,20 @@ pub(crate) fn apply_dirty_entries_traced(
         directory.set(e.directory_index, new_entry);
 
         if let Some(slot) = new_material_slot {
-            copies.push(PatchCopy {
+            occupancy_patches.push(PatchCopy {
                 staging_request_idx: e.staging_request_idx,
                 dst_material_slot:   slot,
+            });
+        }
+
+        // Emit a material-id patch only when the sub-chunk actually has
+        // a live material-data slot. The INVALID path is where the
+        // magenta sentinel renders — no copy to issue until the grow +
+        // retry lands next frame.
+        if !is_uniform_new && new_mds != MATERIAL_DATA_SLOT_INVALID {
+            material_patches.push(MaterialPatchCopy {
+                staging_request_idx: e.staging_request_idx,
+                dst_global_slot:     new_mds,
             });
         }
 
@@ -2065,7 +2333,11 @@ pub(crate) fn apply_dirty_entries_traced(
         }
     }
 
-    copies
+    DirtyRetireOutput {
+        occupancy_patches,
+        material_patches,
+        grow_needed,
+    }
 }
 
 // --- Tests ---
@@ -2078,6 +2350,17 @@ mod tests {
     /// << 6) | (1 << 7)`.
     fn pack_new_bits(exposure: u32, is_solid: bool) -> u32 {
         exposure | ((is_solid as u32) << 6) | BITS_RESIDENT
+    }
+
+    /// Construct a freshly-grown [`MaterialDataPool`] sized for the
+    /// transition-table tests. One segment is live immediately so
+    /// `try_allocate` succeeds without the deferred-grow path; capacity
+    /// is the production [`SLOTS_PER_SEGMENT`] — plenty of headroom for
+    /// any test that allocates at most a handful of slots.
+    fn fresh_mpool() -> MaterialDataPool {
+        let mut p = MaterialDataPool::new();
+        p.grow().expect("first grow always succeeds");
+        p
     }
 
     fn retire(
@@ -2104,11 +2387,12 @@ mod tests {
     fn uniform_first_time_writes_empty_and_emits_no_copy() {
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count(); // clear initial dirty set
 
         // Exposure = 0 → uniform-empty classification.
         let inputs = vec![retire(2, 0, 0, false, [1, 2, 3])];
-        let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc);
+        let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc, &mut mpool);
 
         assert!(copies.is_empty(), "uniform-empty must not allocate a material slot");
         let e = dir.get(2);
@@ -2120,11 +2404,12 @@ mod tests {
     fn sparse_first_time_allocates_and_emits_copy() {
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
         // Exposure != 0 → sparse classification; no prior material slot.
         let inputs = vec![retire(2, 7, BITS_EXPOSURE_MASK, false, [4, 5, 6])];
-        let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc);
+        let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc, &mut mpool);
 
         assert_eq!(copies.len(), 1);
         assert_eq!(copies[0].staging_request_idx, 7);
@@ -2145,17 +2430,18 @@ mod tests {
     fn sparse_update_reuses_slot_and_emits_copy_to_same_slot() {
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
         // First-time sparse: identity policy allocates slot 2.
         let first = vec![retire(2, 1, 0x3F, false, [1, 2, 3])];
-        let _     = apply_dirty_entries(&first, &mut dir, &mut alloc);
+        let _     = apply_dirty_entries(&first, &mut dir, &mut alloc, &mut mpool);
         assert_eq!(alloc.active(), 1);
 
         // Sparse update at the same directory_index: different exposure,
         // different staging index.
         let second = vec![retire(2, 5, 0x21, false, [1, 2, 3])];
-        let copies = apply_dirty_entries(&second, &mut dir, &mut alloc);
+        let copies = apply_dirty_entries(&second, &mut dir, &mut alloc, &mut mpool);
 
         assert_eq!(copies.len(), 1);
         // Material slot is retained across the update (== directory_index 2
@@ -2175,16 +2461,17 @@ mod tests {
     fn sparse_to_uniform_frees_slot() {
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
         // Prime slot 0 via sparse-first-time.
         let first = vec![retire(3, 2, 0x3F, false, [0, 0, 0])];
-        let _     = apply_dirty_entries(&first, &mut dir, &mut alloc);
+        let _     = apply_dirty_entries(&first, &mut dir, &mut alloc, &mut mpool);
         assert_eq!(alloc.active(), 1);
 
         // Transition to uniform-empty.
         let second = vec![retire(3, 2, 0, false, [0, 0, 0])];
-        let copies = apply_dirty_entries(&second, &mut dir, &mut alloc);
+        let copies = apply_dirty_entries(&second, &mut dir, &mut alloc, &mut mpool);
 
         assert!(copies.is_empty(), "uniform-empty must not emit a copy");
         assert_eq!(alloc.active(), 0, "the freed slot must be released");
@@ -2195,17 +2482,18 @@ mod tests {
     fn uniform_to_sparse_allocates_fresh_slot() {
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
         // Prime with a uniform-empty entry (directory stays empty, no
         // material slot).
         let first = vec![retire(1, 0, 0, false, [0, 0, 0])];
-        let _     = apply_dirty_entries(&first, &mut dir, &mut alloc);
+        let _     = apply_dirty_entries(&first, &mut dir, &mut alloc, &mut mpool);
         assert_eq!(alloc.active(), 0);
 
         // Now the sub-chunk becomes sparse.
         let second = vec![retire(1, 4, 0x3F, false, [0, 0, 0])];
-        let copies = apply_dirty_entries(&second, &mut dir, &mut alloc);
+        let copies = apply_dirty_entries(&second, &mut dir, &mut alloc, &mut mpool);
 
         assert_eq!(copies.len(), 1);
         // Identity policy: slot == directory_index 1.
@@ -2219,6 +2507,7 @@ mod tests {
     fn full_transition_cycle_leaves_allocator_clean() {
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
         // uniform-first-time → sparse-first-time → sparse-update →
@@ -2231,7 +2520,7 @@ mod tests {
             retire(1, 3, 0,    false, [0, 0, 0]), // sparse → uniform
         ];
         for step in &script {
-            let _ = apply_dirty_entries(std::slice::from_ref(step), &mut dir, &mut alloc);
+            let _ = apply_dirty_entries(std::slice::from_ref(step), &mut dir, &mut alloc, &mut mpool);
         }
 
         assert_eq!(alloc.active(), 0);
@@ -2249,13 +2538,14 @@ mod tests {
     fn is_solid_propagates_into_resident_entry() {
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
         // Sparse-first-time with is_solid=true: the sub-chunk is uniformly
         // solid but has at least one exposed face (otherwise exposure
         // would be 0 and the classification would drop into uniform-empty).
         let inputs = vec![retire(2, 3, 0x03, true, [9, 9, 9])];
-        let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc);
+        let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc, &mut mpool);
 
         assert_eq!(copies.len(), 1, "sparse entry must emit a patch copy");
         // Identity policy: slot == directory_index 2.
@@ -2278,10 +2568,11 @@ mod tests {
         // the candidate in cull before the is_solid fast-path fires.
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
         let inputs = vec![retire(1, 0, 0, true, [0, 0, 0])];
-        let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc);
+        let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc, &mut mpool);
 
         assert!(copies.is_empty(), "uniform-empty must not allocate a material slot");
         let e = dir.get(1);
@@ -2293,6 +2584,7 @@ mod tests {
     fn content_version_is_preserved_across_sparse_update() {
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
         // Seed a resident entry with a non-zero content_version to mimic
@@ -2304,7 +2596,7 @@ mod tests {
         dir.set(0, primed);
 
         let inputs = vec![retire(0, 9, 0x1F, false, [1, 1, 1])];
-        let _ = apply_dirty_entries(&inputs, &mut dir, &mut alloc);
+        let _ = apply_dirty_entries(&inputs, &mut dir, &mut alloc, &mut mpool);
 
         let e = dir.get(0);
         assert!(e.is_resident());
@@ -2421,11 +2713,12 @@ mod tests {
         // targets.
         let mut dir   = SlotDirectory::new(256);
         let mut alloc = MaterialAllocator::new(256);
+        let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
         // Sparse-first-time retirement.
         let inputs = vec![retire(100, 0, 0x3F, false, [4, 5, 6])];
-        let _copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc);
+        let _copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc, &mut mpool);
         assert!(dir.get(100).is_resident());
 
         // Simulate what `update` does after retirement: for each input,
@@ -2669,6 +2962,10 @@ mod tests {
             exposure_dispatches_this_frame:    0,
             dirty_appends_this_frame_full:     0,
             dirty_appends_this_frame_exposure: 0,
+            material_data_segments_live:       0,
+            material_data_grow_events:         0,
+            material_data_active_slots:        0,
+            material_data_sentinel_patches_this_frame: 0,
         }
     }
 

@@ -54,29 +54,39 @@
 //   BITS_RESIDENT              = 1 << 7       (bit 7)
 //   BITS_MATERIAL_SLOT_SHIFT   = 8            (bits 8..31 — 24-bit field)
 //   MATERIAL_SLOT_INVALID      = 0x00FF_FFFF  (sentinel: non-resident)
+//   MATERIAL_DATA_SLOT_INVALID = 0xFFFF_FFFF  (sentinel: material-data pool
+//                                              entry unallocated / deferred /
+//                                              ceiling-reached — see
+//                                              material.hlsl)
 // -----------------------------------------------------------------------
 #define DIRENTRY_BITS_EXPOSURE_MASK        0x3Fu
 #define DIRENTRY_BITS_IS_SOLID             (1u << 6)
 #define DIRENTRY_BITS_RESIDENT             (1u << 7)
 #define DIRENTRY_BITS_MATERIAL_SLOT_SHIFT  8u
 #define DIRENTRY_MATERIAL_SLOT_INVALID     0x00FFFFFFu
+#define DIRENTRY_MATERIAL_DATA_SLOT_INVALID 0xFFFFFFFFu
 
 // -----------------------------------------------------------------------
-// DirEntry — 24-byte CPU-authored directory entry.
+// DirEntry — 28-byte CPU-authored directory entry.
 //
 // Layout matches Rust `renderer::subchunk::DirEntry`:
 //   int3 coord              (+0)
 //   uint bits               (+12)  // [0..5] exposure, [6] is_solid,
 //                                  // [7] resident, [8..31] material_slot
 //                                  //                       | INVALID
+//                                  // (material_slot is the OCCUPANCY pool
+//                                  //  slot; NOT the material-data pool.)
 //   uint content_version    (+16)
 //   uint last_synth_version (+20)
+//   uint material_data_slot (+24)  // flat-global MaterialDataPool slot, or
+//                                  // DIRENTRY_MATERIAL_DATA_SLOT_INVALID.
 // -----------------------------------------------------------------------
 struct DirEntry {
     int3 coord;
     uint bits;
     uint content_version;
     uint last_synth_version;
+    uint material_data_slot;
 };
 
 // -----------------------------------------------------------------------
@@ -121,6 +131,21 @@ uint direntry_get_material_slot(DirEntry e) {
 // `resident ⇒ material_slot != INVALID` (enforced in `DirEntry::resident`).
 bool direntry_has_material(DirEntry e) {
     return direntry_get_material_slot(e) != DIRENTRY_MATERIAL_SLOT_INVALID;
+}
+
+// Flat-global slot index into the material-data pool, or
+// `DIRENTRY_MATERIAL_DATA_SLOT_INVALID` when the pool has no allocation
+// for this sub-chunk. The shade shader reads this (never `occ_slot`) to
+// locate per-voxel material IDs — see `decision-material-system-m1-sparse`.
+uint direntry_get_material_data_slot(DirEntry e) {
+    return e.material_data_slot;
+}
+
+// `true` when the material-data slot field holds a real pool index (not
+// the INVALID sentinel). Callers that observe this false should draw
+// the magenta sentinel pixel rather than dereference the pool.
+bool direntry_has_material_data(DirEntry e) {
+    return e.material_data_slot != DIRENTRY_MATERIAL_DATA_SLOT_INVALID;
 }
 
 // Torus-verification check. `resolve_coord_to_slot` reduces the query
