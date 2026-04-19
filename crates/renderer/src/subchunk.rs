@@ -35,6 +35,17 @@
 //! - 2: visible    (StorageReadOnly, stride=4)  — VERTEX
 //! - 3: occ_array  (StorageReadOnly, stride=64) — FRAGMENT
 //!
+//! **Shade bind group** (set 0 for `subchunk_shade.cs.hlsl`):
+//! - 0: gpu_consts  (UniformBuffer, sizeof GpuConstsData) — COMPUTE.
+//!   Implicit, supplied via `create_bind_group`'s `gpu_consts` argument
+//!   (`directory.hlsl` includes `gpu_consts.hlsl` which pins this slot).
+//! - 1: vis         (SampledTexture, R32Uint)              — COMPUTE
+//! - 2: shaded_out  (StorageTexture, Rgba8Unorm, write)    — COMPUTE
+//! - 3: directory   (StorageReadOnly, stride=24)           — COMPUTE
+//! - 4: occ_array   (StorageReadOnly, stride=64)           — COMPUTE
+//! - 5: camera      (UniformBuffer, 64)                    — COMPUTE
+//! - 6: depth       (SampledTexture, Depth32Float)         — COMPUTE
+//!
 //! **Prep bind group** (set 0 for `subchunk_prep.cs.hlsl`):
 //! - 0: gpu_consts     (UniformBuffer, sizeof GpuConstsData) — COMPUTE.
 //!   Implicit, supplied via `create_bind_group`'s `gpu_consts` argument
@@ -1306,6 +1317,11 @@ impl WorldRenderer {
 /// fullscreen-triangle blit that reads `shaded_color` and writes into the
 /// caller-supplied `color` attachment (typically the swapchain).
 ///
+/// `gpu_consts` is forwarded to the shade pass's bind group (slot 0) so
+/// the shade shader's `dda_world` can read `g_consts.levels[level_idx]`
+/// via `resolve_coord_to_slot`. Callers that already hold a
+/// [`crate::GpuConsts`] for the prep pass can pass the same reference.
+///
 /// The vis buffer is an `R32_UINT` transient with the `subchunk_vis`
 /// graph name; its resolution matches `(width, height)` — the same
 /// extent the caller uses for the depth buffer and the swapchain blit.
@@ -1320,12 +1336,13 @@ impl WorldRenderer {
 /// write. The `shaded_color` transient is consumed internally by the
 /// blit; callers do not observe it.
 pub fn subchunk_world(
-    graph    : &mut RenderGraph,
-    renderer : &Arc<WorldRenderer>,
-    color    : TextureHandle,
-    depth    : TextureHandle,
-    width    : u32,
-    height   : u32,
+    graph      : &mut RenderGraph,
+    renderer   : &Arc<WorldRenderer>,
+    gpu_consts : &crate::GpuConsts,
+    color      : TextureHandle,
+    depth      : TextureHandle,
+    width      : u32,
+    height     : u32,
 )
     -> (TextureHandle, TextureHandle)
 {
@@ -1404,16 +1421,6 @@ pub fn subchunk_world(
         ],
     );
 
-    let shade_bg = graph.create_bind_group(
-        "subchunk_shade_bg",
-        renderer.shade_pipeline().as_ref(),
-        None,
-        &[
-            (0, vis_h.into()),
-            (1, shaded_h.into()),
-        ],
-    );
-
     let indirect_in = IndirectArgs { indirect: indirect_h, count: count_h, max_draws: 1 };
 
     let indirect_out = cull(
@@ -1441,6 +1448,25 @@ pub fn subchunk_world(
     );
     let vis_written = color_outs[0];
 
+    // Shade bind group is built after the draw pass so that `depth_out`
+    // (the post-draw version of the depth texture) is available. The
+    // shade pass reads the depth buffer written by the draw pass, so
+    // passing `depth_out` establishes the correct read-after-write
+    // ordering via the graph's access tracking.
+    let shade_bg = graph.create_bind_group(
+        "subchunk_shade_bg",
+        renderer.shade_pipeline().as_ref(),
+        Some(gpu_consts),
+        &[
+            (1, vis_written.into()),
+            (2, shaded_h.into()),
+            (3, directory_h.into()),
+            (4, occ_h.into()),
+            (5, camera_h.into()),
+            (6, depth_out.into()),
+        ],
+    );
+
     // Dispatch grid: one thread per output pixel in 8×8 workgroups.
     // Right / bottom edges may be partial — the shader's own
     // `GetDimensions` check drops out-of-range threads.
@@ -1449,12 +1475,11 @@ pub fn subchunk_world(
 
     let shade_pipeline = Arc::clone(renderer.shade_pipeline());
     let shaded_out = graph.add_pass("subchunk_shade", |pass| {
-        let writes       = pass.use_bind_group(shade_bg);
-        let shaded_v     = writes.write_texture_of(shaded_h);
-        // `vis_written` is already recorded as a read via the
-        // `SampledTexture` binding in the shade bind group — no
-        // additional explicit declaration required.
-        let _ = vis_written;
+        let writes   = pass.use_bind_group(shade_bg);
+        let shaded_v = writes.write_texture_of(shaded_h);
+        // `vis_written` and `depth_out` are already recorded as reads
+        // via their `SampledTexture` bindings in the shade bind group —
+        // no additional explicit declaration required.
         pass.execute(move |ctx| {
             let bg = ctx.resources.bind_group(shade_bg);
             ctx.commands.dispatch(&shade_pipeline, &[bg], [wg_x, wg_y, 1], &[]);

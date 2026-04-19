@@ -266,4 +266,212 @@ MarchResult dda_sub_chunk(float3 origin, float3 dir, float max_t, uint occ_slot)
     return miss;
 }
 
+// --- World-space DDA entry point (compute-callable). ---
+//
+// Only available when `directory.hlsl` has been included before this file —
+// `dda_world` depends on `DirEntry`, `g_directory`, `direntry_is_resident`,
+// and `resolve_and_verify`, all of which live in `directory.hlsl`.
+// `subchunk.ps.hlsl` includes `dda.hlsl` without `directory.hlsl` (to avoid
+// pulling g_consts into its pipeline layout), so the guard keeps it clean.
+// Consumers that need `dda_world` (e.g. `subchunk_shade.cs.hlsl`) must
+// `#include "directory.hlsl"` before `#include "dda.hlsl"`.
+#ifdef RENDERER_DIRECTORY_HLSL
+
+// Walks a world-space ray across the sub-chunk grid at a single LOD level
+// using a two-level Amanatides-Woo DDA: an *outer* step that advances
+// through integer sub-chunk cells, and — for each resident cell — an *inner*
+// descent into `dda_sub_chunk` to test the voxel occupancy bitmap.
+//
+// # Purpose
+//
+// `dda_sub_chunk` is limited to a ray that already starts inside one
+// sub-chunk. Secondary rays (shadow, GI, reflections) start at an arbitrary
+// world-space surface point and must cross multiple sub-chunk cells before
+// finding an occluder. `dda_world` provides that outer traversal.
+//
+// # Outer+inner composition and scaling invariant
+//
+// Each outer cell spans `sc_size = 8 * voxel_size` world units, where
+// `voxel_size = 1 << level_idx`. On entry to a resident cell we compute:
+//
+//   local_origin = (origin_ws + t_outer * dir_ws - cell_corner_ws) / voxel_size
+//   local_dir    = dir_ws / voxel_size
+//
+// With `|dir_ws| = 1` (required — see caller contract below):
+//   `|local_dir| = 1 / voxel_size`
+//
+// Inside `dda_sub_chunk`, `t_delta.x = abs(1 / local_dir.x) =
+// voxel_size / abs(dir_ws.x)`. For an axis-aligned ray (+X only),
+// one full voxel crossing adds `t = voxel_size`, which equals the world
+// distance traveled (one voxel = `voxel_size` world units). Therefore
+// the `t` returned by `dda_sub_chunk` is directly in world units, and
+// the hit world-position is `origin_ws + (t_outer + t_inner) * dir_ws`.
+//
+// # Torus-collision check
+//
+// `resolve_coord_to_slot` reduces the query coord modulo `pool_dims`. A
+// secondary ray that wanders past the toroidal ring can alias onto a
+// resident sub-chunk that belongs to a completely different world position.
+// `resolve_and_verify` (from `directory.hlsl`) guards against this by
+// comparing the stored `coord` against the query — a mismatching entry is
+// treated as non-resident. This check is *load-bearing* for secondary rays
+// but would be a redundant re-validation for primary hits (which come from
+// a cull-survived instance carrying its own verified slot).
+//
+// # Binding requirement
+//
+// The consumer must also `#include "directory.hlsl"` (which brings in
+// `g_consts` at slot 0 via `gpu_consts.hlsl` and the directory accessor
+// functions) and declare:
+//
+//   [[vk::binding(N, 0)]] StructuredBuffer<DirEntry> g_directory;
+//
+// `dda.hlsl` cannot include `directory.hlsl` itself because today's
+// fragment-shader callers (`subchunk.ps.hlsl`) do not bind the directory —
+// it would pull in a binding slot those pipelines never fill, breaking
+// SPIR-V reflection. The include discipline stays at the consumer.
+//
+// `g_occ_array` (for the inner DDA) must also be declared by the consumer
+// per the existing binding discipline documented in the file header above.
+//
+// # Caller contract
+//
+// `dir_ws` must be unit-normalised. The scaling invariant above relies on
+// `|dir_ws| = 1`; a non-unit direction produces `t` values that do not
+// equal world distance. No defensive re-normalise is performed here — the
+// caller is responsible for enforcing this invariant.
+//
+// Parameters:
+//   origin_ws  — ray start in world space.
+//   dir_ws     — ray direction, unit-normalised.
+//   max_t_ws   — world-space parameter cap; `hit = false` if no occluder
+//                is reached within this distance.
+//   level_idx  — LOD level; selects voxel_size and the directory ring.
+//
+// Returns a `MarchResult` in world units. On miss, `hit = false` and all
+// other fields are unspecified. The caller interprets a miss as "ray
+// reached max_t_ws without finding an occupied voxel."
+MarchResult dda_world(float3 origin_ws, float3 dir_ws, float max_t_ws, uint level_idx) {
+    MarchResult miss;
+    miss.occ_slot  = 0u;
+    miss.local_idx = 0u;
+    miss.face      = DDA_FACE_POS_X;
+    miss.t         = 0.0;
+    miss.hit       = false;
+
+    float voxel_size = float(1u << level_idx);
+    float sc_size    = 8.0 * voxel_size;   // world units per sub-chunk cell
+
+    // Starting outer cell (integer sub-chunk coords at this LOD).
+    int3 cell = int3(floor(origin_ws / sc_size));
+
+    // Outer DDA step signs.
+    int3 step;
+    step.x = dir_ws.x > 0.0 ? 1 : (dir_ws.x < 0.0 ? -1 : 0);
+    step.y = dir_ws.y > 0.0 ? 1 : (dir_ws.y < 0.0 ? -1 : 0);
+    step.z = dir_ws.z > 0.0 ? 1 : (dir_ws.z < 0.0 ? -1 : 0);
+
+    const float HUGE = 1e30;
+
+    // Per-axis t at the next outer cell boundary, and per-axis increment
+    // per full outer-cell crossing (= sc_size / |dir_ws[axis]|).
+    // Inactive axes get HUGE so they never win the min-select.
+    float3 t_next, t_delta;
+
+    if (step.x != 0) {
+        float boundary = step.x > 0 ? float(cell.x + 1) * sc_size
+                                     : float(cell.x)     * sc_size;
+        t_next.x  = (boundary - origin_ws.x) / dir_ws.x;
+        t_delta.x = abs(sc_size / dir_ws.x);
+    } else { t_next.x = HUGE; t_delta.x = HUGE; }
+
+    if (step.y != 0) {
+        float boundary = step.y > 0 ? float(cell.y + 1) * sc_size
+                                     : float(cell.y)     * sc_size;
+        t_next.y  = (boundary - origin_ws.y) / dir_ws.y;
+        t_delta.y = abs(sc_size / dir_ws.y);
+    } else { t_next.y = HUGE; t_delta.y = HUGE; }
+
+    if (step.z != 0) {
+        float boundary = step.z > 0 ? float(cell.z + 1) * sc_size
+                                     : float(cell.z)     * sc_size;
+        t_next.z  = (boundary - origin_ws.z) / dir_ws.z;
+        t_delta.z = abs(sc_size / dir_ws.z);
+    } else { t_next.z = HUGE; t_delta.z = HUGE; }
+
+    // Accumulated outer-DDA t (world units to the current cell's entry).
+    float t_outer = 0.0;
+
+    // Cap at 128 outer steps to prevent runaway walks on long empty
+    // stretches (e.g. a ray fired into open sky). Same [loop] pattern as
+    // `dda_sub_chunk` to hint the driver this is a non-trivial loop.
+    [loop]
+    for (int i = 0; i < 128; i++) {
+        if (t_outer > max_t_ws) {
+            break;
+        }
+
+        // Resolve the current cell. `resolve_and_verify` returns true only
+        // when the entry's stored coord matches `cell` — guards against
+        // torus aliasing for secondary rays.
+        uint slot;
+        bool resident = resolve_and_verify(cell, level_idx, g_directory, slot);
+
+        if (resident) {
+            DirEntry e = g_directory[slot];
+            if (direntry_is_resident(e)) {
+                // Descend into inner DDA.
+                float3 cell_corner_ws = float3(cell) * sc_size;
+
+                // Convert origin to sub-chunk local [0,8]^3 frame.
+                // The starting point is the world entry of this outer cell
+                // (origin_ws + t_outer * dir_ws); we translate to the
+                // cell corner and scale by 1/voxel_size.
+                float3 local_origin = (origin_ws + t_outer * dir_ws - cell_corner_ws)
+                                    / voxel_size;
+
+                // Scale dir so t from dda_sub_chunk is in world units
+                // (see scaling invariant in header comment).
+                float3 local_dir    = dir_ws / voxel_size;
+
+                float max_t_local   = max_t_ws - t_outer;
+
+                MarchResult inner = dda_sub_chunk(local_origin, local_dir, max_t_local, slot);
+                if (inner.hit) {
+                    inner.t += t_outer;   // convert to world-space t
+                    return inner;
+                }
+            }
+        }
+
+        // Advance to the next outer cell on the axis with the smallest t_next.
+        if (t_next.x < t_next.y) {
+            if (t_next.x < t_next.z) {
+                t_outer   = t_next.x;
+                cell.x   += step.x;
+                t_next.x += t_delta.x;
+            } else {
+                t_outer   = t_next.z;
+                cell.z   += step.z;
+                t_next.z += t_delta.z;
+            }
+        } else {
+            if (t_next.y < t_next.z) {
+                t_outer   = t_next.y;
+                cell.y   += step.y;
+                t_next.y += t_delta.y;
+            } else {
+                t_outer   = t_next.z;
+                cell.z   += step.z;
+                t_next.z += t_delta.z;
+            }
+        }
+    }
+
+    return miss;
+}
+
+
+#endif // RENDERER_DIRECTORY_HLSL
+
 #endif // RENDERER_DDA_HLSL

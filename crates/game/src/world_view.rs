@@ -437,6 +437,15 @@ impl WorldView {
         &self.renderer
     }
 
+    /// Borrow the per-frame GPU constants for bind-group wiring.
+    ///
+    /// Used by callers that need to pass `gpu_consts` to render-graph
+    /// functions (e.g. [`nodes::subchunk_world`]) without gaining ownership
+    /// of the internal [`GpuConsts`] handle.
+    pub fn gpu_consts(&self) -> &GpuConsts {
+        &self.consts
+    }
+
     pub fn evicted_last_update(&self) -> usize {
         self.evicted_last_update
     }

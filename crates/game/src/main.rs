@@ -373,7 +373,8 @@ impl ApplicationHandler for App {
                     TextureDesc::new_2d(
                         w, h,
                         SUBCHUNK_DEPTH_FORMAT,
-                        wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        wgpu::TextureUsages::RENDER_ATTACHMENT
+                            | wgpu::TextureUsages::TEXTURE_BINDING,
                     ),
                 );
 
@@ -407,7 +408,8 @@ impl ApplicationHandler for App {
                 // needs to be threaded further. See
                 // `decision-vis-buffer-deferred-shading-phase-1`.
                 let (_color_out, _depth_out) = nodes::subchunk_world(
-                    &mut graph, world_view.renderer(), color, depth, w, h,
+                    &mut graph, world_view.renderer(), world_view.gpu_consts(),
+                    color, depth, w, h,
                 );
 
                 let (pending, present_token) = graph.compile()
