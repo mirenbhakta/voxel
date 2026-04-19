@@ -38,12 +38,18 @@
 // voxel's `-X` face, so the emitted face direction is opposite the step
 // sign on the crossing axis.
 //
-// Degenerate case: when the ray origin already lies inside an occupied
-// voxel the entry-cell test fires at `t = 0` and no axis crossing has
-// occurred. There is no well-defined face to report; the primitive
-// returns `0` (+X). Callers that need a meaningful normal in this case
-// should detect it via `t == 0` and handle it themselves. Phase-1 debug
-// shading ignores `face` entirely, so this has no rendered consequence.
+// Entry-cell hit (`t == 0`): when the ray origin already lies inside an
+// occupied voxel — typically the rasterized hull entry point landing on
+// the sub-chunk's outer face — the primitive infers the entry face from
+// origin's distance to each face of the entry cell. For the common case
+// where origin sits exactly on the sub-chunk's AABB face, this resolves
+// to the matching axis-aligned face (e.g. ray entering the +Y face of
+// the hull on an occupied top-row voxel reports `face = +Y`). Origins
+// strictly interior to the entry cell (camera inside an occupied voxel,
+// or a secondary ray starting on a surface) fall back to the closest
+// face — a sensible heuristic, but the "which AABB face did the ray
+// cross" semantics have decayed. Callers can still detect entry-cell
+// hits via `t == 0`.
 
 #ifndef RENDERER_DDA_HLSL
 #define RENDERER_DDA_HLSL
@@ -143,10 +149,33 @@ MarchResult dda_sub_chunk(float3 origin, float3 dir, float max_t, uint occ_slot)
     step.y = dir.y > 0.0 ? 1 : (dir.y < 0.0 ? -1 : 0);
     step.z = dir.z > 0.0 ? 1 : (dir.z < 0.0 ? -1 : 0);
 
+    const float HUGE = 1e30;
+
+    // Entry-face inference for the entry-cell hit. For each active axis
+    // measure how far origin sits from that axis's "entering" face of
+    // the entry cell; the axis with the minimum distance is the one the
+    // ray crossed to land here. Inactive axes (step == 0) get HUGE so
+    // they never win. Stepping +X enters a cell through its -X face,
+    // matching the main loop's face emission below.
+    float dx = (step.x > 0) ? abs(origin.x - float(vox.x))     :
+               (step.x < 0) ? abs(origin.x - float(vox.x + 1)) : HUGE;
+    float dy = (step.y > 0) ? abs(origin.y - float(vox.y))     :
+               (step.y < 0) ? abs(origin.y - float(vox.y + 1)) : HUGE;
+    float dz = (step.z > 0) ? abs(origin.z - float(vox.z))     :
+               (step.z < 0) ? abs(origin.z - float(vox.z + 1)) : HUGE;
+
+    uint entry_face;
+    if (dx <= dy && dx <= dz) {
+        entry_face = (step.x > 0) ? DDA_FACE_NEG_X : DDA_FACE_POS_X;
+    } else if (dy <= dz) {
+        entry_face = (step.y > 0) ? DDA_FACE_NEG_Y : DDA_FACE_POS_Y;
+    } else {
+        entry_face = (step.z > 0) ? DDA_FACE_NEG_Z : DDA_FACE_POS_Z;
+    }
+
     // Per-axis t at the next cell boundary, and per-axis t increment per
     // full cell crossing. Axes with zero ray-direction component get HUGE
     // values so the min-select never picks them.
-    const float HUGE = 1e30;
     float3 t_next, t_delta;
 
     if (step.x != 0) {
@@ -172,7 +201,7 @@ MarchResult dda_sub_chunk(float3 origin, float3 dir, float max_t, uint occ_slot)
         MarchResult h;
         h.occ_slot  = occ_slot;
         h.local_idx = uint(vox.x) | (uint(vox.y) << 3u) | (uint(vox.z) << 6u);
-        h.face      = DDA_FACE_POS_X; // degenerate; see header.
+        h.face      = entry_face;
         h.t         = 0.0;
         h.hit       = true;
         return h;
