@@ -18,9 +18,13 @@ pub struct BindEntry {
     pub visibility: wgpu::ShaderStages,
 }
 
-/// Kind of buffer resource exposed by a [`BindEntry`].
+/// Kind of resource exposed by a [`BindEntry`].
 ///
-/// Textures and samplers are deferred until a primitive genuinely needs them.
+/// The first three variants cover buffers; the texture variants are added
+/// for primitives that read a vis buffer or write a storage image (the
+/// first of which is the subchunk shade compute pass — see
+/// `shaders/subchunk_shade.cs.hlsl`). Samplers remain deferred until a
+/// primitive genuinely needs them.
 #[derive(Clone, Copy, Debug)]
 pub enum BindKind {
     /// A uniform buffer of the given size in bytes. Maps to wgpu's
@@ -32,4 +36,21 @@ pub enum BindKind {
     /// A read-write storage buffer of the given size in bytes. Maps to wgpu's
     /// `BufferBindingType::Storage { read_only: false }`.
     StorageBufferReadWrite { size: u64 },
+    /// A sampled (SRV) texture. HLSL source: `Texture2D<T>` (plus future
+    /// array / cube variants via [`view_dimension`](Self::SampledTexture::view_dimension)).
+    /// Read-only from the shader. Maps to wgpu's `BindingType::Texture`.
+    SampledTexture {
+        sample_type    : wgpu::TextureSampleType,
+        view_dimension : wgpu::TextureViewDimension,
+    },
+    /// A storage (UAV) texture. HLSL source: `RWTexture2D<T>` with a
+    /// `[[vk::image_format(...)]]` attribute so reflection can pin the
+    /// texel format. Treated as a write by the graph's automatic access
+    /// tracking — the one consumer today (subchunk shade) writes and
+    /// never reads. Maps to wgpu's `BindingType::StorageTexture` with
+    /// `StorageTextureAccess::WriteOnly`.
+    StorageTexture {
+        format         : wgpu::TextureFormat,
+        view_dimension : wgpu::TextureViewDimension,
+    },
 }

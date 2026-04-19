@@ -396,6 +396,17 @@ impl RenderGraph {
         self.output_versions.push(handle.0);
     }
 
+    /// Mark a texture version as a graph output.
+    ///
+    /// Same semantics as [`mark_output`](Self::mark_output), but accepts
+    /// a [`TextureHandle`].  Used by producers whose consumer has not
+    /// landed yet (e.g. phase-1.4's shaded-colour transient, which the
+    /// phase-1.5 blit pass will read in a later task) so the upstream
+    /// passes are not dead-culled during compile.
+    pub fn mark_texture_output(&mut self, handle: TextureHandle) {
+        self.output_versions.push(handle.0);
+    }
+
     /// Hand the frame's swapchain image to the graph as the frame output.
     ///
     /// Imports the surface texture, stashes the [`SurfaceFrame`] for
@@ -635,14 +646,16 @@ impl<'g> PassBuilder<'g> {
         for (res_id, kind) in work {
             match kind {
                 BindKind::UniformBuffer { .. }
-                | BindKind::StorageBufferReadOnly { .. } => {
+                | BindKind::StorageBufferReadOnly { .. }
+                | BindKind::SampledTexture { .. } => {
                     let version = self.graph.resource_versions[res_id.0 as usize];
                     self.record_access(
                         ResourceHandle { resource: res_id.0, version },
                         Access::Read,
                     );
                 }
-                BindKind::StorageBufferReadWrite { .. } => {
+                BindKind::StorageBufferReadWrite { .. }
+                | BindKind::StorageTexture { .. } => {
                     let new_version = self.next_version(res_id.0);
                     self.record_access(
                         ResourceHandle { resource: res_id.0, version: new_version },
@@ -716,6 +729,27 @@ pub struct BindGroupWrites {
 }
 
 impl BindGroupWrites {
+    /// Return the versioned [`TextureHandle`] produced by the bind
+    /// group's storage-texture binding on `h`'s resource.
+    ///
+    /// # Panics
+    ///
+    /// Same as [`write_of`](Self::write_of) — the lookup is by resource
+    /// id, the `TextureHandle` wrapper is purely for type safety on the
+    /// caller side.
+    pub fn write_texture_of(&self, h: TextureHandle) -> TextureHandle {
+        let (_, version) = *self.writes.iter()
+            .find(|(r, _)| *r == h.0.resource)
+            .unwrap_or_else(|| panic!(
+                "BindGroupWrites::write_texture_of: resource {} is not a \
+                 storage-texture binding in this bind group — check the \
+                 layout kind or ensure the correct bind group was passed \
+                 to use_bind_group",
+                h.0.resource,
+            ));
+        TextureHandle(ResourceHandle { resource: h.0.resource, version })
+    }
+
     /// Return the versioned handle produced by the bind group's
     /// read-write binding on `h`'s resource.
     ///

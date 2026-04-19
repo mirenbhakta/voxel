@@ -398,7 +398,17 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                nodes::subchunk_world(&mut graph, world_view.renderer(), color, depth);
+                // Phase 1.5: `subchunk_world` now takes the swapchain
+                // `color` target and returns `(color_out, depth_out)` —
+                // the blit pass inside `subchunk_world` writes the
+                // shaded pixels into the swapchain attachment directly.
+                // `graph.present()` seeded the swapchain's output
+                // version at `compile` time, so neither return value
+                // needs to be threaded further. See
+                // `decision-vis-buffer-deferred-shading-phase-1`.
+                let (_color_out, _depth_out) = nodes::subchunk_world(
+                    &mut graph, world_view.renderer(), color, depth, w, h,
+                );
 
                 let (pending, present_token) = graph.compile()
                     .expect("render graph compile")

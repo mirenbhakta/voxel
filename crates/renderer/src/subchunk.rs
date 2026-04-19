@@ -55,9 +55,9 @@ use bytemuck::{Pod, Zeroable};
 
 use crate::device::RendererContext;
 use crate::frame::FrameIndex;
-use crate::graph::{BufferDesc, BufferHandle, BufferPool, RenderGraph, TextureHandle};
+use crate::graph::{BufferDesc, BufferHandle, BufferPool, RenderGraph, TextureDesc, TextureHandle};
 use crate::multi_buffer::MultiBufferRing;
-use crate::nodes::{CullArgs, DrawArgs, IndirectArgs, cull, mdi_draw};
+use crate::nodes::{ColorTarget, CullArgs, DrawArgs, IndirectArgs, cull, mdi_draw, present_blit};
 use crate::pipeline::compute::{ComputePipeline, ComputePipelineDescriptor};
 use crate::pipeline::render::{RenderPipeline, RenderPipelineDescriptor};
 use crate::shader::{ShaderModule, ShaderSource};
@@ -79,6 +79,15 @@ const SUBCHUNK_PREP_CS_SPV: &[u8] =
 const SUBCHUNK_EXPOSURE_CS_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/shaders/subchunk_exposure.cs.spv"));
 
+const SUBCHUNK_SHADE_CS_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/shaders/subchunk_shade.cs.spv"));
+
+const PRESENT_BLIT_VS_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/shaders/present_blit.vs.spv"));
+
+const PRESENT_BLIT_PS_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/shaders/present_blit.ps.spv"));
+
 // --- Constants ---
 
 /// Maximum number of candidate sub-chunks the cull pass handles in one
@@ -97,6 +106,19 @@ pub const MAX_LEVELS: usize = 16;
 
 /// Depth format used by the sub-chunk pipeline's `DepthStencilState`.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+
+/// Format of the transient `shaded_color` texture the shade compute pass
+/// writes and the phase-1.5 blit pass consumes.
+///
+/// Chosen to be universally storage-binding-compatible in wgpu — the
+/// swapchain format (typically `Bgra8UnormSrgb`) is a `RENDER_ATTACHMENT`
+/// only surface and cannot host a UAV, so an intermediate transient is
+/// required regardless. `Rgba8Unorm` is the cheapest four-channel
+/// storage-binding-capable format and maps cleanly to any 8-bit-per-channel
+/// swapchain via a downstream blit. The shade shader's HLSL side pins
+/// this through `[[vk::image_format("rgba8")]]` — the two must stay in
+/// sync or the pipeline layout validation fires on construction.
+pub const SHADED_COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 // --- SubchunkCamera ---
 
@@ -615,7 +637,20 @@ pub struct WorldRenderer {
     /// [`PrepRequest`] (the shared request layout — exposure-only uses
     /// the same 32-byte struct shape). See [`subchunk_exposure`].
     exposure_pipeline: Arc<ComputePipeline>,
+    /// Compute pipeline that consumes the vis-buffer produced by the draw
+    /// pass and writes the shaded colour transient. See
+    /// `shaders/subchunk_shade.cs.hlsl` and `subchunk_world`.
+    shade_pipeline:    Arc<ComputePipeline>,
     render_pipeline:   Arc<RenderPipeline>,
+    /// Raster pipeline for the phase-1.5 present blit. Fullscreen triangle
+    /// that `.Load`s from `shaded_color` and writes into the swapchain
+    /// attachment the node is wired against. Colour target format is the
+    /// surface format observed at construction time — the pipeline state
+    /// is immutable, so a resize that changed the swapchain format (not a
+    /// case wgpu exposes today) would require a fresh `WorldRenderer`.
+    /// See `shaders/present_blit.vs.hlsl` + `.ps.hlsl` and
+    /// [`crate::nodes::present_blit`].
+    present_blit_pipeline: Arc<RenderPipeline>,
 
     camera_buf:            wgpu::Buffer,
     instance_buf:          wgpu::Buffer,
@@ -696,6 +731,16 @@ impl WorldRenderer {
     /// (= `DirEntry::empty()` — `resident = 0`, `exposure = 0`), so the
     /// cull shader's exposure rejection drops them.
     pub fn new(ctx: &RendererContext, pool: &mut BufferPool) -> Self {
+        // Assert a windowed context up front — the draw/shade path writes
+        // into transients whose extents come from the swapchain size, and
+        // the downstream blit pass (phase-1.5) depends on a swapchain
+        // target. Catching the headless case here surfaces the
+        // misconfiguration at renderer construction rather than deep in a
+        // compiled-graph execute closure.
+        //
+        // The surface format is also load-bearing for the present-blit
+        // pipeline's colour target (an immutable part of the render
+        // pipeline state), so we retain it rather than discarding.
         let surface_format = ctx
             .surface_format()
             .expect("WorldRenderer requires a windowed RendererContext");
@@ -731,6 +776,30 @@ impl WorldRenderer {
             "main",
         )
         .expect("subchunk exposure shader failed to load");
+
+        let shade_cs = ShaderModule::load(
+            ctx,
+            "subchunk_shade.cs",
+            ShaderSource::Spirv(SUBCHUNK_SHADE_CS_SPV),
+            "main",
+        )
+        .expect("subchunk shade shader failed to load");
+
+        let blit_vs = ShaderModule::load(
+            ctx,
+            "present_blit.vs",
+            ShaderSource::Spirv(PRESENT_BLIT_VS_SPV),
+            "main",
+        )
+        .expect("present blit vertex shader failed to load");
+
+        let blit_ps = ShaderModule::load(
+            ctx,
+            "present_blit.ps",
+            ShaderSource::Spirv(PRESENT_BLIT_PS_SPV),
+            "main",
+        )
+        .expect("present blit pixel shader failed to load");
 
         // --- Buffer sizes ---
 
@@ -914,16 +983,30 @@ impl WorldRenderer {
             immediate_size:          0,
         }));
 
+        let shade_pipeline = Arc::new(ComputePipeline::new(ctx, ComputePipelineDescriptor {
+            label:                   "subchunk_shade",
+            shader:                  shade_cs,
+            expected_workgroup_size: Some([8, 8, 1]),
+            immediate_size:          0,
+        }));
+
+        // Single MRT slot now that task 1.4's shade compute pass produces
+        // the swapchain-destined colour. The fragment shader's only
+        // `SV_Target*` output is `SV_Target0` (the packed vis word); the
+        // swapchain is handed the shade pass's output through a
+        // downstream blit (phase-1.5).
         let render_pipeline = Arc::new(RenderPipeline::new(ctx, RenderPipelineDescriptor {
             label:          "subchunk",
             vertex:         vs,
             fragment:       ps,
             vertex_buffers: &[],
-            color_targets:  &[Some(wgpu::ColorTargetState {
-                format:     surface_format,
-                blend:      None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            color_targets:  &[
+                Some(wgpu::ColorTargetState {
+                    format:     wgpu::TextureFormat::R32Uint,
+                    blend:      None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
             depth_stencil:  Some(wgpu::DepthStencilState {
                 format:              DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
@@ -941,11 +1024,42 @@ impl WorldRenderer {
             immediate_size: 0,
         }));
 
+        // Fullscreen-triangle blit that samples `shaded_color` into the
+        // swapchain attachment. No vertex buffer (positions derived from
+        // `SV_VertexID`), no depth, no cull — the three issued vertices
+        // cover clip space and the rasteriser clips the off-screen area
+        // so winding / face-cull selection is moot. Blend disabled so the
+        // pass is a pure overwrite of the swapchain texels. Colour target
+        // format must match the actual swapchain format or pipeline
+        // validation fires on the first render pass.
+        let present_blit_pipeline =
+            Arc::new(RenderPipeline::new(ctx, RenderPipelineDescriptor {
+                label:          "present_blit",
+                vertex:         blit_vs,
+                fragment:       blit_ps,
+                vertex_buffers: &[],
+                color_targets:  &[Some(wgpu::ColorTargetState {
+                    format:     surface_format,
+                    blend:      None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                depth_stencil:  None,
+                primitive:      wgpu::PrimitiveState {
+                    topology:   wgpu::PrimitiveTopology::TriangleList,
+                    cull_mode:  None,
+                    ..Default::default()
+                },
+                multisample:    wgpu::MultisampleState::default(),
+                immediate_size: 0,
+            }));
+
         Self {
             cull_pipeline,
             prep_pipeline,
             exposure_pipeline,
+            shade_pipeline,
             render_pipeline,
+            present_blit_pipeline,
             camera_buf,
             instance_buf,
             material_pool_buf,
@@ -1115,8 +1229,16 @@ impl WorldRenderer {
         &self.exposure_pipeline
     }
 
+    pub(crate) fn shade_pipeline(&self) -> &Arc<ComputePipeline> {
+        &self.shade_pipeline
+    }
+
     pub(crate) fn render_pipeline(&self) -> &Arc<RenderPipeline> {
         &self.render_pipeline
+    }
+
+    pub(crate) fn present_blit_pipeline(&self) -> &Arc<RenderPipeline> {
+        &self.present_blit_pipeline
     }
 
     pub(crate) fn camera_buf(&self) -> &wgpu::Buffer {
@@ -1172,19 +1294,38 @@ impl WorldRenderer {
 
 // --- subchunk_world render node ---
 
-/// Register the sub-chunk cull + MDI draw passes into `graph`.
+/// Register the sub-chunk cull + MDI draw + shade + present-blit passes
+/// into `graph`.
 ///
-/// Imports the renderer's four persistent buffers, allocates `visible`
-/// and `indirect` as per-frame transients, wires both dynamic bind groups,
-/// dispatches the 64-thread cull (1 workgroup), and issues a
-/// multi-draw-indirect-count raster that draws the surviving sub-chunks.
+/// Imports the renderer's persistent buffers, allocates the `visible`,
+/// `indirect`, `vis`, and `shaded_color` per-frame transients, wires the
+/// cull / draw / shade / blit bind groups, dispatches the 256-thread cull
+/// (1 workgroup), issues a multi-draw-indirect-count raster that writes
+/// the vis buffer + depth, dispatches an 8×8 compute shade that reads
+/// the vis buffer and writes `shaded_color`, then issues a
+/// fullscreen-triangle blit that reads `shaded_color` and writes into the
+/// caller-supplied `color` attachment (typically the swapchain).
 ///
-/// Returns the versioned output handles for the color and depth textures.
+/// The vis buffer is an `R32_UINT` transient with the `subchunk_vis`
+/// graph name; its resolution matches `(width, height)` — the same
+/// extent the caller uses for the depth buffer and the swapchain blit.
+/// Width and height are passed in explicitly because neither the vis nor
+/// `shaded_color` transients nor the depth handle expose their extent
+/// through the handle itself. See
+/// `decision-vis-buffer-deferred-shading-phase-1` for the vis packing
+/// layout.
+///
+/// Returns `(color_out, depth_out)` — the blit pass's colour write (the
+/// final pixels handed to the swapchain) and the draw pass's depth
+/// write. The `shaded_color` transient is consumed internally by the
+/// blit; callers do not observe it.
 pub fn subchunk_world(
     graph    : &mut RenderGraph,
     renderer : &Arc<WorldRenderer>,
     color    : TextureHandle,
     depth    : TextureHandle,
+    width    : u32,
+    height   : u32,
 )
     -> (TextureHandle, TextureHandle)
 {
@@ -1207,6 +1348,36 @@ pub fn subchunk_world(
         size  : indirect_size,
         usage : wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
     });
+
+    // Vis buffer: R32_UINT MRT target for the draw pass; sampled as a
+    // `Texture2D<uint>` by the shade compute pass. `STORAGE` is
+    // deliberately not included — shade reads via a sampled texture
+    // binding, not a storage UAV; adding `STORAGE` would force
+    // `R32Uint`-compatible storage-format validation on the GPU for zero
+    // gain.
+    let vis_h = graph.create_texture(
+        "subchunk_vis",
+        TextureDesc::new_2d(
+            width,
+            height,
+            wgpu::TextureFormat::R32Uint,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        ),
+    );
+
+    // Shaded-colour transient the compute shade pass writes and the
+    // downstream blit pass reads. `STORAGE_BINDING` is load-bearing for
+    // the shade pass's `RWTexture2D<float4>` UAV; `TEXTURE_BINDING` for
+    // the blit. See `SHADED_COLOR_FORMAT` for the format rationale.
+    let shaded_h = graph.create_texture(
+        "subchunk_shaded_color",
+        TextureDesc::new_2d(
+            width,
+            height,
+            SHADED_COLOR_FORMAT,
+            wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+        ),
+    );
 
     let cull_bg = graph.create_bind_group(
         "subchunk_cull_bg",
@@ -1233,6 +1404,16 @@ pub fn subchunk_world(
         ],
     );
 
+    let shade_bg = graph.create_bind_group(
+        "subchunk_shade_bg",
+        renderer.shade_pipeline().as_ref(),
+        None,
+        &[
+            (0, vis_h.into()),
+            (1, shaded_h.into()),
+        ],
+    );
+
     let indirect_in = IndirectArgs { indirect: indirect_h, count: count_h, max_draws: 1 };
 
     let indirect_out = cull(
@@ -1243,15 +1424,59 @@ pub fn subchunk_world(
         indirect_in,
     );
 
-    mdi_draw(
+    // Single colour attachment — the vis buffer. Slot 0 is cleared to
+    // the `0xFFFFFFFF` miss sentinel (packed layout in
+    // `decision-vis-buffer-deferred-shading-phase-1`). Passed as an
+    // `f64` because `wgpu::Color`'s channels are f64; `4294967295` fits
+    // exactly in f64's mantissa, so wgpu's bitwise integer cast for
+    // integer targets reproduces the sentinel exactly.
+    let (color_outs, depth_out) = mdi_draw(
         graph,
         renderer.render_pipeline(),
         render_bg,
         &indirect_out,
         &DrawArgs::default(),
-        color,
+        &[ColorTarget { texture: vis_h, clear: [4294967295.0, 0.0, 0.0, 0.0] }],
         depth,
-    )
+    );
+    let vis_written = color_outs[0];
+
+    // Dispatch grid: one thread per output pixel in 8×8 workgroups.
+    // Right / bottom edges may be partial — the shader's own
+    // `GetDimensions` check drops out-of-range threads.
+    let wg_x = width.div_ceil(8);
+    let wg_y = height.div_ceil(8);
+
+    let shade_pipeline = Arc::clone(renderer.shade_pipeline());
+    let shaded_out = graph.add_pass("subchunk_shade", |pass| {
+        let writes       = pass.use_bind_group(shade_bg);
+        let shaded_v     = writes.write_texture_of(shaded_h);
+        // `vis_written` is already recorded as a read via the
+        // `SampledTexture` binding in the shade bind group — no
+        // additional explicit declaration required.
+        let _ = vis_written;
+        pass.execute(move |ctx| {
+            let bg = ctx.resources.bind_group(shade_bg);
+            ctx.commands.dispatch(&shade_pipeline, &[bg], [wg_x, wg_y, 1], &[]);
+        });
+        shaded_v
+    });
+
+    // Fullscreen blit from `shaded_color` into the caller-supplied colour
+    // attachment. This is the final pass for the sub-chunk world render
+    // and — when `color` is the swapchain texture imported via
+    // `graph.present()` — also the pass whose output the swapchain
+    // presents. The blit's explicit read of `shaded_color` subsumes the
+    // liveness role the previous `mark_texture_output` scaffold served,
+    // so the scaffold is no longer needed and has been removed.
+    let color_out = present_blit(
+        graph,
+        renderer.present_blit_pipeline(),
+        shaded_out,
+        color,
+    );
+
+    (color_out, depth_out)
 }
 
 // --- subchunk_prep render node ---

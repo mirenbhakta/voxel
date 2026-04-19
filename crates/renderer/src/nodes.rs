@@ -10,9 +10,11 @@
 mod cull;
 mod indirect_args;
 mod mdi_draw;
+mod present_blit;
 
 pub use cull::{CullArgs, cull};
 pub use indirect_args::IndirectArgs;
-pub use mdi_draw::{DrawArgs, mdi_draw};
+pub use mdi_draw::{ColorTarget, DrawArgs, mdi_draw};
+pub use present_blit::present_blit;
 
 pub use crate::subchunk::{subchunk_exposure, subchunk_patch, subchunk_prep, subchunk_world};

@@ -353,6 +353,13 @@ fn collect_set_bindings(module: &Module, set: u32) -> Vec<(Word, u32)> {
 /// - `Uniform` + `BufferBlock` (legacy SPIR-V) OR `StorageBuffer` + `Block`
 ///   → storage buffer (size = element stride of the trailing runtime array).
 ///   Read-only when the variable carries `NonWritable`, read-write otherwise.
+/// - `UniformConstant` pointing at an `OpTypeImage` →
+///   [`BindKind::SampledTexture`] when `Sampled = 1` (HLSL `Texture2D<T>`),
+///   or [`BindKind::StorageTexture`] when `Sampled = 2` (HLSL
+///   `RWTexture2D<T>`). The storage-texture variant requires a concrete
+///   `vk::image_format` attribute on the HLSL side — SPIR-V
+///   `ImageFormat::Unknown` fails reflection with a message pointing at
+///   the attribute.
 /// - Anything else → `ShaderReflectionFailed`.
 fn classify_var(module: &Module, var_id: Word, binding: u32)
     -> Result<BindKind, RendererError>
@@ -371,6 +378,19 @@ fn classify_var(module: &Module, var_id: Word, binding: u32)
     let ptr_id = var_inst.result_type.ok_or_else(|| refl_err!(
         "binding {binding}: OpVariable has no result type",
     ))?;
+
+    // `UniformConstant` textures point directly at `OpTypeImage`; the
+    // `Uniform` / `StorageBuffer` block shapes indirect through a struct.
+    // Branch on storage class first rather than forcing every shape to
+    // resolve a struct id.
+    if matches!(sc, StorageClass::UniformConstant) {
+        let pointee_id = find_type(module, Op::TypePointer, ptr_id)
+            .and_then(|i| as_id(i.operands.get(1)))
+            .ok_or_else(|| refl_err!(
+                "binding {binding}: cannot follow pointer type {ptr_id} to its pointee",
+            ))?;
+        return classify_image(module, pointee_id, binding);
+    }
 
     let struct_id = find_type(module, Op::TypePointer, ptr_id)
         .and_then(|i| as_id(i.operands.get(1)))
@@ -416,9 +436,153 @@ fn classify_var(module: &Module, var_id: Word, binding: u32)
         (sc, deco) => Err(refl_err!(
             "binding {binding}: unsupported variable shape \
              (StorageClass={sc:?}, decoration={deco:?}); \
-             only Uniform+Block, Uniform+BufferBlock, and StorageBuffer+Block are supported",
+             only Uniform+Block, Uniform+BufferBlock, StorageBuffer+Block, \
+             and UniformConstant+OpTypeImage are supported",
         )),
     }
+}
+
+/// Classify an `OpTypeImage` pointee as a sampled or storage texture.
+///
+/// Looks at:
+///   - `Dim` operand to map to `wgpu::TextureViewDimension`. Only `2D` is
+///     supported today — the one consumer, `subchunk_shade.cs`, uses
+///     `Texture2D<uint>` and `RWTexture2D<float4>`; new dimensions gate
+///     on a concrete caller.
+///   - `Sampled` operand: `1` → sampled (SRV), `2` → storage (UAV).
+///     `0` (runtime-selected) is a DXC-unusual shape and rejected.
+///   - `SampledType` (the image's element type) maps to
+///     `wgpu::TextureSampleType` for sampled textures. Integer vs. float
+///     dispatches on the `OpTypeInt` `Signedness` operand.
+///   - `ImageFormat` operand for storage textures. `Unknown` is rejected
+///     — DXC emits it unless the shader uses `[[vk::image_format(...)]]`,
+///     and wgpu requires a concrete format in the bind-group layout
+///     entry.
+fn classify_image(module: &Module, image_id: Word, binding: u32)
+    -> Result<BindKind, RendererError>
+{
+    let inst = find_type(module, Op::TypeImage, image_id)
+        .ok_or_else(|| refl_err!(
+            "binding {binding}: UniformConstant variable does not point at \
+             an OpTypeImage (only image resources are supported on \
+             UniformConstant today)",
+        ))?;
+
+    // OpTypeImage operands: [SampledType, Dim, Depth, Arrayed, MS, Sampled, ImageFormat, …]
+    let sampled_type_id = as_id(inst.operands.first())
+        .ok_or_else(|| refl_err!(
+            "binding {binding}: OpTypeImage has no SampledType operand",
+        ))?;
+
+    let Some(Operand::Dim(dim)) = inst.operands.get(1) else {
+        return Err(refl_err!(
+            "binding {binding}: OpTypeImage has no Dim operand",
+        ));
+    };
+
+    let view_dimension = match dim {
+        spirv::Dim::Dim2D => wgpu::TextureViewDimension::D2,
+        other => return Err(refl_err!(
+            "binding {binding}: OpTypeImage Dim {other:?} is not supported \
+             (only Dim2D today)",
+        )),
+    };
+
+    let sampled = as_lit(inst.operands.get(5))
+        .ok_or_else(|| refl_err!(
+            "binding {binding}: OpTypeImage has no Sampled literal at operand 5",
+        ))?;
+
+    match sampled {
+        1 => {
+            let sample_type = classify_image_sample_type(module, sampled_type_id, binding)?;
+            Ok(BindKind::SampledTexture { sample_type, view_dimension })
+        }
+        2 => {
+            let Some(Operand::ImageFormat(fmt)) = inst.operands.get(6) else {
+                return Err(refl_err!(
+                    "binding {binding}: OpTypeImage has no ImageFormat operand at index 6",
+                ));
+            };
+            let format = image_format_to_wgpu(*fmt).ok_or_else(|| refl_err!(
+                "binding {binding}: OpTypeImage ImageFormat {fmt:?} cannot be \
+                 mapped to a wgpu::TextureFormat. Add \
+                 [[vk::image_format(\"<fmt>\")]] to the HLSL declaration so \
+                 reflection can pin the format (Unknown is not accepted — \
+                 wgpu requires a concrete format in the layout entry)",
+            ))?;
+            Ok(BindKind::StorageTexture { format, view_dimension })
+        }
+        other => Err(refl_err!(
+            "binding {binding}: OpTypeImage Sampled={other} is not supported \
+             (only Sampled=1 [Texture2D] and Sampled=2 [RWTexture2D] today)",
+        )),
+    }
+}
+
+/// Map an `OpTypeImage` `SampledType` id to `wgpu::TextureSampleType`.
+///
+/// Follows the convention the only current caller (subchunk_shade)
+/// establishes: `uint` → `Uint`, `int` → `Sint`, `float` → `Float {
+/// filterable: false }`. Filterability is the conservative choice — a
+/// non-filterable float sampled texture is a strict subset of the
+/// filterable form, and phase-1 shade does plain integer loads without
+/// interpolation.
+fn classify_image_sample_type(module: &Module, type_id: Word, binding: u32)
+    -> Result<wgpu::TextureSampleType, RendererError>
+{
+    let inst = find_type_any(module, type_id).ok_or_else(|| refl_err!(
+        "binding {binding}: cannot resolve SampledType {type_id}",
+    ))?;
+
+    match inst.class.opcode {
+        Op::TypeInt => {
+            let Some(signedness) = as_lit(inst.operands.get(1)) else {
+                return Err(refl_err!(
+                    "binding {binding}: SampledType OpTypeInt has no Signedness operand",
+                ));
+            };
+            Ok(if signedness == 0 {
+                wgpu::TextureSampleType::Uint
+            }
+            else {
+                wgpu::TextureSampleType::Sint
+            })
+        }
+        Op::TypeFloat => Ok(wgpu::TextureSampleType::Float { filterable: false }),
+        other => Err(refl_err!(
+            "binding {binding}: SampledType opcode {other:?} is not supported \
+             (only OpTypeInt and OpTypeFloat today)",
+        )),
+    }
+}
+
+/// Map a SPIR-V `ImageFormat` to a `wgpu::TextureFormat`.
+///
+/// Only the formats that storage-texture consumers in the renderer have
+/// asked for are mapped; extending the table is straightforward as new
+/// needs arise. Returns `None` for `Unknown` and for any unmapped
+/// variant — the caller turns that into an actionable error pointing
+/// at the `vk::image_format` attribute on the HLSL side.
+fn image_format_to_wgpu(fmt: spirv::ImageFormat) -> Option<wgpu::TextureFormat> {
+    use spirv::ImageFormat as S;
+    use wgpu::TextureFormat as W;
+    Some(match fmt {
+        S::Rgba8       => W::Rgba8Unorm,
+        S::Rgba8Snorm  => W::Rgba8Snorm,
+        S::Rgba16f     => W::Rgba16Float,
+        S::Rgba32f     => W::Rgba32Float,
+        S::R32f        => W::R32Float,
+        S::R32ui       => W::R32Uint,
+        S::R32i        => W::R32Sint,
+        S::Rgba8ui     => W::Rgba8Uint,
+        S::Rgba8i      => W::Rgba8Sint,
+        S::Rgba16ui    => W::Rgba16Uint,
+        S::Rgba16i     => W::Rgba16Sint,
+        S::Rgba32ui    => W::Rgba32Uint,
+        S::Rgba32i     => W::Rgba32Sint,
+        _ => return None,
+    })
 }
 
 // --- Decoration queries ---

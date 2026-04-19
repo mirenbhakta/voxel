@@ -91,7 +91,8 @@ void main(uint vid : SV_VertexID,
           out float                    inside_flag : TEXCOORD1,
           out nointerpolation uint     occ_slot    : TEXCOORD2,
           out nointerpolation int3     origin      : TEXCOORD3,
-          out nointerpolation float    voxel_size  : TEXCOORD4) {
+          out nointerpolation float    voxel_size  : TEXCOORD4,
+          out nointerpolation uint     level_idx   : TEXCOORD5) {
     // Look up which candidate this instance corresponds to.
     uint     slot = g_visible[iid];
     Instance inst = g_instances[slot];
@@ -143,4 +144,7 @@ void main(uint vid : SV_VertexID,
     occ_slot    = inst.slot_mask & 0x003FFFFFu;
     origin      = inst.origin;
     voxel_size  = vox_size;
+    // 4-bit LOD level passed through for vis-buffer packing. Shading
+    // consumers unpack via `(vis >> 12) & 0xFu`.
+    level_idx   = lvl;
 }

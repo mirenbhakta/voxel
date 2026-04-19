@@ -60,5 +60,17 @@ pub(crate) fn bind_kind_to_wgpu_ty(kind: BindKind) -> wgpu::BindingType {
             has_dynamic_offset: false,
             min_binding_size: NonZeroU64::new(size),
         },
+        BindKind::SampledTexture { sample_type, view_dimension } =>
+            wgpu::BindingType::Texture {
+                sample_type,
+                view_dimension,
+                multisampled: false,
+            },
+        BindKind::StorageTexture { format, view_dimension } =>
+            wgpu::BindingType::StorageTexture {
+                access: wgpu::StorageTextureAccess::WriteOnly,
+                format,
+                view_dimension,
+            },
     }
 }
