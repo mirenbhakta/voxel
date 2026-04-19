@@ -471,6 +471,213 @@ MarchResult dda_world(float3 origin_ws, float3 dir_ws, float max_t_ws, uint leve
     return miss;
 }
 
+// --- World-space DDA across LOD levels (classical clipmap promotion). ---
+//
+// Walks a world-space ray through the overlapping clipmap occupancy grid,
+// starting at `min_level` and promoting to the next coarser level whenever
+// the outer DDA steps into a non-resident cell (= ray exited the current
+// level's shell). Does not demote back to finer levels; classical clipmap
+// rule. Terminates when the ray promotes past the coarsest resident level,
+// when `t` exceeds `max_t_ws`, or on the first occupancy hit.
+//
+// # Overlapping-clipmap substrate
+//
+// Nested-shell LOD (`decision-lod-nested-shells-hierarchical-occupancy`)
+// partitions *primary-ray rendering* so each pixel comes from exactly one
+// level, but the underlying occupancy *data* at each level overlaps: a
+// region resident at L0 is also resident at L1, L2, etc. Worldgen
+// OR-propagates fine authored content up the hierarchy so coarser levels
+// are conservatively solid relative to finer. Together these make classical
+// clipmap promotion correct: once the ray exits L_n's shell, L_(n+1)
+// covers the same region (and more), and will never miss an occluder the
+// finer level would have reported.
+//
+// # min_level selection
+//
+// Callers should pass the finest level that is resident at the ray origin.
+// For a secondary ray spawned at a primary hit, that is the primary hit's
+// `level_idx` — L0 is not resident at coarser-level hit positions, so
+// starting there would just burn iterations on non-resident cells until
+// the ray promotes to the hit's actual level.
+//
+// # Parameters
+//
+// Same ray contract as `dda_world`: `dir_ws` must be unit-length; `t` is in
+// world units; `max_t_ws` caps the march.
+MarchResult dda_world_clipmap(
+    float3 origin_ws,
+    float3 dir_ws,
+    float  max_t_ws,
+    uint   min_level
+) {
+    MarchResult miss;
+    miss.occ_slot  = 0u;
+    miss.local_idx = 0u;
+    miss.face      = DDA_FACE_POS_X;
+    miss.t         = 0.0;
+    miss.hit       = false;
+
+    const float HUGE = 1e30;
+
+    // Step signs are level-invariant — set once.
+    int3 step;
+    step.x = dir_ws.x > 0.0 ? 1 : (dir_ws.x < 0.0 ? -1 : 0);
+    step.y = dir_ws.y > 0.0 ? 1 : (dir_ws.y < 0.0 ? -1 : 0);
+    step.z = dir_ws.z > 0.0 ? 1 : (dir_ws.z < 0.0 ? -1 : 0);
+
+    uint  level      = min_level;
+    float voxel_size = float(1u << level);
+    float sc_size    = 8.0 * voxel_size;
+
+    int3 cell = int3(floor(origin_ws / sc_size));
+
+    float3 t_next, t_delta;
+    if (step.x != 0) {
+        float boundary = step.x > 0 ? float(cell.x + 1) * sc_size
+                                     : float(cell.x)     * sc_size;
+        t_next.x  = (boundary - origin_ws.x) / dir_ws.x;
+        t_delta.x = abs(sc_size / dir_ws.x);
+    } else { t_next.x = HUGE; t_delta.x = HUGE; }
+    if (step.y != 0) {
+        float boundary = step.y > 0 ? float(cell.y + 1) * sc_size
+                                     : float(cell.y)     * sc_size;
+        t_next.y  = (boundary - origin_ws.y) / dir_ws.y;
+        t_delta.y = abs(sc_size / dir_ws.y);
+    } else { t_next.y = HUGE; t_delta.y = HUGE; }
+    if (step.z != 0) {
+        float boundary = step.z > 0 ? float(cell.z + 1) * sc_size
+                                     : float(cell.z)     * sc_size;
+        t_next.z  = (boundary - origin_ws.z) / dir_ws.z;
+        t_delta.z = abs(sc_size / dir_ws.z);
+    } else { t_next.z = HUGE; t_delta.z = HUGE; }
+
+    float t_outer = 0.0;
+
+    // Global step cap across all levels. Each level can contribute up to
+    // ~shell-diameter outer steps; 256 covers 16 levels of deep traversal
+    // while bounding worst-case runtime.
+    [loop]
+    for (uint i = 0u; i < 256u; i++) {
+        if (t_outer > max_t_ws) {
+            break;
+        }
+
+        uint slot;
+        bool resident = resolve_and_verify(cell, level, g_directory, slot);
+
+        if (resident) {
+            DirEntry e = g_directory[slot];
+            if (direntry_is_resident(e)) {
+                float3 cell_corner_ws = float3(cell) * sc_size;
+                float3 local_origin   = (origin_ws + t_outer * dir_ws - cell_corner_ws)
+                                      / voxel_size;
+                float3 local_dir      = dir_ws / voxel_size;
+                float  max_t_local    = max_t_ws - t_outer;
+
+                MarchResult inner = dda_sub_chunk(local_origin, local_dir, max_t_local, slot);
+                if (inner.hit) {
+                    inner.t += t_outer;
+                    return inner;
+                }
+            }
+
+            // Advance to next outer cell at the current level.
+            if (t_next.x < t_next.y) {
+                if (t_next.x < t_next.z) {
+                    t_outer   = t_next.x;
+                    cell.x   += step.x;
+                    t_next.x += t_delta.x;
+                } else {
+                    t_outer   = t_next.z;
+                    cell.z   += step.z;
+                    t_next.z += t_delta.z;
+                }
+            } else {
+                if (t_next.y < t_next.z) {
+                    t_outer   = t_next.y;
+                    cell.y   += step.y;
+                    t_next.y += t_delta.y;
+                } else {
+                    t_outer   = t_next.z;
+                    cell.z   += step.z;
+                    t_next.z += t_delta.z;
+                }
+            }
+        } else {
+            // Non-resident at current level → ray exited this level's shell.
+            // Promote to the next coarser level and re-initialize outer DDA.
+            // Bail if already past the coarsest resident level.
+            uint next_level = level + 1u;
+            if (next_level >= g_consts.level_count) {
+                break;
+            }
+
+            // Derive the new-level cell via the nested-shell integer
+            // invariant rather than `floor(pos_ws / new_sc_size)`.
+            //
+            // `decision-lod-nested-shells-hierarchical-occupancy` guarantees
+            // all per-level corners coincide in world space and each finer
+            // sub-chunk index is a bit-shifted copy of its coarser parent.
+            // So the L+1 cell containing the current L cell is exactly
+            // `cell >> 1` (arithmetic shift — correct for signed negatives).
+            //
+            // Deriving via floor on `origin_ws + t_outer * dir_ws` is wrong
+            // when `t_outer` sits on an L-level boundary that coincides with
+            // an L+1-level boundary (common on promote since we just
+            // advanced across an L-boundary): `pos_ws` lands within one fp
+            // ULP of a coarse cell face, and adjacent pixels with
+            // sub-voxel `origin_ws` variation flip between neighbour L+1
+            // cells — producing per-pixel speckle when the wrong-side cell
+            // happens to be OR-occupied.
+            cell       = cell >> 1;
+            level      = next_level;
+            voxel_size = float(1u << level);
+            sc_size    = 8.0 * voxel_size;
+
+            if (step.x != 0) {
+                float boundary = step.x > 0 ? float(cell.x + 1) * sc_size
+                                             : float(cell.x)     * sc_size;
+                t_next.x  = (boundary - origin_ws.x) / dir_ws.x;
+                t_delta.x = abs(sc_size / dir_ws.x);
+            } else { t_next.x = HUGE; t_delta.x = HUGE; }
+            if (step.y != 0) {
+                float boundary = step.y > 0 ? float(cell.y + 1) * sc_size
+                                             : float(cell.y)     * sc_size;
+                t_next.y  = (boundary - origin_ws.y) / dir_ws.y;
+                t_delta.y = abs(sc_size / dir_ws.y);
+            } else { t_next.y = HUGE; t_delta.y = HUGE; }
+            if (step.z != 0) {
+                float boundary = step.z > 0 ? float(cell.z + 1) * sc_size
+                                             : float(cell.z)     * sc_size;
+                t_next.z  = (boundary - origin_ws.z) / dir_ws.z;
+                t_delta.z = abs(sc_size / dir_ws.z);
+            } else { t_next.z = HUGE; t_delta.z = HUGE; }
+
+            // Nudge `t_outer` forward past the L-boundary we just crossed.
+            //
+            // L cell boundaries are always on L+1 voxel boundaries (L sub-
+            // chunk size = 4 × L+1 voxel size under dyadic OR-reduction), so
+            // at this moment `local_origin` for the L+1 inner DDA sits
+            // exactly on an L+1 voxel face. The L+1 voxel on the ray's
+            // entry side OR-reduces content from the OLD L cell — which the
+            // L-level march just verified has no hit. Testing it at t=0 via
+            // the entry-cell check fires a conservative false shadow when
+            // the real content in that L+1 voxel lives at the FAR end (in
+            // the just-exited L region) rather than on the ray's path.
+            //
+            // Nudging by `sc_size * 1e-5` moves the ray infinitesimally
+            // past the boundary, flipping `floor(local_origin[axis])` to
+            // the voxel on the NEW side — the L+1 voxel whose OR-reduction
+            // comes entirely from non-resident L cells (so its marks are
+            // legitimately conservative for territory we have no L data
+            // on). Other axes are unaffected because the nudge is well
+            // below 1 ULP relative to their local_origin magnitudes.
+            t_outer += sc_size * 1e-5;
+        }
+    }
+
+    return miss;
+}
 
 #endif // RENDERER_DIRECTORY_HLSL
 

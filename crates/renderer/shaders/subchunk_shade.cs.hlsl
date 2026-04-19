@@ -212,12 +212,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // voxel_size so it stays meaningful across LOD levels.
     float3 shadow_origin_ws = hit_ws + normal * (voxel_size * 1e-3);
 
-    // Cast a single sun-shadow ray at the primary hit's LOD level. Walking
-    // at the same level keeps the shadow consistent with the primary hit.
-    // Cross-LOD shadow rays (where the ray traverses multiple shell
-    // boundaries) are a follow-up — see `dda_world_clipmap` in the next
-    // change.
-    MarchResult s = dda_world(shadow_origin_ws, SUN_DIR_TO_LIGHT, MAX_SHADOW_T, level_idx);
+    // Cast a single sun-shadow ray via classical clipmap promotion. Always
+    // start at level 0 — the finest possible level — and let
+    // `dda_world_clipmap` promote on non-resident cells. The primary hit's
+    // `level_idx` is NOT the right starting level: a primary hit rendered
+    // at L_n lives in an L_n sub-chunk that straddles out of L_(n-1)'s
+    // shell, but the shadow ray almost immediately enters adjacent sub-
+    // chunks whose finer levels may still be resident. Using L_n as the
+    // start would read OR-reduced occupancy at positions where precise L0
+    // data exists, producing conservative (false-positive) shadow hits.
+    MarchResult s = dda_world_clipmap(shadow_origin_ws, SUN_DIR_TO_LIGHT, MAX_SHADOW_T, 0u);
 
     // Shadow attenuation: 0.0 if occluded, 1.0 if unoccluded.
     float shadow = s.hit ? 0.0 : 1.0;
