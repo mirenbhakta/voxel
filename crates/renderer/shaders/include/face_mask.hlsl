@@ -211,4 +211,123 @@ bool face_exposed(uint2 my_face, uint2 nbr_face) {
     return (exposed.x | exposed.y) != 0u;
 }
 
+// --- Interior cell-pair exposure (per direction). ---
+//
+// Mirrors the scaffold renderer's `here & ~there` quad-emission criterion
+// (`crates/scaffold/src/shaders/include/face.hlsl`, removed in 3715045) for
+// the 7 cell-pair interfaces *internal* to a sub-chunk along a given
+// axis. The boundary interface (cell-pair across the sub-chunk's outer
+// face) is handled by `face_exposed` above against a neighbour-extracted
+// face plane; together they cover all 8 interfaces along the axis.
+//
+// Each helper OR-folds the per-cell `here & ~there` mask across all
+// internal interfaces and returns a u32 accumulator. The accumulator is
+// non-zero iff at least one interior voxel V satisfies (V solid AND
+// V's d-neighbour empty AND that neighbour is internal to the sub-chunk).
+//
+// Bit-position semantics within the accumulator are not preserved across
+// the OR-fold (different interfaces contribute bits at different
+// positions), so callers should treat the result as a single boolean
+// "any interior pair exposed in direction d." The u32 return type avoids
+// branching in the per-direction OR; the consumer collapses with `!= 0`.
+
+// +X interior: bit p = 8y + x set iff (V at x=k solid) AND (V at x=k+1
+// empty), for k in [0, 6]. Within each y-row of 8 contiguous bits in a
+// word, `V & ~(V >> 1)` gives the cell pair test; the MASK_NO_X7 mask
+// drops bit 7 of each byte (the x=7 column has no internal +X neighbour
+// — it pairs against the external sub-chunk to the +X side).
+uint interior_exposed_pX(Occupancy occ) {
+    const uint MASK_NO_X7 = 0x7F7F7F7Fu;
+    uint acc = 0u;
+    [unroll] for (uint z = 0u; z < 8u; ++z) {
+        uint w0 = occ_word0_at_z(occ, z);
+        uint w1 = occ_word1_at_z(occ, z);
+        acc |= w0 & ~(w0 >> 1u) & MASK_NO_X7;
+        acc |= w1 & ~(w1 >> 1u) & MASK_NO_X7;
+    }
+    return acc;
+}
+
+// -X interior: symmetric to +X. `V & ~(V << 1)` gives (V at x=k solid)
+// AND (V at x=k-1 empty). MASK_NO_X0 drops bit 0 of each byte (x=0 has
+// no internal -X neighbour).
+uint interior_exposed_nX(Occupancy occ) {
+    const uint MASK_NO_X0 = 0xFEFEFEFEu;
+    uint acc = 0u;
+    [unroll] for (uint z = 0u; z < 8u; ++z) {
+        uint w0 = occ_word0_at_z(occ, z);
+        uint w1 = occ_word1_at_z(occ, z);
+        acc |= w0 & ~(w0 << 1u) & MASK_NO_X0;
+        acc |= w1 & ~(w1 << 1u) & MASK_NO_X0;
+    }
+    return acc;
+}
+
+// +Y interior: y-rows are stored in 8-bit strides within a word. Within
+// word 0 (y in [0,4)) we get pairs k=0,1,2; within word 1 (y in [4,8))
+// we get pairs k=4,5,6. The cross-word pair k=3 -> k=4 is handled
+// separately: y=3 lives in bits 24..31 of word 0, y=4 in bits 0..7 of
+// word 1, so `(w0 >> 24) & ~(w1 & 0xFF)` packs the 8 cell-pair bits
+// at low positions of `acc`.
+uint interior_exposed_pY(Occupancy occ) {
+    const uint MASK_NO_Y_TOP = 0x00FFFFFFu;
+    uint acc = 0u;
+    [unroll] for (uint z = 0u; z < 8u; ++z) {
+        uint w0 = occ_word0_at_z(occ, z);
+        uint w1 = occ_word1_at_z(occ, z);
+        acc |= w0 & ~(w0 >> 8u) & MASK_NO_Y_TOP;
+        acc |= w1 & ~(w1 >> 8u) & MASK_NO_Y_TOP;
+        acc |= (w0 >> 24u) & ~(w1 & 0xFFu);
+    }
+    return acc;
+}
+
+// -Y interior: symmetric to +Y. Within-word pairs use `V & ~(V << 8)`;
+// the cross-word pair k=4 -> k=3 reads y=4 from word 1's low byte vs
+// y=3 from word 0's high byte.
+uint interior_exposed_nY(Occupancy occ) {
+    const uint MASK_NO_Y_BOT = 0xFFFFFF00u;
+    uint acc = 0u;
+    [unroll] for (uint z = 0u; z < 8u; ++z) {
+        uint w0 = occ_word0_at_z(occ, z);
+        uint w1 = occ_word1_at_z(occ, z);
+        acc |= w0 & ~(w0 << 8u) & MASK_NO_Y_BOT;
+        acc |= w1 & ~(w1 << 8u) & MASK_NO_Y_BOT;
+        acc |= (w1 & 0xFFu) & ~(w0 >> 24u);
+    }
+    return acc;
+}
+
+// +Z interior: each z-plane is two whole 32-bit words; the cell at (x,y,z)
+// pairs with the cell at (x,y,z+1) at the identical bit position within
+// the corresponding word. Iterate the 7 z-pair interfaces and OR both
+// halves of each pair.
+uint interior_exposed_pZ(Occupancy occ) {
+    uint acc = 0u;
+    [unroll] for (uint z = 0u; z < 7u; ++z) {
+        uint w0_here  = occ_word0_at_z(occ, z);
+        uint w1_here  = occ_word1_at_z(occ, z);
+        uint w0_there = occ_word0_at_z(occ, z + 1u);
+        uint w1_there = occ_word1_at_z(occ, z + 1u);
+        acc |= w0_here & ~w0_there;
+        acc |= w1_here & ~w1_there;
+    }
+    return acc;
+}
+
+// -Z interior: symmetric to +Z, iterating the 7 z-pair interfaces with
+// `here = z=k`, `there = z=k-1` for k in [1, 7].
+uint interior_exposed_nZ(Occupancy occ) {
+    uint acc = 0u;
+    [unroll] for (uint z = 1u; z < 8u; ++z) {
+        uint w0_here  = occ_word0_at_z(occ, z);
+        uint w1_here  = occ_word1_at_z(occ, z);
+        uint w0_there = occ_word0_at_z(occ, z - 1u);
+        uint w1_there = occ_word1_at_z(occ, z - 1u);
+        acc |= w0_here & ~w0_there;
+        acc |= w1_here & ~w1_there;
+    }
+    return acc;
+}
+
 #endif // RENDERER_FACE_MASK_HLSL

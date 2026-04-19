@@ -100,6 +100,24 @@ uint compute_exposure_mask(Occupancy me, int3 self_coord, uint level_idx) {
         int3( 0,  0,  1),
     };
 
+    // Interior cell-pair contribution. For each direction d, OR-fold
+    // `here & ~there` across the 7 internal interfaces along axis d
+    // (`include/face_mask.hlsl`). Catches sub-chunks whose only exposed
+    // faces are interior — e.g. a heightfield surface that crests inside
+    // the sub-chunk and never reaches the y=7 plane. Pure self-occupancy:
+    // no neighbour reads, no level dependency.
+    uint interior[6];
+    interior[0] = interior_exposed_nX(me);
+    interior[1] = interior_exposed_pX(me);
+    interior[2] = interior_exposed_nY(me);
+    interior[3] = interior_exposed_pY(me);
+    interior[4] = interior_exposed_nZ(me);
+    interior[5] = interior_exposed_pZ(me);
+
+    // Boundary contribution: my outer face plane vs. the neighbour's
+    // opposing face plane. Only fetched when interior didn't already
+    // fire — saves up to 6 neighbour reads per sub-chunk on geometry
+    // that has any interior surface.
     uint2 my_faces[6];
     my_faces[0] = face_nX(me);
     my_faces[1] = face_pX(me);
@@ -110,9 +128,13 @@ uint compute_exposure_mask(Occupancy me, int3 self_coord, uint level_idx) {
 
     uint exposure = 0u;
     [unroll] for (uint d = 0u; d < 6u; ++d) {
-        int3 nbr_coord = self_coord + offsets[d];
-        uint2 nbr_face = neighbour_opposing_face(nbr_coord, level_idx, d);
-        if (face_exposed(my_faces[d], nbr_face)) {
+        bool exposed = (interior[d] != 0u);
+        if (!exposed) {
+            int3 nbr_coord = self_coord + offsets[d];
+            uint2 nbr_face = neighbour_opposing_face(nbr_coord, level_idx, d);
+            exposed = face_exposed(my_faces[d], nbr_face);
+        }
+        if (exposed) {
             exposure |= 1u << d;
         }
     }

@@ -1839,6 +1839,89 @@ mod tests {
         (ex0 | ex1) != 0
     }
 
+    // -- Interior cell-pair exposure CPU mirror --
+    //
+    // Mirrors the six `interior_exposed_*` helpers in face_mask.hlsl.
+    // Each returns a u32 accumulator that is non-zero iff at least one
+    // interior voxel V satisfies (V solid AND V's d-neighbour empty AND
+    // that neighbour is internal to this sub-chunk).
+
+    fn interior_exposed_px_mirror(occ: &SubchunkOccupancy) -> u32 {
+        const MASK_NO_X7: u32 = 0x7F7F_7F7F;
+        let mut acc = 0u32;
+        for z in 0..8 {
+            let w0 = word_at(occ, z, 0);
+            let w1 = word_at(occ, z, 1);
+            acc |= w0 & !(w0 >> 1) & MASK_NO_X7;
+            acc |= w1 & !(w1 >> 1) & MASK_NO_X7;
+        }
+        acc
+    }
+
+    fn interior_exposed_nx_mirror(occ: &SubchunkOccupancy) -> u32 {
+        const MASK_NO_X0: u32 = 0xFEFE_FEFE;
+        let mut acc = 0u32;
+        for z in 0..8 {
+            let w0 = word_at(occ, z, 0);
+            let w1 = word_at(occ, z, 1);
+            acc |= w0 & !(w0 << 1) & MASK_NO_X0;
+            acc |= w1 & !(w1 << 1) & MASK_NO_X0;
+        }
+        acc
+    }
+
+    fn interior_exposed_py_mirror(occ: &SubchunkOccupancy) -> u32 {
+        const MASK_NO_Y_TOP: u32 = 0x00FF_FFFF;
+        let mut acc = 0u32;
+        for z in 0..8 {
+            let w0 = word_at(occ, z, 0);
+            let w1 = word_at(occ, z, 1);
+            acc |= w0 & !(w0 >> 8) & MASK_NO_Y_TOP;
+            acc |= w1 & !(w1 >> 8) & MASK_NO_Y_TOP;
+            acc |= (w0 >> 24) & !(w1 & 0xFF);
+        }
+        acc
+    }
+
+    fn interior_exposed_ny_mirror(occ: &SubchunkOccupancy) -> u32 {
+        const MASK_NO_Y_BOT: u32 = 0xFFFF_FF00;
+        let mut acc = 0u32;
+        for z in 0..8 {
+            let w0 = word_at(occ, z, 0);
+            let w1 = word_at(occ, z, 1);
+            acc |= w0 & !(w0 << 8) & MASK_NO_Y_BOT;
+            acc |= w1 & !(w1 << 8) & MASK_NO_Y_BOT;
+            acc |= (w1 & 0xFF) & !(w0 >> 24);
+        }
+        acc
+    }
+
+    fn interior_exposed_pz_mirror(occ: &SubchunkOccupancy) -> u32 {
+        let mut acc = 0u32;
+        for z in 0..7 {
+            let w0_here  = word_at(occ, z,     0);
+            let w1_here  = word_at(occ, z,     1);
+            let w0_there = word_at(occ, z + 1, 0);
+            let w1_there = word_at(occ, z + 1, 1);
+            acc |= w0_here & !w0_there;
+            acc |= w1_here & !w1_there;
+        }
+        acc
+    }
+
+    fn interior_exposed_nz_mirror(occ: &SubchunkOccupancy) -> u32 {
+        let mut acc = 0u32;
+        for z in 1..8 {
+            let w0_here  = word_at(occ, z,     0);
+            let w1_here  = word_at(occ, z,     1);
+            let w0_there = word_at(occ, z - 1, 0);
+            let w1_there = word_at(occ, z - 1, 1);
+            acc |= w0_here & !w0_there;
+            acc |= w1_here & !w1_there;
+        }
+        acc
+    }
+
     /// The canonical bit position for face cell (a, b) — the single bit
     /// that a voxel at the free-axis coordinates (a, b) on a given face
     /// should set in the `(u32, u32)` canonical layout.
@@ -2097,6 +2180,166 @@ mod tests {
                  is NOT exposed — the two voxels meet at cell (y=3, z=2)",
             );
         }
+    }
+
+    // -- Interior cell-pair exposure tests --
+
+    /// Empty occupancy has no solid voxels, so no `here & ~there` cell
+    /// pair can fire in any direction.
+    #[test]
+    fn interior_exposed_is_zero_on_empty() {
+        let occ = SubchunkOccupancy { planes: [0; 16] };
+        assert_eq!(interior_exposed_px_mirror(&occ), 0);
+        assert_eq!(interior_exposed_nx_mirror(&occ), 0);
+        assert_eq!(interior_exposed_py_mirror(&occ), 0);
+        assert_eq!(interior_exposed_ny_mirror(&occ), 0);
+        assert_eq!(interior_exposed_pz_mirror(&occ), 0);
+        assert_eq!(interior_exposed_nz_mirror(&occ), 0);
+    }
+
+    /// Fully-solid occupancy has no interior cell pair where `here` is
+    /// solid AND `there` is empty — `ALL_ONES & !ALL_ONES = 0`. This
+    /// isolates the interior path; the boundary-via-neighbour
+    /// contribution is checked separately by the face_exposed tests.
+    /// It is also the load-bearing property that lets cull drop the
+    /// `is_solid` early-out: for fully-solid sub-chunks, exposure bits
+    /// are entirely determined by the boundary check against neighbours.
+    #[test]
+    fn interior_exposed_is_zero_on_fully_solid() {
+        let occ = SubchunkOccupancy { planes: [0xFFFF_FFFF; 16] };
+        assert_eq!(interior_exposed_px_mirror(&occ), 0);
+        assert_eq!(interior_exposed_nx_mirror(&occ), 0);
+        assert_eq!(interior_exposed_py_mirror(&occ), 0);
+        assert_eq!(interior_exposed_ny_mirror(&occ), 0);
+        assert_eq!(interior_exposed_pz_mirror(&occ), 0);
+        assert_eq!(interior_exposed_nz_mirror(&occ), 0);
+    }
+
+    /// A single voxel at the centre has all 6 neighbours empty AND
+    /// inside the sub-chunk, so every direction's interior OR-fold
+    /// fires.
+    #[test]
+    fn interior_exposed_fires_in_all_directions_for_isolated_voxel() {
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 4, 4, 4);
+        assert_ne!(interior_exposed_px_mirror(&occ), 0);
+        assert_ne!(interior_exposed_nx_mirror(&occ), 0);
+        assert_ne!(interior_exposed_py_mirror(&occ), 0);
+        assert_ne!(interior_exposed_ny_mirror(&occ), 0);
+        assert_ne!(interior_exposed_pz_mirror(&occ), 0);
+        assert_ne!(interior_exposed_nz_mirror(&occ), 0);
+    }
+
+    /// A voxel at x=7 has no internal +X neighbour — the cell at "x=8"
+    /// wraps into the next y-row in raw bit terms, which the
+    /// MASK_NO_X7 mask is there to suppress. Without that mask, the
+    /// helper would spuriously report +X exposure for any voxel at the
+    /// outer face. Symmetric guard for `interior_exposed_pz` at z=7
+    /// (mask not needed — the iteration bound `z < 7u` excludes it).
+    #[test]
+    fn interior_exposed_does_not_fire_for_voxel_at_outer_face() {
+        // x=7: no internal +X neighbour. -X should still fire because
+        // (x=6, y=4, z=4) is empty and (x=7, y=4, z=4) is solid.
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 7, 4, 4);
+        assert_eq!(
+            interior_exposed_px_mirror(&occ), 0,
+            "+X must NOT fire for x=7 voxel — no internal +X neighbour",
+        );
+        assert_ne!(interior_exposed_nx_mirror(&occ), 0);
+
+        // z=7: no internal +Z neighbour.
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 3, 4, 7);
+        assert_eq!(
+            interior_exposed_pz_mirror(&occ), 0,
+            "+Z must NOT fire for z=7 voxel — no internal +Z neighbour",
+        );
+        assert_ne!(interior_exposed_nz_mirror(&occ), 0);
+
+        // x=0: no internal -X neighbour.
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 0, 4, 4);
+        assert_eq!(
+            interior_exposed_nx_mirror(&occ), 0,
+            "-X must NOT fire for x=0 voxel — no internal -X neighbour",
+        );
+        assert_ne!(interior_exposed_px_mirror(&occ), 0);
+    }
+
+    /// The y=3 / y=4 interface crosses the word-0 / word-1 boundary
+    /// inside a single z-plane (word 0 holds y in [0,4), word 1 holds y
+    /// in [4,8)). The cross-word OR `(w0 >> 24) & !(w1 & 0xFF)` must
+    /// detect the empty +Y neighbour at y=4 for a solid voxel at y=3.
+    #[test]
+    fn interior_exposed_py_fires_across_y3_y4_word_boundary() {
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 2, 3, 4);
+        assert_ne!(
+            interior_exposed_py_mirror(&occ), 0,
+            "+Y must fire across the y=3 -> y=4 word boundary",
+        );
+    }
+
+    /// Symmetric to the +Y cross-word test: a voxel at y=4 in word 1's
+    /// low byte with empty -Y neighbour at y=3 in word 0's high byte
+    /// must fire via `(w1 & 0xFF) & !(w0 >> 24)`.
+    #[test]
+    fn interior_exposed_ny_fires_across_y4_y3_word_boundary() {
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        set_bit(&mut occ, 2, 4, 4);
+        assert_ne!(
+            interior_exposed_ny_mirror(&occ), 0,
+            "-Y must fire across the y=4 -> y=3 word boundary",
+        );
+    }
+
+    /// The original motivating case: a heightfield surface that crests
+    /// inside the sub-chunk and never reaches y=7. The boundary-only
+    /// `face_pY` extracts the y=7 row, sees zero solid voxels there, and
+    /// reports +Y exposure = 0 — dropping the sub-chunk from cull when
+    /// the camera looks down on it. The interior +Y OR-fold catches the
+    /// y=3 -> y=4 transition at the column top and forces +Y exposure
+    /// regardless of the boundary.
+    #[test]
+    fn interior_exposed_py_fires_on_heightfield_top_inside_sub_chunk() {
+        let mut occ = SubchunkOccupancy { planes: [0; 16] };
+        for y in 0..4 {
+            set_bit(&mut occ, 4, y, 4);
+        }
+        assert_ne!(
+            interior_exposed_py_mirror(&occ), 0,
+            "+Y interior must fire for an interior heightfield top",
+        );
+        assert_eq!(
+            interior_exposed_ny_mirror(&occ), 0,
+            "-Y interior must NOT fire — column bottom only exposes via boundary",
+        );
+        // Lateral directions: column has empty interior neighbours on
+        // every side, so all four ±X / ±Z fire.
+        assert_ne!(interior_exposed_px_mirror(&occ), 0);
+        assert_ne!(interior_exposed_nx_mirror(&occ), 0);
+        assert_ne!(interior_exposed_pz_mirror(&occ), 0);
+        assert_ne!(interior_exposed_nz_mirror(&occ), 0);
+    }
+
+    /// Fully-solid except a single empty cell at the centre. Each of the
+    /// 6 surrounding solid cells has its inward-facing direction's
+    /// interior OR-fold fire because of the empty centre. Exercises all
+    /// 6 helpers in a single configuration and confirms the symmetric
+    /// behaviour.
+    #[test]
+    fn interior_exposed_fires_for_single_empty_in_solid() {
+        let mut occ = SubchunkOccupancy { planes: [0xFFFF_FFFF; 16] };
+        let bit  = 4u32 * 8 + 4;
+        let word = 4u32 * 2 + (bit >> 5);
+        occ.planes[word as usize] &= !(1u32 << (bit & 31));
+        assert_ne!(interior_exposed_px_mirror(&occ), 0);
+        assert_ne!(interior_exposed_nx_mirror(&occ), 0);
+        assert_ne!(interior_exposed_py_mirror(&occ), 0);
+        assert_ne!(interior_exposed_ny_mirror(&occ), 0);
+        assert_ne!(interior_exposed_pz_mirror(&occ), 0);
+        assert_ne!(interior_exposed_nz_mirror(&occ), 0);
     }
 
     // -- DirtyReport byte layout --

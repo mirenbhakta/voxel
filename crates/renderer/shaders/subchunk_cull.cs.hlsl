@@ -240,15 +240,14 @@ void main(uint3 tid : SV_DispatchThreadID, uint ltid : SV_GroupIndex) {
 
     DirEntry dir = g_directory[slot];
 
-    // Future-proof early-out. Step 4 will emit a uniformly-solid hint for
-    // sub-chunks whose interior voxels are all solid; those contribute no
-    // visible surface from any view and can be rejected here regardless
-    // of the exposure mask. The bit is always clear today, so this branch
-    // costs one load and a zero-test.
-    if (direntry_is_solid(dir)) {
-        return;
-    }
-
+    // No is_solid early-out: a fully-solid sub-chunk with any air
+    // neighbour still emits visible faces along that boundary, and the
+    // exposure mask handles it correctly — interior `here & ~there` is
+    // identically zero for fully-solid occupancy, so the per-direction
+    // bits reflect exactly which boundary planes meet a non-solid
+    // neighbour. The is_solid bit is still authored by prep but is no
+    // longer load-bearing for cull; reserved for future raymarcher
+    // early-outs that can prove non-coverage from any view.
     uint exposure = direntry_get_exposure(dir);
     if ((exposure & relevant) == 0u) {
         return;
