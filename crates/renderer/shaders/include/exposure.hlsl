@@ -255,12 +255,35 @@ uint2 synthesize_coarser_face(
 // see.
 //
 // Returns `false` (and leaves `face` zeroed) when `my_level == 0` (no
-// finer level) or when any of the four face-plane L_{n-1} sub-chunks
-// fails `resolve_and_verify`. The all-four-resident requirement matches
-// the nested-shell invariant: inside the L_{n-1} shell, all four are
-// resident; outside it, none are. The partial-coverage case (shell edge
-// crossing an L_n face) is not reachable under axis-aligned nested shells,
-// so the all-or-nothing check is complete for the current topology.
+// finer level) or when *all four* face-plane L_{n-1} sub-chunks fail
+// `resolve_and_verify` (the neighbour lies outside the L_{n-1} shell
+// entirely; caller should fall back to same-level).
+//
+// # Partial-coverage case (uniformly-empty finer children)
+//
+// A per-quadrant `resolve_and_verify` miss has two causes that are
+// indistinguishable from the directory alone:
+//
+//   a) the L_{n-1} shell doesn't cover this coord — no entry was ever
+//      authored;
+//   b) the L_{n-1} shell *does* cover this coord, full-prep ran, found
+//      the sub-chunk uniformly empty, and retired it as `DirEntry::
+//      empty()` (coord=(0,0,0) — the torus alias check then rejects it).
+//
+// The previous all-or-nothing guard treated any miss as case (a) and
+// bailed out on the first failure. Under case (b) this silently leaked
+// an OR-reduced same-level answer back into the cross-LOD exposure
+// test — reintroducing the very over-cull this path is supposed to
+// retire (see `failure-subchunk-over-cull-from-partial-finer-coverage`).
+//
+// The discriminator is simple: case (a) fires for *all four* quadrants
+// (nested-shell topology is axis-aligned + sub-chunk-grid-aligned, so
+// coverage is all-or-nothing at the L_n boundary); case (b) fires for
+// *some* quadrants. So if at least one quadrant resolves, we're at the
+// inner boundary — the misses are uniformly-empty finer sub-chunks, not
+// outside-shell, and we treat each missed quadrant as all-air
+// (contributes 0 to the AND across its 4×4 L_n face region). If all
+// four miss, we bail to same-level as before.
 //
 // # Coordinate mapping
 //
@@ -300,7 +323,15 @@ bool sub_sample_finer_face(
     // {0, 1}² mapping onto the two free axes of this direction. The
     // `i * 2 + j` flattening avoids HLSL's patchy support for
     // multi-dimensional arrays of user-defined structs.
+    //
+    // Track per-quadrant resolve status. A missed quadrant is treated as
+    // uniformly-empty air contributing 0 to the AND, iff at least one
+    // other quadrant resolved (we are at the inner boundary — see the
+    // docstring for why). If every quadrant misses, we fall through to
+    // the outer-boundary fallback below.
     DirEntry fe[4];
+    bool     fe_resolved[4];
+    uint     resolved_count = 0u;
     [unroll] for (uint i = 0u; i < 2u; ++i) {
         [unroll] for (uint j = 0u; j < 2u; ++j) {
             int3 off;
@@ -313,51 +344,68 @@ bool sub_sample_finer_face(
             }
             int3 finer_coord = base + off;
             uint finer_slot;
-            if (!resolve_and_verify(
+            uint quad        = i * 2u + j;
+            if (resolve_and_verify(
                     finer_coord, finer_level, g_directory, finer_slot)) {
-                return false;
+                fe[quad]          = g_directory[finer_slot];
+                fe_resolved[quad] = true;
+                resolved_count   += 1u;
+            } else {
+                fe_resolved[quad] = false;
             }
-            fe[i * 2u + j] = g_directory[finer_slot];
         }
     }
 
+    // No quadrant resolved → neighbour lies wholly outside the L_{n-1}
+    // shell. The same-level OR-reduced face is the authoritative answer
+    // there; let the caller fall through.
+    if (resolved_count == 0u) {
+        return false;
+    }
+
     // Build the 8×8 L_n face by AND-reducing 2×2 L_{n-1} face cells into
-    // each L_n face bit.
+    // each L_n face bit. A quadrant that failed to resolve is treated as
+    // uniformly empty — every L_n face bit it covers stays 0.
     [loop] for (uint b = 0u; b < 8u; ++b) {
         [loop] for (uint a = 0u; a < 8u; ++a) {
-            uint     i = a >> 2u;
-            uint     j = b >> 2u;
-            DirEntry e = fe[i * 2u + j];
+            uint i    = a >> 2u;
+            uint j    = b >> 2u;
+            uint quad = i * 2u + j;
 
             uint all_solid;
-            if (direntry_is_solid(e)) {
-                all_solid = 1u;
-            } else if (!direntry_has_material(e)) {
+            if (!fe_resolved[quad]) {
                 all_solid = 0u;
             } else {
-                uint      mslot = direntry_get_material_slot(e);
-                Occupancy o     = g_material_pool[mslot];
-                uint      wa0   = (a & 3u) << 1u;
-                uint      wb0   = (b & 3u) << 1u;
-                uint      acc   = 1u;
-                [unroll] for (uint db = 0u; db < 2u; ++db) {
-                    [unroll] for (uint da = 0u; da < 2u; ++da) {
-                        uint wa = wa0 + da;
-                        uint wb = wb0 + db;
-                        uint cx, cy, cz;
-                        if (axis == 0u) {
-                            cx = within_axis; cy = wa; cz = wb;
-                        } else if (axis == 1u) {
-                            cx = wa; cy = within_axis; cz = wb;
-                        } else {
-                            cx = wa; cy = wb; cz = within_axis;
-                        }
-                        if (read_cell_bit(o, cx, cy, cz) == 0u) {
-                            acc = 0u;
+                DirEntry e = fe[quad];
+                if (direntry_is_solid(e)) {
+                    all_solid = 1u;
+                } else if (!direntry_has_material(e)) {
+                    all_solid = 0u;
+                } else {
+                    uint      mslot = direntry_get_material_slot(e);
+                    Occupancy o     = g_material_pool[mslot];
+                    uint      wa0   = (a & 3u) << 1u;
+                    uint      wb0   = (b & 3u) << 1u;
+                    uint      acc   = 1u;
+                    [unroll] for (uint db = 0u; db < 2u; ++db) {
+                        [unroll] for (uint da = 0u; da < 2u; ++da) {
+                            uint wa = wa0 + da;
+                            uint wb = wb0 + db;
+                            uint cx, cy, cz;
+                            if (axis == 0u) {
+                                cx = within_axis; cy = wa; cz = wb;
+                            } else if (axis == 1u) {
+                                cx = wa; cy = within_axis; cz = wb;
+                            } else {
+                                cx = wa; cy = wb; cz = within_axis;
+                            }
+                            if (read_cell_bit(o, cx, cy, cz) == 0u) {
+                                acc = 0u;
+                            }
                         }
                     }
+                    all_solid = acc;
                 }
-                all_solid = acc;
             }
 
             if (all_solid != 0u) {
