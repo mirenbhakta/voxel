@@ -36,15 +36,19 @@
 //! - 3: occ_array  (StorageReadOnly, stride=64) — FRAGMENT
 //!
 //! **Shade bind group** (set 0 for `subchunk_shade.cs.hlsl`):
-//! - 0: gpu_consts  (UniformBuffer, sizeof GpuConstsData) — COMPUTE.
+//! - 0: gpu_consts    (UniformBuffer, sizeof GpuConstsData) — COMPUTE.
 //!   Implicit, supplied via `create_bind_group`'s `gpu_consts` argument
 //!   (`directory.hlsl` includes `gpu_consts.hlsl` which pins this slot).
-//! - 1: vis         (SampledTexture, R32Uint)              — COMPUTE
-//! - 2: shaded_out  (StorageTexture, Rgba8Unorm, write)    — COMPUTE
-//! - 3: directory   (StorageReadOnly, stride=24)           — COMPUTE
-//! - 4: occ_array   (StorageReadOnly, stride=64)           — COMPUTE
-//! - 5: camera      (UniformBuffer, 64)                    — COMPUTE
-//! - 6: depth       (SampledTexture, Depth32Float)         — COMPUTE
+//! - 1: vis           (SampledTexture, R32Uint)              — COMPUTE
+//! - 2: shaded_out    (StorageTexture, Rgba8Unorm, write)    — COMPUTE
+//! - 3: directory     (StorageReadOnly, stride=24)           — COMPUTE
+//! - 4: occ_array     (StorageReadOnly, stride=64)           — COMPUTE
+//! - 5: camera        (UniformBuffer, 64)                    — COMPUTE
+//! - 6: depth         (SampledTexture, Depth32Float)         — COMPUTE
+//! - 7: materials     (StorageReadOnly, stride=32)           — COMPUTE
+//! - 8: light_list    (UniformBuffer, sizeof LightList)      — COMPUTE
+//!
+//! Set 1 holds the material-data pool binding array (slot 0).
 //!
 //! **Prep bind group** (set 0 for `subchunk_prep.cs.hlsl`):
 //! - 0: gpu_consts             (UniformBuffer, sizeof GpuConstsData) — COMPUTE.
@@ -70,6 +74,7 @@ use bytemuck::{Pod, Zeroable};
 use crate::device::RendererContext;
 use crate::frame::FrameIndex;
 use crate::graph::{BufferDesc, BufferHandle, BufferPool, RenderGraph, TextureDesc, TextureHandle};
+use crate::lights::LightList;
 use crate::multi_buffer::MultiBufferRing;
 use crate::nodes::{ColorTarget, CullArgs, DrawArgs, IndirectArgs, cull, mdi_draw, present_blit};
 use crate::pipeline::compute::{ComputePipeline, ComputePipelineDescriptor};
@@ -972,6 +977,14 @@ pub struct WorldRenderer {
     /// — the contention window is one push per grow event, which is
     /// measured in seconds of play.
     material_segment_bufs: Mutex<Vec<wgpu::Buffer>>,
+
+    /// Per-frame light list for the shade pass. Uniform-sized
+    /// `ConstantBuffer<LightList>` at set 0 slot 8; updated each frame via
+    /// [`write_lights`](WorldRenderer::write_lights) before submitting the
+    /// graph. Zero-initialised (count = 0) so the first frame renders pure
+    /// ambient — the game side is expected to publish at least the sun
+    /// before any meaningful shading is seen.
+    light_list_buf:        wgpu::Buffer,
 }
 
 impl WorldRenderer {
@@ -1067,6 +1080,7 @@ impl WorldRenderer {
         let directory_size    = (std::mem::size_of::<DirEntry>()     * MAX_CANDIDATES) as u64;
         let material_desc_size =
             (std::mem::size_of::<MaterialDesc>() * MATERIAL_DESC_CAPACITY) as u64;
+        let light_list_size   = std::mem::size_of::<LightList>() as u64;
 
         // --- Persistent buffers ---
 
@@ -1272,6 +1286,16 @@ impl WorldRenderer {
             create_material_segment_buf(device, 0),
         ]);
 
+        // Light list uniform. Zero-initialised (count = 0) — the game
+        // side publishes the real list via `write_lights` before the
+        // first meaningful frame.
+        let light_list_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("light_list"),
+            size:               light_list_size,
+            usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // --- Pipelines ---
 
         let cull_pipeline = Arc::new(ComputePipeline::new(ctx, ComputePipelineDescriptor {
@@ -1387,6 +1411,7 @@ impl WorldRenderer {
             slot_directory_buf,
             material_desc_buf,
             material_segment_bufs,
+            light_list_buf,
         }
     }
 
@@ -1409,6 +1434,17 @@ impl WorldRenderer {
         }
         ctx.queue()
             .write_buffer(&self.material_desc_buf, 0, bytemuck::cast_slice(descs));
+    }
+
+    /// Overwrite the per-frame light list consumed by the shade pass.
+    ///
+    /// Intended to be called each frame (or whenever the light set
+    /// changes) before submitting the render graph. The supplied
+    /// [`LightList`] is uploaded as-is to the uniform buffer backing set 0
+    /// slot 8 of the shade bind group; the shader iterates `lights[0..count]`.
+    pub fn write_lights(&self, ctx: &RendererContext, list: &LightList) {
+        ctx.queue()
+            .write_buffer(&self.light_list_buf, 0, bytemuck::bytes_of(list));
     }
 
     /// Append a new 64 MB material-data pool segment.
@@ -1774,6 +1810,10 @@ impl WorldRenderer {
         &self.material_desc_buf
     }
 
+    pub(crate) fn light_list_buf(&self) -> &wgpu::Buffer {
+        &self.light_list_buf
+    }
+
     /// Snapshot the current segment list as a `Vec<wgpu::Buffer>` clone.
     /// Each `wgpu::Buffer` is `Arc`-backed and cheap to clone; the clone
     /// is required because callers (like `subchunk_world`) need stable
@@ -1955,6 +1995,7 @@ pub fn subchunk_world(
     // because wgpu's validator refuses to co-locate a binding array
     // with uniform buffers (`g_consts`, `g_camera`) in one set.
     let material_desc_h = graph.import_buffer(renderer.material_desc_buf().clone());
+    let light_list_h    = graph.import_buffer(renderer.light_list_buf().clone());
     let material_segment_handles: Vec<crate::graph::BufferHandle> = renderer
         .material_segment_bufs_snapshot()
         .into_iter()
@@ -1982,6 +2023,7 @@ pub fn subchunk_world(
             (5, camera_h.into()),
             (6, depth_out.into()),
             (7, material_desc_h.into()),
+            (8, light_list_h.into()),
         ],
     );
 

@@ -35,8 +35,8 @@ use std::sync::Arc;
 use renderer::{
     BITS_EXPOSURE_MASK, BITS_IS_SOLID, BITS_MATERIAL_SLOT_SHIFT, BITS_RESIDENT,
     DirEntry, DirtyEntry, EXPOSURE_STAGING_REQUEST_IDX_SENTINEL, FrameIndex,
-    GpuConsts, GpuConstsData, INFLIGHT_INVALID, LevelStatic, LodMaskUniform,
-    MATERIAL_DESC_CAPACITY, MATERIAL_SLOT_INVALID, MaterialDesc,
+    GpuConsts, GpuConstsData, INFLIGHT_INVALID, LevelStatic, LightDesc, LightList,
+    LodMaskUniform, MATERIAL_DESC_CAPACITY, MATERIAL_SLOT_INVALID, MaterialDesc,
     MaterialPatchCopy as RendererMaterialPatchCopy,
     PatchCopy, OverflowPolicy, PrepRequest as GpuPrepRequest, ReadbackChannel,
     RendererContext, SUBCHUNK_MAX_CANDIDATES, SUBCHUNK_MAX_LEVELS, SubchunkInstance,
@@ -381,6 +381,29 @@ impl WorldView {
         let block_registry = build_default_block_registry();
         let material_descs = build_material_descs_from_registry(&block_registry);
         renderer.write_materials(ctx, &material_descs);
+
+        // --- Publish the initial light list ---
+        //
+        // Light 0: the sun (directional). Direction matches the previous
+        // hardcoded `normalize(0.4, 0.8, -0.3)` from `subchunk_shade.cs.hlsl`
+        // so the visual is unchanged vs. the pre-refactor renderer.
+        //
+        // Light 1: a warm orange test point light near the starting camera,
+        // primarily to exercise the non-sun path of the light-dispatch
+        // kernel. Placement is eyeballed — somewhere in view of the
+        // default camera (`[4.0, 4.0, -40.0]` in `main.rs`) with a radius
+        // that reaches nearby terrain but doesn't blanket the scene.
+        let sun_dir = {
+            let v = [0.4_f32, 0.8, -0.3];
+            let inv_len = 1.0 / (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            [v[0] * inv_len, v[1] * inv_len, v[2] * inv_len]
+        };
+        let lights = [
+            LightDesc::directional(sun_dir, [1.00, 0.95, 0.85]),
+            LightDesc::point([8.0, 6.0, -20.0], 24.0, [1.20, 0.60, 0.20]),
+        ];
+        renderer.write_lights(ctx, &LightList::from_slice(&lights));
+
         let channel   = ReadbackChannel::<DirtyReport>::new(
             ctx, pool, "subchunk_prep_readback", OverflowPolicy::Panic,
         );
