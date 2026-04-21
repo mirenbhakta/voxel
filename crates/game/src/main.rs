@@ -13,6 +13,14 @@
 //! Run `game --validate` (e.g. `cargo run -- --validate`) to execute a GPU
 //! validation suite against real hardware and exit, rather than opening a
 //! window.  Useful for bug reports and CI on GPU-capable machines.
+//!
+//! # Camera CLI
+//!
+//! `--pos X,Y,Z` overrides the starting position, `--yaw DEG` and
+//! `--pitch DEG` override the starting rotation (degrees). Handy for
+//! reproducing a RenderDoc capture pose: read `g_camera` from the capture,
+//! recover yaw/pitch via `atan2(fwd.x, fwd.z)` / `asin(fwd.y)`, pass them
+//! here.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -40,14 +48,108 @@ mod world_view;
 // ---------------------------------------------------------------------------
 
 fn main() {
-    if std::env::args().any(|a| a == "--validate") {
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--validate") {
         validation::run();
         return;
     }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return;
+    }
+
+    let cli = match parse_cli(&args[1..]) {
+        Ok(c)  => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            eprintln!();
+            print_help();
+            std::process::exit(2);
+        }
+    };
 
     let event_loop = EventLoop::new().expect("failed to create event loop");
-    let mut app = App::new();
+    let mut app = App::new(cli);
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+// ---------------------------------------------------------------------------
+
+/// CLI-driven camera overrides. Each field is `Some` iff the corresponding
+/// flag was provided; otherwise the defaults baked into `App::new` are
+/// used (matches the behaviour before the flags were added).
+struct CliArgs {
+    pos:   Option<[f32; 3]>,
+    yaw:   Option<f32>,   // radians
+    pitch: Option<f32>,   // radians
+}
+
+fn parse_cli(args: &[String]) -> Result<CliArgs, String> {
+    let mut out = CliArgs { pos: None, yaw: None, pitch: None };
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--pos" => {
+                let v = args.get(i + 1)
+                    .ok_or_else(|| "--pos requires X,Y,Z".to_string())?;
+                let parts: Vec<&str> = v.split(',').collect();
+                if parts.len() != 3 {
+                    return Err(format!("--pos expects X,Y,Z (3 floats), got `{v}`"));
+                }
+                let x = parts[0].parse::<f32>()
+                    .map_err(|e| format!("--pos X: {e}"))?;
+                let y = parts[1].parse::<f32>()
+                    .map_err(|e| format!("--pos Y: {e}"))?;
+                let z = parts[2].parse::<f32>()
+                    .map_err(|e| format!("--pos Z: {e}"))?;
+                out.pos = Some([x, y, z]);
+                i += 2;
+            }
+            "--yaw" => {
+                let v = args.get(i + 1)
+                    .ok_or_else(|| "--yaw requires DEG".to_string())?;
+                let deg = v.parse::<f32>()
+                    .map_err(|e| format!("--yaw DEG: {e}"))?;
+                out.yaw = Some(deg.to_radians());
+                i += 2;
+            }
+            "--pitch" => {
+                let v = args.get(i + 1)
+                    .ok_or_else(|| "--pitch requires DEG".to_string())?;
+                let deg = v.parse::<f32>()
+                    .map_err(|e| format!("--pitch DEG: {e}"))?;
+                out.pitch = Some(deg.to_radians().clamp(-PITCH_CLAMP, PITCH_CLAMP));
+                i += 2;
+            }
+            // Already handled in `main`; skip silently.
+            "--validate" | "--help" | "-h" => { i += 1; }
+            other => {
+                return Err(format!("unknown argument: {other}"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn print_help() {
+    eprintln!("usage: game [OPTIONS]");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  --validate          run GPU validation suite and exit");
+    eprintln!("  --pos X,Y,Z         starting camera position (floats, no spaces)");
+    eprintln!("  --yaw DEG           starting yaw (degrees; default 0)");
+    eprintln!("  --pitch DEG         starting pitch (degrees; clamped to ±89)");
+    eprintln!("  -h, --help          print this help");
+    eprintln!();
+    eprintln!("camera convention: yaw=0, pitch=0 → forward = +Z. Pitch is");
+    eprintln!("rotation around the camera's right axis (positive = look up).");
+    eprintln!();
+    eprintln!("example reproducing a RenderDoc pose where");
+    eprintln!("g_camera.pos=(-119.27, 9.36, -53.17) and g_camera.forward=(0.68, -0.73, 0.10):");
+    eprintln!();
+    eprintln!("  game --pos -119.27,9.36,-53.17 --yaw 81.6 --pitch -46.9");
 }
 
 // ---------------------------------------------------------------------------
@@ -85,19 +187,20 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(cli: CliArgs) -> Self {
+        // Starting pose: camera outside the initial L0 shell, looking
+        // toward +Z. At radius 2 the L0 shell world AABB is `[-16, 16]³`
+        // centered on the origin anchor vertex. CLI flags override any
+        // component the user supplied.
         Self {
             window:     None,
             ctx:        None,
             world_view: None,
             buf_pool:   BufferPool::default(),
             tex_pool:   TexturePool::default(),
-            // Starting pose: camera outside the initial L0 shell,
-            // looking toward +Z. At radius 2 the L0 shell world AABB is
-            // `[-16, 16]³` centered on the origin anchor vertex.
-            pos:    [4.0, 4.0, -40.0],
-            yaw:    0.0,
-            pitch:  0.0,
+            pos:    cli.pos.unwrap_or([4.0, 4.0, -40.0]),
+            yaw:    cli.yaw.unwrap_or(0.0),
+            pitch:  cli.pitch.unwrap_or(0.0),
             keys:   HashSet::new(),
             last_t: None,
             lod_frozen: false,
