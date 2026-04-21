@@ -63,27 +63,9 @@
 // cull is handed the directory index directly via the instance's slot
 // field, so the torus-verify path in the header is unused here.
 #include "include/directory.hlsl"
-
-struct Camera {
-    float3 pos;
-    float  fov_y;
-    float3 forward;
-    float  aspect;
-    float3 right;
-    float  _pad0;
-    float3 up;
-    float  _pad1;
-};
-
-// slot_mask packs two fields + a padding sentinel:
-//   bits  0-21: occupancy slot index (22 bits)  — selects `g_directory` entry
-//   bits 22-25: LOD level (4 bits)              — used here for extent
-//   bits 26-30: reserved (5 bits), must be zero
-//   bit  31   : padding sentinel — matches `SubchunkInstance::PADDING_BIT`
-struct Instance {
-    int3 origin;
-    uint slot_mask;
-};
+#include "include/camera.hlsl"
+#include "include/instance.hlsl"
+#include "include/projection.hlsl"
 
 // Per-level finer-shell AABB. Layout mirrors Rust `LodMaskUniform`:
 // `lo[N].xyz` and `hi[N].xyz` describe the world-space box that level N
@@ -103,8 +85,6 @@ struct LodMask {
 
 static const uint  MAX_CANDIDATES   = 256u;
 static const float SUBCHUNK_VOXELS  = 8.0;   // voxels per sub-chunk edge (level-invariant)
-static const float NEAR_PLANE       = 0.1;
-static const float FAR_PLANE        = 1000.0;
 
 // AABB frustum test.
 //
@@ -192,12 +172,12 @@ void main(uint3 tid : SV_DispatchThreadID, uint ltid : SV_GroupIndex) {
     // slot-indexed buffer — `inst.slot_mask`'s slot field on a padding
     // entry has no owner, and reading `g_directory[slot]` for it would
     // conflate padding with an unused-but-valid directory entry.
-    if ((inst.slot_mask & 0x80000000u) != 0u) {
+    if (instance_is_padding(inst)) {
         return;
     }
 
-    uint   slot        = inst.slot_mask & 0x3FFFFFu;
-    uint   level       = (inst.slot_mask >> 22u) & 0xFu;
+    uint   slot        = instance_slot(inst);
+    uint   level       = instance_level(inst);
     float  voxel_size  = float(1u << level);
     float  cube_extent = SUBCHUNK_VOXELS * voxel_size;
     float3 lo          = float3(inst.origin);

@@ -20,12 +20,13 @@
 // This header defines types + pure functions only. The consuming shader
 // must declare
 //
-//   struct SubchunkOcc { uint4 plane[4]; };
-//   [[vk::binding(N, 0)]] StructuredBuffer<SubchunkOcc> g_occ_array;
+//   struct Occupancy { uint4 plane[4]; };
+//   [[vk::binding(N, 0)]] StructuredBuffer<Occupancy> g_occ_array;
 //
 // at a binding slot appropriate to its pipeline (matches the pattern used
 // by `directory.hlsl`, which likewise leaves `g_directory` to the
-// consumer).
+// consumer). Include `include/occupancy.hlsl` before this header to pull
+// in the canonical `Occupancy` definition.
 //
 // # Face-code convention (3 bits, 0..5)
 //
@@ -87,6 +88,70 @@ static const uint DDA_FACE_NEG_Y = 3u;
 static const uint DDA_FACE_POS_Z = 4u;
 static const uint DDA_FACE_NEG_Z = 5u;
 
+// --- face → axis-aligned outward normal. ---
+//
+// Face codes match the `Direction` enum discriminants above:
+//   0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z.
+float3 face_to_normal(uint face) {
+    switch (face) {
+        case DDA_FACE_POS_X: return float3( 1.0,  0.0,  0.0);
+        case DDA_FACE_NEG_X: return float3(-1.0,  0.0,  0.0);
+        case DDA_FACE_POS_Y: return float3( 0.0,  1.0,  0.0);
+        case DDA_FACE_NEG_Y: return float3( 0.0, -1.0,  0.0);
+        case DDA_FACE_POS_Z: return float3( 0.0,  0.0,  1.0);
+        default:             return float3( 0.0,  0.0, -1.0);
+    }
+}
+
+// --- Private: initialise per-axis t_next / t_delta for a DDA step. ---
+//
+// Fills all three axes at once. `cell` is the integer starting-cell index,
+// `origin` is the ray start in the same coordinate frame, `dir` is the ray
+// direction, and `cell_size` is the world-unit extent of one cell along each
+// axis (1.0 for the inner sub-chunk DDA, `sc_size` for the outer DDA).
+// Inactive axes (step == 0) receive HUGE so the min-select never picks them.
+void dda_init_t(int3 step, int3 cell, float3 origin, float3 dir, float cell_size,
+                out float3 t_next, out float3 t_delta) {
+    const float HUGE = 1e30;
+    if (step.x != 0) {
+        float boundary = (step.x > 0 ? float(cell.x + 1) : float(cell.x)) * cell_size;
+        t_next.x  = (boundary - origin.x) / dir.x;
+        t_delta.x = abs(cell_size / dir.x);
+    } else { t_next.x = HUGE; t_delta.x = HUGE; }
+    if (step.y != 0) {
+        float boundary = (step.y > 0 ? float(cell.y + 1) : float(cell.y)) * cell_size;
+        t_next.y  = (boundary - origin.y) / dir.y;
+        t_delta.y = abs(cell_size / dir.y);
+    } else { t_next.y = HUGE; t_delta.y = HUGE; }
+    if (step.z != 0) {
+        float boundary = (step.z > 0 ? float(cell.z + 1) : float(cell.z)) * cell_size;
+        t_next.z  = (boundary - origin.z) / dir.z;
+        t_delta.z = abs(cell_size / dir.z);
+    } else { t_next.z = HUGE; t_delta.z = HUGE; }
+}
+
+// --- Private: advance the outer DDA by one step on the minimum-t axis. ---
+//
+// Updates `t_outer`, `cell`, and `t_next` for `dda_world` and
+// `dda_world_clipmap`. Not used by `dda_sub_chunk` — the inner DDA also
+// emits a face code on each step, which this helper does not produce.
+void dda_advance_outer(inout float t_outer, inout int3 cell,
+                       inout float3 t_next, float3 t_delta, int3 step) {
+    if (t_next.x < t_next.y) {
+        if (t_next.x < t_next.z) {
+            t_outer   = t_next.x; cell.x += step.x; t_next.x += t_delta.x;
+        } else {
+            t_outer   = t_next.z; cell.z += step.z; t_next.z += t_delta.z;
+        }
+    } else {
+        if (t_next.y < t_next.z) {
+            t_outer   = t_next.y; cell.y += step.y; t_next.y += t_delta.y;
+        } else {
+            t_outer   = t_next.z; cell.z += step.z; t_next.z += t_delta.z;
+        }
+    }
+}
+
 // --- Private: pick one uint component from a uint4 by index. ---
 uint dda_pick_word(uint4 v, uint idx) {
     if (idx == 0u) return v.x;
@@ -98,8 +163,9 @@ uint dda_pick_word(uint4 v, uint idx) {
 // --- Private: occupancy lookup for (x, y, z) inside `occ_slot`. ---
 //
 // Out-of-bounds coordinates return `false`. Storage mirrors the `Occupancy`
-// layout documented in `face_mask.hlsl`: 8 XY planes packed as 16 u32s,
-// grouped into four uint4s to dodge std140 element padding.
+// layout documented in `include/occupancy.hlsl` and `face_mask.hlsl`: 8 XY
+// planes packed as 16 u32s, grouped into four uint4s to dodge std140 element
+// padding.
 bool dda_occupied(int x, int y, int z, uint occ_slot) {
     if (x < 0 || x > 7 || y < 0 || y > 7 || z < 0 || z > 7)
         return false;
@@ -177,24 +243,7 @@ MarchResult dda_sub_chunk(float3 origin, float3 dir, float max_t, uint occ_slot)
     // full cell crossing. Axes with zero ray-direction component get HUGE
     // values so the min-select never picks them.
     float3 t_next, t_delta;
-
-    if (step.x != 0) {
-        float boundary = step.x > 0 ? float(vox.x + 1) : float(vox.x);
-        t_next.x  = (boundary - origin.x) / dir.x;
-        t_delta.x = abs(1.0 / dir.x);
-    } else { t_next.x = HUGE; t_delta.x = HUGE; }
-
-    if (step.y != 0) {
-        float boundary = step.y > 0 ? float(vox.y + 1) : float(vox.y);
-        t_next.y  = (boundary - origin.y) / dir.y;
-        t_delta.y = abs(1.0 / dir.y);
-    } else { t_next.y = HUGE; t_delta.y = HUGE; }
-
-    if (step.z != 0) {
-        float boundary = step.z > 0 ? float(vox.z + 1) : float(vox.z);
-        t_next.z  = (boundary - origin.z) / dir.z;
-        t_delta.z = abs(1.0 / dir.z);
-    } else { t_next.z = HUGE; t_delta.z = HUGE; }
+    dda_init_t(step, vox, origin, dir, 1.0, t_next, t_delta);
 
     // Test the entry cell first — the ray starts inside it.
     if (dda_occupied(vox.x, vox.y, vox.z, occ_slot)) {
@@ -371,33 +420,11 @@ MarchResult dda_world(float3 origin_ws, float3 dir_ws, float max_t_ws, uint leve
     step.y = dir_ws.y > 0.0 ? 1 : (dir_ws.y < 0.0 ? -1 : 0);
     step.z = dir_ws.z > 0.0 ? 1 : (dir_ws.z < 0.0 ? -1 : 0);
 
-    const float HUGE = 1e30;
-
     // Per-axis t at the next outer cell boundary, and per-axis increment
     // per full outer-cell crossing (= sc_size / |dir_ws[axis]|).
     // Inactive axes get HUGE so they never win the min-select.
     float3 t_next, t_delta;
-
-    if (step.x != 0) {
-        float boundary = step.x > 0 ? float(cell.x + 1) * sc_size
-                                     : float(cell.x)     * sc_size;
-        t_next.x  = (boundary - origin_ws.x) / dir_ws.x;
-        t_delta.x = abs(sc_size / dir_ws.x);
-    } else { t_next.x = HUGE; t_delta.x = HUGE; }
-
-    if (step.y != 0) {
-        float boundary = step.y > 0 ? float(cell.y + 1) * sc_size
-                                     : float(cell.y)     * sc_size;
-        t_next.y  = (boundary - origin_ws.y) / dir_ws.y;
-        t_delta.y = abs(sc_size / dir_ws.y);
-    } else { t_next.y = HUGE; t_delta.y = HUGE; }
-
-    if (step.z != 0) {
-        float boundary = step.z > 0 ? float(cell.z + 1) * sc_size
-                                     : float(cell.z)     * sc_size;
-        t_next.z  = (boundary - origin_ws.z) / dir_ws.z;
-        t_delta.z = abs(sc_size / dir_ws.z);
-    } else { t_next.z = HUGE; t_delta.z = HUGE; }
+    dda_init_t(step, cell, origin_ws, dir_ws, sc_size, t_next, t_delta);
 
     // Accumulated outer-DDA t (world units to the current cell's entry).
     float t_outer = 0.0;
@@ -445,27 +472,7 @@ MarchResult dda_world(float3 origin_ws, float3 dir_ws, float max_t_ws, uint leve
         }
 
         // Advance to the next outer cell on the axis with the smallest t_next.
-        if (t_next.x < t_next.y) {
-            if (t_next.x < t_next.z) {
-                t_outer   = t_next.x;
-                cell.x   += step.x;
-                t_next.x += t_delta.x;
-            } else {
-                t_outer   = t_next.z;
-                cell.z   += step.z;
-                t_next.z += t_delta.z;
-            }
-        } else {
-            if (t_next.y < t_next.z) {
-                t_outer   = t_next.y;
-                cell.y   += step.y;
-                t_next.y += t_delta.y;
-            } else {
-                t_outer   = t_next.z;
-                cell.z   += step.z;
-                t_next.z += t_delta.z;
-            }
-        }
+        dda_advance_outer(t_outer, cell, t_next, t_delta, step);
     }
 
     return miss;
@@ -548,24 +555,7 @@ MarchResult dda_world_clipmap(
     int3 cell = int3(floor(origin_ws / sc_size));
 
     float3 t_next, t_delta;
-    if (step.x != 0) {
-        float boundary = step.x > 0 ? float(cell.x + 1) * sc_size
-                                     : float(cell.x)     * sc_size;
-        t_next.x  = (boundary - origin_ws.x) / dir_ws.x;
-        t_delta.x = abs(sc_size / dir_ws.x);
-    } else { t_next.x = HUGE; t_delta.x = HUGE; }
-    if (step.y != 0) {
-        float boundary = step.y > 0 ? float(cell.y + 1) * sc_size
-                                     : float(cell.y)     * sc_size;
-        t_next.y  = (boundary - origin_ws.y) / dir_ws.y;
-        t_delta.y = abs(sc_size / dir_ws.y);
-    } else { t_next.y = HUGE; t_delta.y = HUGE; }
-    if (step.z != 0) {
-        float boundary = step.z > 0 ? float(cell.z + 1) * sc_size
-                                     : float(cell.z)     * sc_size;
-        t_next.z  = (boundary - origin_ws.z) / dir_ws.z;
-        t_delta.z = abs(sc_size / dir_ws.z);
-    } else { t_next.z = HUGE; t_delta.z = HUGE; }
+    dda_init_t(step, cell, origin_ws, dir_ws, sc_size, t_next, t_delta);
 
     float t_outer = 0.0;
 
@@ -609,24 +599,7 @@ MarchResult dda_world_clipmap(
                 voxel_size = finer_voxel_sz;
                 sc_size    = finer_sc_size;
 
-                if (step.x != 0) {
-                    float boundary = step.x > 0 ? float(cell.x + 1) * sc_size
-                                                 : float(cell.x)     * sc_size;
-                    t_next.x  = (boundary - origin_ws.x) / dir_ws.x;
-                    t_delta.x = abs(sc_size / dir_ws.x);
-                } else { t_next.x = HUGE; t_delta.x = HUGE; }
-                if (step.y != 0) {
-                    float boundary = step.y > 0 ? float(cell.y + 1) * sc_size
-                                                 : float(cell.y)     * sc_size;
-                    t_next.y  = (boundary - origin_ws.y) / dir_ws.y;
-                    t_delta.y = abs(sc_size / dir_ws.y);
-                } else { t_next.y = HUGE; t_delta.y = HUGE; }
-                if (step.z != 0) {
-                    float boundary = step.z > 0 ? float(cell.z + 1) * sc_size
-                                                 : float(cell.z)     * sc_size;
-                    t_next.z  = (boundary - origin_ws.z) / dir_ws.z;
-                    t_delta.z = abs(sc_size / dir_ws.z);
-                } else { t_next.z = HUGE; t_delta.z = HUGE; }
+                dda_init_t(step, cell, origin_ws, dir_ws, sc_size, t_next, t_delta);
 
                 // Same forward nudge as the promote branch — keeps the
                 // inner DDA's local_origin off the finer-voxel face it
@@ -655,27 +628,7 @@ MarchResult dda_world_clipmap(
             }
 
             // Advance to next outer cell at the current level.
-            if (t_next.x < t_next.y) {
-                if (t_next.x < t_next.z) {
-                    t_outer   = t_next.x;
-                    cell.x   += step.x;
-                    t_next.x += t_delta.x;
-                } else {
-                    t_outer   = t_next.z;
-                    cell.z   += step.z;
-                    t_next.z += t_delta.z;
-                }
-            } else {
-                if (t_next.y < t_next.z) {
-                    t_outer   = t_next.y;
-                    cell.y   += step.y;
-                    t_next.y += t_delta.y;
-                } else {
-                    t_outer   = t_next.z;
-                    cell.z   += step.z;
-                    t_next.z += t_delta.z;
-                }
-            }
+            dda_advance_outer(t_outer, cell, t_next, t_delta, step);
         } else {
             // Non-resident at current level → ray exited this level's shell.
             // Promote to the next coarser level and re-initialize outer DDA.
@@ -707,24 +660,7 @@ MarchResult dda_world_clipmap(
             voxel_size = float(1u << level);
             sc_size    = 8.0 * voxel_size;
 
-            if (step.x != 0) {
-                float boundary = step.x > 0 ? float(cell.x + 1) * sc_size
-                                             : float(cell.x)     * sc_size;
-                t_next.x  = (boundary - origin_ws.x) / dir_ws.x;
-                t_delta.x = abs(sc_size / dir_ws.x);
-            } else { t_next.x = HUGE; t_delta.x = HUGE; }
-            if (step.y != 0) {
-                float boundary = step.y > 0 ? float(cell.y + 1) * sc_size
-                                             : float(cell.y)     * sc_size;
-                t_next.y  = (boundary - origin_ws.y) / dir_ws.y;
-                t_delta.y = abs(sc_size / dir_ws.y);
-            } else { t_next.y = HUGE; t_delta.y = HUGE; }
-            if (step.z != 0) {
-                float boundary = step.z > 0 ? float(cell.z + 1) * sc_size
-                                             : float(cell.z)     * sc_size;
-                t_next.z  = (boundary - origin_ws.z) / dir_ws.z;
-                t_delta.z = abs(sc_size / dir_ws.z);
-            } else { t_next.z = HUGE; t_delta.z = HUGE; }
+            dda_init_t(step, cell, origin_ws, dir_ws, sc_size, t_next, t_delta);
 
             // Nudge `t_outer` forward past the L-boundary we just crossed.
             //

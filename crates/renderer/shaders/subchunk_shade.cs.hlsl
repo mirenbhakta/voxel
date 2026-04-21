@@ -36,7 +36,7 @@
 //   set 0 binding 1 : `g_vis`              — `Texture2D<uint>` vis buffer.
 //   set 0 binding 2 : `g_out`              — `RWTexture2D<float4>` storage image.
 //   set 0 binding 3 : `g_directory`        — `StructuredBuffer<DirEntry>`, read-only.
-//   set 0 binding 4 : `g_occ_array`        — `StructuredBuffer<SubchunkOcc>`, read-only.
+//   set 0 binding 4 : `g_occ_array`        — `StructuredBuffer<Occupancy>`, read-only.
 //   set 0 binding 5 : `g_camera`           — `ConstantBuffer<Camera>`, per-frame camera.
 //   set 0 binding 6 : `g_depth`            — `Texture2D<float>` depth buffer (Depth32Float).
 //   set 0 binding 7 : `g_materials`        — `StructuredBuffer<MaterialDesc>`, descriptor table.
@@ -55,13 +55,8 @@
 // `resolve_coord_to_slot`, and `resolve_and_verify` needed by `dda_world`.
 #include "include/directory.hlsl"
 #include "include/material.hlsl"
-
-// SubchunkOcc must be declared before including dda.hlsl. Matches the
-// layout in subchunk.ps.hlsl and the 64-byte GPU representation of
-// SubchunkOccupancy on the Rust side.
-struct SubchunkOcc {
-    uint4 plane[4];
-};
+#include "include/occupancy.hlsl"
+#include "include/projection.hlsl"
 
 [[vk::binding(1, 0)]] Texture2D<uint> g_vis;
 
@@ -79,25 +74,13 @@ RWTexture2D<float4> g_out;
 
 // `g_occ_array` — occupancy bitmaps indexed by occ_slot. Consumed by
 // `dda_sub_chunk` inside `dda.hlsl`.
-[[vk::binding(4, 0)]] StructuredBuffer<SubchunkOcc> g_occ_array;
+[[vk::binding(4, 0)]] StructuredBuffer<Occupancy> g_occ_array;
 
 // dda.hlsl provides `MarchResult`, `dda_sub_chunk`, and (since directory.hlsl
 // is already in scope) `dda_world` under the RENDERER_DIRECTORY_HLSL guard.
 #include "include/dda.hlsl"
 
-// Camera struct — mirrors `subchunk.ps.hlsl` and `subchunk.vs.hlsl`
-// verbatim. 64 bytes, std140-compatible padding. Reused across cull, vs,
-// ps, and now shade; kept in sync by hand.
-struct Camera {
-    float3 pos;
-    float  fov_y;
-    float3 forward;
-    float  aspect;
-    float3 right;
-    float  _pad0;
-    float3 up;
-    float  _pad1;
-};
+#include "include/camera.hlsl"
 
 [[vk::binding(5, 0)]] ConstantBuffer<Camera> g_camera;
 
@@ -124,11 +107,6 @@ struct Camera {
 // shader body is the only place that performs the div/mod decode.
 [[vk::binding(0, 1)]]
 StructuredBuffer<MaterialBlock> material_data_pool[MAX_MATERIAL_POOL_SEGMENTS];
-
-// Projection constants — must match `subchunk.vs.hlsl` and
-// `subchunk.ps.hlsl` exactly.
-static const float NEAR_PLANE = 0.1;
-static const float FAR_PLANE  = 1000.0;
 
 // --- Shading constants (linear sRGB primaries). ---
 
@@ -157,21 +135,6 @@ static const float3 MAGENTA_SENTINEL = float3(1.00, 0.00, 1.00);
 // level 0 and still meaningful at coarser levels — any occluder further
 // than 1024 world units is treated as non-shadowing.
 static const float MAX_SHADOW_T  = 1024.0;
-
-// --- face → axis-aligned normal. ---
-//
-// Face codes match `Direction` enum / `dda.hlsl`:
-//   0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z.
-float3 face_to_normal(uint face) {
-    switch (face) {
-        case 0u: return float3( 1.0,  0.0,  0.0);
-        case 1u: return float3(-1.0,  0.0,  0.0);
-        case 2u: return float3( 0.0,  1.0,  0.0);
-        case 3u: return float3( 0.0, -1.0,  0.0);
-        case 4u: return float3( 0.0,  0.0,  1.0);
-        default: return float3( 0.0,  0.0, -1.0);
-    }
-}
 
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -223,9 +186,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float ndc_x = 2.0 * (float(tid.x) + 0.5) / float(dims.x) - 1.0;
     float ndc_y = 1.0 - 2.0 * (float(tid.y) + 0.5) / float(dims.y);
 
-    float A  = FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
-    float B  = -NEAR_PLANE * FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
-    float vz = B / (depth - A);
+    float vz = decode_vz(depth);
 
     float tan_half_y = tan(g_camera.fov_y * 0.5);
     float tan_half_x = tan_half_y * g_camera.aspect;

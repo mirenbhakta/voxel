@@ -23,28 +23,9 @@
 // The shared camera/instances/visible slots (0..2) are co-declared with
 // `subchunk.ps.hlsl` so the two stages merge into a single set-0 BGL.
 
-struct Camera {
-    float3 pos;
-    float  fov_y;
-    float3 forward;
-    float  aspect;
-    float3 right;
-    float  _pad0;
-    float3 up;
-    float  _pad1;
-};
-
-// slot_mask packs two fields + a padding sentinel (see SubchunkInstance docs):
-//   bits  0-21: occupancy slot index (22 bits)  — selects entry in g_occ_array
-//   bits 22-25: LOD level (4 bits)              — voxel_size = 1 << level
-//   bits 26-30: reserved (5 bits), must be zero
-//   bit  31   : padding sentinel (consumed by the cull shader only; the
-//               cull pass drops padding instances before they can reach
-//               the vertex stage, so the VS never sees a padding entry)
-struct Instance {
-    int3 origin;
-    uint slot_mask;
-};
+#include "include/camera.hlsl"
+#include "include/instance.hlsl"
+#include "include/projection.hlsl"
 
 [[vk::binding(0, 0)]] ConstantBuffer<Camera>     g_camera;
 [[vk::binding(1, 0)]] StructuredBuffer<Instance> g_instances;
@@ -74,9 +55,6 @@ static const float3 CUBE_VERTS[36] = {
     float3(0, 0, 1), float3(1, 1, 1), float3(0, 1, 1),
 };
 
-static const float NEAR_PLANE = 0.1;
-static const float FAR_PLANE  = 1000.0;
-
 // Inside-cube margin: when the camera is within NEAR_PLANE of a cube face,
 // the front face gets clipped by the near plane and the rasterizer falls
 // back on the back face — `world_pos` then sits on the far face, which the
@@ -99,7 +77,7 @@ void main(uint vid : SV_VertexID,
 
     // Per-instance LOD scale: voxel edge length in world units.
     // At L0 voxel_size = 1, cube_extent = 8. Each level doubles both.
-    uint  lvl         = (inst.slot_mask >> 22u) & 0xFu;
+    uint  lvl         = instance_level(inst);
     float vox_size    = float(1u << lvl);
     float cube_extent = 8.0 * vox_size;
 
@@ -135,13 +113,11 @@ void main(uint vid : SV_VertexID,
     // Standard perspective projection. wgpu's clip-space Z range is [0, 1]:
     //   ndc_z = FAR/(FAR-NEAR) - (NEAR*FAR/(FAR-NEAR)) / vz
     float f = 1.0 / tan(g_camera.fov_y * 0.5);
-    float A = FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
-    float B = -NEAR_PLANE * FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
 
-    sv_pos      = float4((f / g_camera.aspect) * vx, f * vy, A * vz + B, vz);
+    sv_pos      = float4((f / g_camera.aspect) * vx, f * vy, DEPTH_A * vz + DEPTH_B, vz);
     world_pos   = w;
     inside_flag = inside ? 1.0 : 0.0;
-    occ_slot    = inst.slot_mask & 0x003FFFFFu;
+    occ_slot    = instance_slot(inst);
     origin      = inst.origin;
     voxel_size  = vox_size;
     // 4-bit LOD level passed through for vis-buffer packing. Shading

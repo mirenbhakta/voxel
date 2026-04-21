@@ -107,25 +107,12 @@
 // `terrain_occupied`. Seed flows in via `g_consts.world_seed`, set once
 // at `WorldView::new`.
 #include "include/worldgen.hlsl"
-
-struct PrepRequest {
-    int3 coord;   // sub-chunk coord at this request's LOD
-    uint level;   // LOD level; voxel_size = 1 << level
-    uint _pad0;
-    uint _pad1;
-    uint _pad2;
-    uint _pad3;
-};  // 32 bytes
-
-// Matches the 16-u32 packed layout of `SubchunkOccupancy::to_gpu_bytes`
-// on the Rust side: bit `y * 8 + x` of word `z * 2 + (bit >> 5)` is set
-// iff voxel (x, y, z) is occupied.
-struct Occupancy {
-    uint4 plane[4];
-};  // 64 bytes
+#include "include/occupancy.hlsl"
+#include "include/request.hlsl"
+#include "include/dirty_list.hlsl"
 
 // Face-mask extractors depend on `Occupancy` being in scope; include
-// here rather than ahead of the struct definition.
+// after occupancy.hlsl.
 #include "include/face_mask.hlsl"
 
 [[vk::binding(1, 0)]] StructuredBuffer<PrepRequest>   g_requests;
@@ -152,12 +139,6 @@ struct Occupancy {
 
 static const float SUBCHUNK_VOXELS = 8.0;
 static const uint  OCC_WORDS       = 16u;
-
-// Mirror of `renderer::subchunk::MAX_CANDIDATES` — ceiling on dirty-list
-// entries per dispatch. The dirty-list append guards against exceeding
-// this ceiling and raises the overflow flag instead of overrunning the
-// `DirtyReport` buffer.
-static const uint DIRTY_LIST_CAPACITY = 256u;
 
 // Shared 16-u32 occupancy accumulator for this workgroup. `InterlockedOr`
 // from per-thread bit contributions — every thread writes up to 8 bits
@@ -449,11 +430,7 @@ void main(uint3 ltid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint lidx : SV_
                         | staged3.x | staged3.y | staged3.z | staged3.w;
         bool  any_bit   = or_accum != 0u;
 
-        uint  and_accum = staged0.x & staged0.y & staged0.z & staged0.w
-                        & staged1.x & staged1.y & staged1.z & staged1.w
-                        & staged2.x & staged2.y & staged2.z & staged2.w
-                        & staged3.x & staged3.y & staged3.z & staged3.w;
-        bool  is_fully_solid = and_accum == 0xFFFFFFFFu;
+        bool  is_fully_solid = occupancy_is_fully_solid(staged);
 
         // Build the neighbour-aware exposure mask via the shared helper in
         // `include/exposure.hlsl` (bit-for-bit shared with
@@ -499,33 +476,17 @@ void main(uint3 ltid : SV_GroupThreadID, uint3 gid : SV_GroupID, uint lidx : SV_
         }
 
         if (dirty) {
-            uint idx;
-            g_dirty_list.InterlockedAdd(0u, 1u, idx);
             // Bounds-check. If the pre-add count already filled the
-            // buffer, raise the overflow flag and skip the store —
-            // writing at `16 + idx * 16` with `idx >= 256` would overrun
-            // the DirtyReport buffer (a silent corruption of whatever
-            // follows it in the allocator). The count header keeps
-            // incrementing so CPU can see how far past capacity the
-            // dispatch tried to go; CPU clamps reads to min(count,
-            // MAX_CANDIDATES).
-            if (idx >= DIRTY_LIST_CAPACITY) {
-                uint _prev;
-                g_dirty_list.InterlockedMax(8u, 1u, _prev);
-            } else {
-                uint entry_off = 16u + idx * 16u;
-                // new_bits_partial packs the shader-authored fields of
-                // DirEntry::bits — exposure [0..5], is_solid [6], resident
-                // (= 1). The material-slot field is authored CPU-side at
-                // retirement and must be zero in this shader-emitted word.
-                uint new_bits_partial = exposure
-                                      | (is_solid_bit << 6)
-                                      | (1u << 7);
-                g_dirty_list.Store(entry_off +  0u, self_slot);  // directory_index
-                g_dirty_list.Store(entry_off +  4u, new_bits_partial);
-                g_dirty_list.Store(entry_off +  8u, gid.x);      // staging_request_idx
-                g_dirty_list.Store(entry_off + 12u, 0u);
-            }
+            // buffer, `dirty_list_append` raises the overflow flag and
+            // skips the store — writing past MAX_CANDIDATES would overrun
+            // the DirtyReport buffer. The count header keeps incrementing
+            // so CPU can see how far past capacity the dispatch tried to
+            // go; CPU clamps reads to min(count, DIRTY_LIST_CAPACITY).
+            // new_bits_partial packs the shader-authored fields of
+            // DirEntry::bits — exposure [0..5], is_solid [6], resident
+            // (= 1). The material-slot field is authored CPU-side at
+            // retirement and must be zero in this shader-emitted word.
+            dirty_list_append(g_dirty_list, self_slot, exposure, is_solid_bit, gid.x);
         }
     }
 }

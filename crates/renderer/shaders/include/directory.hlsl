@@ -44,6 +44,7 @@
 #define RENDERER_DIRECTORY_HLSL
 
 #include "gpu_consts.hlsl"
+#include "material.hlsl"
 
 // -----------------------------------------------------------------------
 // Bit layout of `DirEntry::bits`. Must stay byte-for-byte in sync with the
@@ -64,7 +65,9 @@
 #define DIRENTRY_BITS_RESIDENT             (1u << 7)
 #define DIRENTRY_BITS_MATERIAL_SLOT_SHIFT  8u
 #define DIRENTRY_MATERIAL_SLOT_INVALID     0x00FFFFFFu
-#define DIRENTRY_MATERIAL_DATA_SLOT_INVALID 0xFFFFFFFFu
+// MATERIAL_DATA_SLOT_INVALID (0xFFFFFFFFu) is defined in material.hlsl
+// (included above). Use that name directly — a local alias would be a
+// redundant definition of the same sentinel value.
 
 // -----------------------------------------------------------------------
 // DirEntry — 28-byte CPU-authored directory entry.
@@ -79,7 +82,7 @@
 //   uint content_version    (+16)
 //   uint last_synth_version (+20)
 //   uint material_data_slot (+24)  // flat-global MaterialDataPool slot, or
-//                                  // DIRENTRY_MATERIAL_DATA_SLOT_INVALID.
+//                                  // MATERIAL_DATA_SLOT_INVALID (material.hlsl).
 // -----------------------------------------------------------------------
 struct DirEntry {
     int3 coord;
@@ -134,8 +137,8 @@ bool direntry_has_material(DirEntry e) {
 }
 
 // Flat-global slot index into the material-data pool, or
-// `DIRENTRY_MATERIAL_DATA_SLOT_INVALID` when the pool has no allocation
-// for this sub-chunk. The shade shader reads this (never `occ_slot`) to
+// `MATERIAL_DATA_SLOT_INVALID` (from material.hlsl) when the pool has no
+// allocation for this sub-chunk. The shade shader reads this (never `occ_slot`) to
 // locate per-voxel material IDs — see `decision-material-system-m1-sparse`.
 uint direntry_get_material_data_slot(DirEntry e) {
     return e.material_data_slot;
@@ -145,7 +148,7 @@ uint direntry_get_material_data_slot(DirEntry e) {
 // the INVALID sentinel). Callers that observe this false should draw
 // the magenta sentinel pixel rather than dereference the pool.
 bool direntry_has_material_data(DirEntry e) {
-    return e.material_data_slot != DIRENTRY_MATERIAL_DATA_SLOT_INVALID;
+    return e.material_data_slot != MATERIAL_DATA_SLOT_INVALID;
 }
 
 // Torus-verification check. `resolve_coord_to_slot` reduces the query

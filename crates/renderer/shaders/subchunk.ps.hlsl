@@ -9,7 +9,7 @@
 // Storage: 8 XY planes, each a 64-bit occupancy bitmask (one bit per voxel in
 // the 8×8 XY grid). Stored as 16 uint32s (2 per Z layer), packed in four
 // uint4 to avoid HLSL std140 array-element padding.  The occupancy array holds
-// one SubchunkOcc per candidate; the per-instance occ_slot selects the entry.
+// one Occupancy per candidate; the per-instance occ_slot selects the entry.
 //
 // Output: the vis buffer (R32_UINT, SV_Target0) per
 // `decision-vis-buffer-deferred-shading-phase-1`. Packing layout:
@@ -38,38 +38,19 @@
 // in the merged BGL. Keeping the set contiguous from 0 guarantees this;
 // gaps would silently off-by-one every shader that reads past the gap.
 
-struct Camera {
-    float3 pos;
-    float  fov_y;
-    float3 forward;
-    float  aspect;
-    float3 right;
-    float  _pad0;
-    float3 up;
-    float  _pad1;
-};
+#include "include/camera.hlsl"
+#include "include/occupancy.hlsl"
+#include "include/projection.hlsl"
 
-// `SubchunkOcc` is the storage type consumed by `include/dda.hlsl`. That
+// `Occupancy` is the storage type consumed by `include/dda.hlsl`. That
 // header declares the primitive but leaves the binding to the consumer —
 // binding-slot choice depends on the pipeline's BGL layout, which differs
 // between the raster draw pass and any future compute caller.
-struct SubchunkOcc {
-    uint4 plane[4];
-};
 
-[[vk::binding(0, 0)]] ConstantBuffer<Camera>        g_camera;
-[[vk::binding(3, 0)]] StructuredBuffer<SubchunkOcc> g_occ_array;
+[[vk::binding(0, 0)]] ConstantBuffer<Camera>       g_camera;
+[[vk::binding(3, 0)]] StructuredBuffer<Occupancy>  g_occ_array;
 
 #include "include/dda.hlsl"
-
-// Must match the VS projection. Kept in sync by hand — if you change these,
-// update `subchunk.vs.hlsl` too. Used to project the voxel-hit position back
-// to NDC depth so fragments write the actual hit depth instead of the
-// rasterized hull depth. The inside-cube case rasterizes the back face (far
-// from the camera), so writing hull depth would lose depth-sort battles
-// against neighbouring cubes' front faces.
-static const float NEAR_PLANE = 0.1;
-static const float FAR_PLANE  = 1000.0;
 
 // --- pack_vis — MarchResult → R32_UINT per the committed schema. ---
 //
@@ -161,11 +142,9 @@ PSOutput main(float4                   sv_pos      : SV_Position,
     // the degenerate case where the camera stands inside an occupied voxel
     // (hit at t=0 → world hit == camera.pos → vz == 0).
     float  vz = max(dot(hit_world - g_camera.pos, g_camera.forward), NEAR_PLANE);
-    float  A  = FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
-    float  B  = -NEAR_PLANE * FAR_PLANE / (FAR_PLANE - NEAR_PLANE);
 
     PSOutput o;
     o.vis   = pack_vis(h.local_idx, h.face, level_idx, h.occ_slot);
-    o.depth = A + B / vz;
+    o.depth = encode_depth(vz);
     return o;
 }
