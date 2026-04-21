@@ -2198,7 +2198,33 @@ pub(crate) fn apply_dirty_entries_traced(
 
         let new_exposure = e.new_bits_partial & BITS_EXPOSURE_MASK;
         let new_is_solid = (e.new_bits_partial & BITS_IS_SOLID) != 0;
-        let is_uniform_new = new_exposure == 0;
+        // `exposure == 0` alone does not imply "uniformly empty". Two
+        // distinct cases share that signal:
+        //
+        //   1. any_bit = 0, is_solid = 0 — truly empty. No material needed.
+        //   2. any_bit = 1, is_solid = 1 — fully solid AND every neighbour
+        //      face at dispatch time was fully solid (either legitimately,
+        //      or transiently under intra-batch conservatism reading
+        //      pre-patch `g_material_pool`). No *visible* faces now, but
+        //      the sub-chunk has real occupancy that must stay resident so
+        //      (a) the cull can re-include it when a neighbour changes and
+        //      the exposure refresh recomputes; (b) cross-LOD
+        //      `sub_sample_finer_face` at L_{n+1} can AND-reduce this
+        //      entry's face plane; (c) OR-reduction at coarser levels can
+        //      read its occupancy. Treating case 2 as uniform-empty wrote
+        //      `DirEntry::empty()` (coord=(0,0,0), bits=0), which then
+        //      failed `coord_matches` and silently removed the sub-chunk
+        //      from every downstream query — producing the permanent
+        //      over-cull hole documented in the 2026-04-21 frame 2040
+        //      RenderDoc capture (L0 slot 29 covering the ray from camera
+        //      `(-25.26, 4.30, -26.41)` east-and-down).
+        //
+        // Discriminate via `is_solid`: case 1 has `is_solid = 0`; case 2
+        // has `is_solid = 1`. The refresh dispatch's re-prep will re-fire
+        // exposure from fresh neighbour content on any subsequent frame
+        // the neighbours change, so the resident entry naturally
+        // transitions to the correct state.
+        let is_uniform_new = new_exposure == 0 && !new_is_solid;
 
         // Invariants on the shader-emitted word. The material-slot field
         // must be zero (CPU authors it) and the resident bit must be set
@@ -2560,12 +2586,21 @@ mod tests {
     }
 
     #[test]
-    fn is_solid_with_zero_exposure_classifies_as_uniform_empty() {
+    fn is_solid_with_zero_exposure_retires_resident_not_uniform_empty() {
         // A fully-solid sub-chunk bordered by fully-solid neighbours has
         // exposure=0 (no face is exposed) and is_solid=1. The retirement
-        // treats it as uniform (no material slot allocated) — the is_solid
-        // bit is redundant in this case because exposure=0 already rejects
-        // the candidate in cull before the is_solid fast-path fires.
+        // MUST NOT treat this as uniform-empty: the sub-chunk has real
+        // occupancy that must stay resident so (a) the cull can re-admit
+        // it when a neighbour changes and the exposure refresh recomputes;
+        // (b) cross-LOD `sub_sample_finer_face` at the coarser level can
+        // AND-reduce this entry's face plane; (c) OR-reduction at coarser
+        // levels reads its occupancy.
+        //
+        // This test guards the fix to `is_uniform_new` after a RenderDoc
+        // capture (2026-04-21 frame 2040) showed L0 `(-3, -1, -3)` stuck
+        // in `DirEntry::empty()` under the old rule `is_uniform_new =
+        // exposure == 0`, producing a permanent over-cull hole where the
+        // ray from the camera found no occluder.
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
         let mut mpool = fresh_mpool();
@@ -2574,9 +2609,34 @@ mod tests {
         let inputs = vec![retire(1, 0, 0, true, [0, 0, 0])];
         let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc, &mut mpool);
 
-        assert!(copies.is_empty(), "uniform-empty must not allocate a material slot");
+        assert_eq!(
+            copies.len(), 1,
+            "fully-solid + exposure=0 must allocate a material slot and emit \
+             a patch copy — the occupancy is needed downstream"
+        );
         let e = dir.get(1);
-        assert!(!e.is_resident(), "exposure=0 retires as DirEntry::empty()");
+        assert!(e.is_resident(), "fully-solid retires as resident, not empty()");
+        assert!(e.is_solid(), "is_solid bit is preserved into the directory");
+        assert_eq!(e.exposure(), 0, "exposure=0 is preserved verbatim");
+        assert_eq!(alloc.active(), 1, "one material slot is live for this entry");
+    }
+
+    #[test]
+    fn exposure_zero_without_is_solid_retires_as_uniform_empty() {
+        // Complement of the above: exposure=0 AND is_solid=0 is the true
+        // uniform-empty case (any_bit was 0 at prep time). No material
+        // slot, no patch copy, entry returns to `DirEntry::empty()`.
+        let mut dir   = SlotDirectory::new(4);
+        let mut alloc = MaterialAllocator::new(4);
+        let mut mpool = fresh_mpool();
+        let _ = dir.drain_dirty().count();
+
+        let inputs = vec![retire(2, 0, 0, false, [0, 0, 0])];
+        let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc, &mut mpool);
+
+        assert!(copies.is_empty(), "uniform-empty must not allocate a material slot");
+        let e = dir.get(2);
+        assert!(!e.is_resident(), "uniform-empty retires as DirEntry::empty()");
         assert_eq!(alloc.active(), 0);
     }
 
