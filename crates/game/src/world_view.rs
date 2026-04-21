@@ -35,8 +35,8 @@ use std::sync::Arc;
 use renderer::{
     BITS_EXPOSURE_MASK, BITS_IS_SOLID, BITS_MATERIAL_SLOT_SHIFT, BITS_RESIDENT,
     DirEntry, DirtyEntry, EXPOSURE_STAGING_REQUEST_IDX_SENTINEL, FrameIndex,
-    GpuConsts, GpuConstsData, LevelStatic, LodMaskUniform, MATERIAL_DESC_CAPACITY,
-    MATERIAL_SLOT_INVALID, MaterialDesc,
+    GpuConsts, GpuConstsData, INFLIGHT_INVALID, LevelStatic, LodMaskUniform,
+    MATERIAL_DESC_CAPACITY, MATERIAL_SLOT_INVALID, MaterialDesc,
     MaterialPatchCopy as RendererMaterialPatchCopy,
     PatchCopy, OverflowPolicy, PrepRequest as GpuPrepRequest, ReadbackChannel,
     RendererContext, SUBCHUNK_MAX_CANDIDATES, SUBCHUNK_MAX_LEVELS, SubchunkInstance,
@@ -59,6 +59,7 @@ use crate::world::material_data_pool::{MaterialDataPool, MATERIAL_DATA_SLOT_INVA
 use crate::world::material_pool::MaterialAllocator;
 use crate::world::pool::{SlotId, cpu_compute_directory_index};
 use crate::world::residency::{LevelConfig, OccupancySummary, Residency, RequestId};
+use crate::world::shell::Shell;
 use crate::world::slot_directory::SlotDirectory;
 use crate::world::subchunk::SUBCHUNK_EDGE;
 
@@ -302,11 +303,11 @@ impl WorldView {
     /// occupancy buffer stays zero-initialised until the prep dispatch
     /// recorded on frame 0 retires (typically 1–2 frames later). The
     /// render pass still runs each frame — the cull shader reads each
-    /// slot's exposure from `slot_directory_buf`, whose entries are
-    /// `DirEntry::empty()` (resident bit clear, exposure = 0) until the
-    /// residency flush populates them, so every slot is rejected
-    /// trivially. Expect the first one or two rendered frames to be empty
-    /// before content starts to appear.
+    /// slot's exposure from `slot_directory_buf`, whose entries are seeded
+    /// as `DirEntry::empty(canonical_coord)` at construction and will carry
+    /// `resident = 0, exposure = 0` until retirement populates them, so
+    /// every slot is rejected trivially. Expect the first one or two
+    /// rendered frames to be empty before content starts to appear.
     ///
     /// # Panics
     ///
@@ -401,8 +402,39 @@ impl WorldView {
         // slot), at which point capacity and total_directory_capacity
         // diverge and the allocator starts evicting stale entries.
         let total_capacity = offset;
-        let directory = SlotDirectory::new(total_capacity);
+        let mut directory = SlotDirectory::new(total_capacity);
         let allocator = MaterialAllocator::new(total_capacity);
+
+        // --- Cold-start seed: stamp every shell slot with its canonical
+        // coord before the first flush ---
+        //
+        // SlotDirectory::new initialises entries to empty([0,0,0]) (the
+        // pre-seed placeholder). The GPU buffer is zero-initialised (same
+        // bit pattern), so any slot that hasn't been explicitly seeded looks
+        // like coord=(0,0,0) to the shader. The DDA's `resolve_and_verify`
+        // distinguishes "coord matches + non-resident → sub-chunk confirmed
+        // empty at this level" from "coord mismatch → ray exited shell →
+        // promote to coarser LOD". Without a coord stamp, every slot looks
+        // like a mismatch for any coord other than (0,0,0) — producing
+        // phantom promotions into OR-reduced coarser occupancy, which
+        // manifests as shadow/GI phantom hits.
+        //
+        // We iterate the same set of coords that Residency::new seeded for
+        // prep requests, reconstruct the shell from the config + corner, and
+        // write DirEntry::empty(canonical_coord) for each slot.
+        for (level_idx, cfg) in configs.iter().enumerate() {
+            let level  = residency
+                .corner(cfg.level)
+                .expect("level was just constructed; corner must exist");
+            let shell  = Shell::new(cfg.radius, level);
+            let range  = &level_slots[level_idx];
+            for coord in shell.residents() {
+                let dir_idx = cpu_compute_directory_index(
+                    coord, range.pool_dims, range.offset,
+                );
+                directory.set(dir_idx, DirEntry::empty([coord.x, coord.y, coord.z]));
+            }
+        }
 
         // M1 material-data pool: non-identity allocator, one segment live
         // at construction to mirror the renderer's initial segment
@@ -858,23 +890,22 @@ impl WorldView {
             // Record the patch pass. An empty `copies` is a no-op inside
             // `subchunk_patch`, so we don't guard here.
             //
-            // `ready_frame` — the FrameIndex the retiring dirty list was
-            // dispatched on — selects the staging-ring slot to read.
-            // Passing `frame` (the current frame) here instead would
-            // route the patch at slot holding the current frame's prep
-            // output, which is the bug
-            // `failure-staging-not-ringed-after-gid-x-reindexing` captures.
-            nodes::subchunk_patch(graph, &self.renderer, &copies, ready_frame);
+            // `frame` (the current frame) selects the staging-ring slot.
+            // This is correct by the FIF rotation invariant: prep at
+            // `ready_frame` wrote slot `ready_frame % N`; patch runs at
+            // frame `ready_frame + N`, so the current frame's slot index
+            // is `(ready_frame + N) % N == ready_frame % N` — the same
+            // underlying buffer. See `subchunk_patch` docs.
+            nodes::subchunk_patch(graph, &self.renderer, &copies, frame);
 
             // Material-id patch pass. Parallel to the occupancy patch:
             // reads the same `staging_material_ids_ring` slot the prep
-            // shader wrote on frame `ready_frame` and lands each 1 KB
-            // block at its assigned material-data-pool slot.
+            // shader wrote. Same FIF-rotation invariant as above.
             nodes::subchunk_material_patch(
                 graph,
                 &self.renderer,
                 &material_patches,
-                ready_frame,
+                frame,
             );
 
             // Every retired full-prep dirty entry represents a real
@@ -945,14 +976,22 @@ impl WorldView {
         self.evicted_last_update = evictions.len();
         self.evicted_total       = self.evicted_total.saturating_add(evictions.len() as u64);
 
-        // Clear the directory entry + free the material slot for each
-        // evicted coord.
+        // Free CPU-side material resources for each evicted coord.
         //
         // `is_resident` gates the allocator release: a coord that rolled
         // out before its prep ever retired has a non-resident directory
-        // entry with no material slot to release. The evict path writes
-        // `DirEntry::empty()` regardless so shader reads observe a clean
-        // non-resident entry (`is_resident == false`).
+        // entry with no material slot to release. The directory entry is
+        // intentionally NOT updated here — the prep dispatch in step 4
+        // (same `update()` call, same frame) unconditionally writes
+        // `DirEntry::empty(req.coord)` to every slot that was evicted,
+        // stamping the new canonical owner. Between eviction-free and
+        // prep-dispatch the slot briefly holds the evicted coord's data;
+        // this is safe because no CPU or GPU reads occur in that window.
+        // The 1:1 eviction ↔ new-request correspondence is guaranteed by
+        // the toroidal shell geometry: `Shell::recenter` produces
+        // `added.len() == removed.len()` and each removed coord C_old maps
+        // to the same slot as the corresponding added coord C_new via
+        // `rem_euclid(pool_dims)`.
         for evict in &evictions {
             let Some(level_idx) = self.level_index(evict.level) else {
                 debug_assert!(false, "eviction for unknown level {:?}", evict.level);
@@ -982,7 +1021,6 @@ impl WorldView {
             if existing.material_data_slot != MATERIAL_DATA_SLOT_INVALID {
                 self.material_data_pool.free(existing.material_data_slot);
             }
-            self.directory.set(directory_index, DirEntry::empty());
 
             #[cfg(feature = "debug-state-history")]
             if let Some(b) = self.state_history.builder_mut() {
@@ -997,12 +1035,12 @@ impl WorldView {
 
         // --- 4. Dispatch new prep requests ---
         //
-        // Step-3 inversion: the directory entry is *not* authored here.
-        // It stays at whatever the eviction path left (`DirEntry::empty()`
-        // on clean eviction; a stale resident entry from a prior
-        // torus-collision is cleared below). Exposure / is_solid /
-        // residency are authored at retirement, via `apply_dirty_entries`,
-        // based on the shader's classification.
+        // Step-3 inversion: the directory entry is *not* authored at
+        // retirement dispatch time. Instead, each new request unconditionally
+        // seeds its slot with DirEntry::empty(req.coord) below, stamping the
+        // new canonical owner. Exposure / is_solid / resident bits are
+        // authored at retirement, via `apply_dirty_entries`, once the shader
+        // classification arrives.
         let new_requests = self.residency.take_prep_requests();
         // Coord/level pairs freshly requested this frame. Used to dedup
         // the exposure-only queue drain below: a full-prep of coord C
@@ -1039,23 +1077,31 @@ impl WorldView {
                     self.global_slot(level_idx, req.slot),
                 );
 
-                // If the directory entry at this index is still resident,
-                // its previous occupant rolled out before its prep ever
-                // completed *without* going through the eviction path
-                // (which would have cleared the entry). The only way this
-                // happens today is a torus collision where a new coord
-                // lands in the same directory slot while the prior coord's
-                // prep is in flight. Under the identity policy
-                // (pool_size == directory_size), this cannot fire — the
-                // residency pool sizes are large enough that each resident
-                // coord owns a distinct slot. The clear is retained as a
-                // belt-and-braces guard so Step-3+ eviction work can't
-                // silently leak a material slot.
+                // Torus-collision guard: if the entry is still resident,
+                // the prior coord left the shell before its prep ever
+                // completed *without* going through the normal eviction path.
+                // Under the identity policy (pool_size == directory_size)
+                // this cannot fire, but is retained to prevent material-slot
+                // leaks under future non-identity allocator policies. Free
+                // material-data slot too if one was allocated.
                 let existing = *self.directory.get(directory_index);
                 if existing.is_resident() {
                     self.allocator.free(existing.material_slot());
-                    self.directory.set(directory_index, DirEntry::empty());
+                    if existing.material_data_slot != MATERIAL_DATA_SLOT_INVALID {
+                        self.material_data_pool.free(existing.material_data_slot);
+                    }
                 }
+
+                // Unconditionally seed the slot with the new canonical
+                // owner's coord. Secondary-ray DDAs see a coord-matched
+                // non-resident entry (advance at this level) rather than a
+                // coord-mismatched zero (promote into coarser OR-reduced
+                // occupancy). Retirement overwrites this with the correct
+                // exposure + is_solid + resident bits when the prep result
+                // arrives.
+                self.directory.set(directory_index, DirEntry::empty([
+                    req.coord.x, req.coord.y, req.coord.z,
+                ]));
 
                 gpu_requests.push(GpuPrepRequest {
                     coord: [req.coord.x, req.coord.y, req.coord.z],
@@ -1084,6 +1130,28 @@ impl WorldView {
             // Upload the CPU-side request list into the renderer's prep
             // buffer so the prep compute pass reads it.
             self.renderer.write_prep_requests(ctx, &gpu_requests);
+
+            // Build and upload the in-flight request-index lookup for the
+            // NEXT frame's prep dispatch. For each request at index `i`
+            // with directory slot `d`, write `lookup[d] = i`. All other
+            // slots remain INFLIGHT_INVALID — the shader falls back to
+            // material_pool for those neighbours.
+            //
+            // The lookup goes into `current(frame + 1)` so prep@(frame+1)
+            // reads it as `current(frame+1)`. This follows the convention:
+            // "fill the cpu-side buffer for frame N+1 and FIF queues the
+            // operation" (see `convention-patch-uses-current-frame-not-
+            // dispatch-frame`).
+            {
+                let mut lookup = vec![INFLIGHT_INVALID; SUBCHUNK_MAX_CANDIDATES];
+                for (i, c) in completions.iter().enumerate() {
+                    let d = c.directory_index as usize;
+                    if d < lookup.len() {
+                        lookup[d] = i as u32;
+                    }
+                }
+                self.renderer.write_inflight_request_idx(ctx, frame, &lookup);
+            }
 
             // Reserve this frame's readback slot and wire the prep pass
             // to write into it. Panic on overflow is appropriate: reserve
@@ -1117,10 +1185,9 @@ impl WorldView {
         //     an exposure-only refresh would be redundant work.
         //  2. The coord is currently resident in the directory (the
         //     `bits` we would patch must belong to the same coord).
-        //     Non-resident entries retire into `DirEntry::empty()` when
-        //     they come back around via full-prep; filtering them here
-        //     avoids emitting a dispatch for a slot that has nothing to
-        //     refresh.
+        //     Non-resident entries will be seeded to `DirEntry::empty(coord)`
+        //     when the full-prep dispatch fires; filtering them here avoids
+        //     emitting a dispatch for a slot that has nothing to refresh.
         //  3. The coord has an allocated material slot (has_material).
         //     A uniform-empty entry has no occupancy to re-expose
         //     against — exposure stays 0 by construction.
@@ -2303,11 +2370,11 @@ pub(crate) fn apply_dirty_entries_traced(
         };
 
         // Author the new directory entry. Uniform-empty entries land as
-        // `DirEntry::empty()` so `is_resident` stays clear and the cull
-        // shader drops the candidate before reading the material pool.
+        // `DirEntry::empty(coord)` so `is_resident` stays clear and the
+        // cull shader drops the candidate before reading the material pool.
         // `material_data_slot` is threaded separately; `resident(...)` /
-        // `empty()` both default it to INVALID, so we set it explicitly
-        // via `with_material_data_slot`.
+        // `empty(coord)` both default it to INVALID, so we set it
+        // explicitly via `with_material_data_slot`.
         let new_entry = match new_material_slot {
             Some(slot) => {
                 let mut de = DirEntry::resident(coord, new_exposure, new_is_solid, slot);
@@ -2316,7 +2383,7 @@ pub(crate) fn apply_dirty_entries_traced(
                 de = de.with_material_data_slot(new_mds);
                 de
             }
-            None => DirEntry::empty_at(coord),
+            None => DirEntry::empty(coord),
         };
         directory.set(e.directory_index, new_entry);
 
@@ -2632,7 +2699,7 @@ mod tests {
     fn exposure_zero_without_is_solid_retires_as_uniform_empty() {
         // Complement of the above: exposure=0 AND is_solid=0 is the true
         // uniform-empty case (any_bit was 0 at prep time). No material
-        // slot, no patch copy, entry returns to `DirEntry::empty()`.
+        // slot, no patch copy, entry retires as `DirEntry::empty(coord)`.
         let mut dir   = SlotDirectory::new(4);
         let mut alloc = MaterialAllocator::new(4);
         let mut mpool = fresh_mpool();
@@ -2726,7 +2793,7 @@ mod tests {
         // bits field reverted to zero. Exposure-only retirement must
         // NOT re-resident it with stale data.
         let mut dir = SlotDirectory::new(4);
-        dir.set(3, DirEntry::empty());
+        dir.set(3, DirEntry::empty([0, 0, 0]));
         let _ = dir.drain_dirty().count();
 
         let entries = vec![exposure_entry(3, 0x15, false)];
@@ -3057,13 +3124,13 @@ mod tests {
 
         dir.set(1, DirEntry::resident([0, 0, 0], 0x3F, false, 1));
         dir.set(3, DirEntry::resident([0, 0, 0], 0x01, true,  3));
-        dir.set(5, DirEntry::empty());  // explicit non-resident; sanity check
+        dir.set(5, DirEntry::empty([0, 0, 0]));  // explicit non-resident; sanity check
 
         assert_eq!(count_directory_resident(&dir), 2,
             "two resident entries set, one explicit empty");
 
         // Evict one; counter decrements.
-        dir.set(1, DirEntry::empty());
+        dir.set(1, DirEntry::empty([0, 0, 0]));
         assert_eq!(count_directory_resident(&dir), 1);
     }
 
@@ -3202,5 +3269,113 @@ mod tests {
             "overflow field must live at byte offset 8 to match the \
              shader's InterlockedMax(8u, 1u, _prev)",
         );
+    }
+
+    // --- Cold-start seed regression ---
+
+    /// Regression for the (0,0,0) cold-start bug: after the shell-build
+    /// seed pass, every slot in the directory carries `DirEntry::empty` with
+    /// the *canonical* coord and bits=0.
+    ///
+    /// Before the fix, `SlotDirectory::new` zero-initialised every entry and
+    /// the GPU buffer was also zero-initialised, leaving coord=(0,0,0) in
+    /// every slot. The DDA's `resolve_and_verify` saw `coord_match = false`
+    /// for any coord other than (0,0,0), causing phantom promotions into
+    /// coarser OR-reduced occupancy (shadow/GI phantom hits). For the slot
+    /// whose *canonical* owner happens to be (0,0,0) this was indistinguishable
+    /// from the zero-init — only an explicit seed makes the state observable
+    /// as "empty at (0,0,0)" rather than "uninitialized".
+    #[test]
+    fn cold_start_seed_stamps_every_slot_with_canonical_coord() {
+        // Construct a tiny 2×2×2 shell centred near the origin so that one
+        // of the 8 resident slots has canonical coord (0,0,0). The shell has
+        // radius [1,1,1] and corner (0,0,0), so it covers coords in
+        // [0,1] × [0,1] × [0,1] — wait, Shell::new with corner=(0,0,0) and
+        // radius=[1,1,1] covers [-1,0] on each axis, as per shell.rs §geometry.
+        // Use corner=(0,0,0) + radius=[1,1,1]: residents are dx in [-1,0),
+        // so coords (-1,-1,-1)..(-1,-1,0) etc. Choose corner=(1,1,1) so that
+        // (0,0,0) is one of the residents.
+        let corner   = SubchunkCoord::new(1, 1, 1);
+        let radius   = [1u32, 1, 1];
+        let pool_dims = [2u32, 2, 2];
+        let capacity  = pool_dims[0] * pool_dims[1] * pool_dims[2]; // 8
+
+        // Simulate the seed pass that WorldView::new performs.
+        let mut dir = SlotDirectory::new(capacity);
+        let shell   = Shell::new(radius, corner);
+        for coord in shell.residents() {
+            let dir_idx = cpu_compute_directory_index(coord, pool_dims, 0);
+            dir.set(dir_idx, DirEntry::empty([coord.x, coord.y, coord.z]));
+        }
+
+        // Verify every resident slot carries its canonical coord, bits=0,
+        // and is not marked resident — i.e. exactly DirEntry::empty(coord).
+        let mut zero_coord_found = false;
+        for coord in shell.residents() {
+            let dir_idx = cpu_compute_directory_index(coord, pool_dims, 0);
+            let entry   = dir.get(dir_idx);
+            assert!(!entry.is_resident(),
+                "seeded slot must be non-resident at coord {coord:?}");
+            assert_eq!(
+                entry.coord, [coord.x, coord.y, coord.z],
+                "seeded slot must carry canonical coord at dir_idx {dir_idx}",
+            );
+            assert_eq!(
+                entry.bits, 0,
+                "seeded empty entry must have all bits clear",
+            );
+            if coord.x == 0 && coord.y == 0 && coord.z == 0 {
+                zero_coord_found = true;
+            }
+        }
+        assert!(zero_coord_found,
+            "shell with corner=(1,1,1) radius=[1,1,1] must include (0,0,0)");
+    }
+
+    // --- Eviction → prep-dispatch path ---
+
+    /// Regression: after eviction, the prep-dispatch step (not the eviction
+    /// step) is the sole writer of new coord ownership in the directory.
+    ///
+    /// Eviction frees CPU-side resources but does NOT touch the directory.
+    /// The prep-dispatch loop then writes `DirEntry::empty(new_coord)` for
+    /// each newly-requested slot. The slot must carry the *new* coord after
+    /// this sequence, not the old evicted coord's data.
+    #[test]
+    fn eviction_then_prep_dispatch_stamps_new_coord() {
+        // Pool dims [2, 1, 1]: two slots at x=0 and x=1. Old coord (0,0,0)
+        // maps to slot 0; new coord (2,0,0) also maps to slot 0 (toroidal
+        // wrap: 2 % 2 = 0). That is the evict-then-replace case.
+        let pool_dims   = [2u32, 1, 1];
+        let global_offset = 0u32;
+        let old_coord   = [0i32, 0, 0];
+        let new_coord   = [2i32, 0, 0];
+
+        // Seed the directory as if the shell-build seed pass ran for old_coord.
+        let mut dir = SlotDirectory::new(2);
+        let slot = cpu_compute_directory_index(
+            SubchunkCoord::new(old_coord[0], old_coord[1], old_coord[2]),
+            pool_dims,
+            global_offset,
+        );
+        dir.set(slot, DirEntry::resident(old_coord, 0x3F, true, 1));
+        let _ = dir.drain_dirty().count();
+
+        // Eviction: free CPU resources only. No directory write (the new design).
+        // The slot still holds the old resident entry.
+        assert!(dir.get(slot).is_resident(), "slot still resident before prep-dispatch");
+        assert_eq!(dir.get(slot).coord, old_coord);
+
+        // Prep-dispatch: unconditionally seed the slot with the new canonical owner.
+        dir.set(slot, DirEntry::empty([new_coord[0], new_coord[1], new_coord[2]]));
+
+        // After prep-dispatch: slot must carry the new coord and be non-resident.
+        let entry = dir.get(slot);
+        assert!(!entry.is_resident(),
+            "slot must be non-resident after prep-dispatch seeds new coord");
+        assert_eq!(entry.coord, new_coord,
+            "slot must carry the new canonical coord, not the evicted coord");
+        assert_eq!(entry.bits, 0,
+            "prep-dispatch seeds empty([coord]) which has bits=0");
     }
 }

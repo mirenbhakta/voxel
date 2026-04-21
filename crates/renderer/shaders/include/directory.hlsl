@@ -110,10 +110,8 @@ bool direntry_is_solid(DirEntry e) {
 }
 
 // `true` when the entry points at real occupancy. Always check this before
-// trusting `material_slot` — a non-resident entry carries
-// `DIRENTRY_MATERIAL_SLOT_INVALID` in the slot field (via
-// `DirEntry::non_resident`) or zero (via `DirEntry::empty`, the buffer's
-// zero-init state before any residency flush has run).
+// trusting `material_slot` — a non-resident entry carries zero in the slot
+// field. The resident bit is the authoritative gate.
 bool direntry_is_resident(DirEntry e) {
     return (e.bits & DIRENTRY_BITS_RESIDENT) != 0u;
 }

@@ -54,8 +54,32 @@ struct NeighbourFace {
 //   * is_solid                        → all-ones (every face bit set).
 //   * has no material slot            → uniform-empty, all zero —
 //                                       resolved (no fallback).
-//   * sparse                          → read from g_material_pool and
-//                                       extract the opposing face.
+//   * sparse                          → resolve occupancy (via staging
+//                                       when PREP_INFLIGHT_STAGING is
+//                                       defined; else from g_material_pool)
+//                                       and extract the opposing face.
+//
+// When the consumer shader defines `PREP_INFLIGHT_STAGING` before
+// including this header, two additional globals must be in scope:
+//
+//   StructuredBuffer<uint>      g_inflight_request_idx;
+//   StructuredBuffer<Occupancy> g_staging_occ_prev;
+//
+// With those in scope, a neighbour whose directory slot `nbr_slot` has
+// `g_inflight_request_idx[nbr_slot] != INFLIGHT_INVALID` is known to
+// have in-flight staging from the previous frame. The shader reads its
+// occupancy from `g_staging_occ_prev[g_inflight_request_idx[nbr_slot]]`
+// instead of `g_material_pool[mslot]`. This closes the cross-boundary
+// conservatism window caused by the 1-frame gap between a neighbour's
+// prep dispatch and the CPU patch that promotes its occupancy into
+// `material_pool`. See `log-multi-source-prep-neighbour-read`.
+//
+// INFLIGHT_INVALID (= 0xFFFFFFFF) mirrors `renderer::INFLIGHT_INVALID` on
+// the Rust side. Defined below to keep this header self-contained.
+#ifndef INFLIGHT_INVALID
+#define INFLIGHT_INVALID 0xFFFFFFFFu
+#endif
+
 NeighbourFace neighbour_opposing_face(
     int3 nbr_coord,
     uint level_idx,
@@ -84,8 +108,30 @@ NeighbourFace neighbour_opposing_face(
         return result;
     }
 
-    uint mslot = direntry_get_material_slot(d);
-    Occupancy nbr = g_material_pool[mslot];
+    // Resolve neighbour occupancy. When this shader is the full-prep
+    // dispatch and the neighbour was in-flight from the previous frame
+    // (PREP_INFLIGHT_STAGING path), prefer the previous staging slot over
+    // the material_pool entry — the patch for that frame hasn't landed yet
+    // so material_pool is up to 2 frames stale for this neighbour.
+    Occupancy nbr;
+#ifdef PREP_INFLIGHT_STAGING
+    {
+        uint inflight_req_idx = g_inflight_request_idx[nbr_slot];
+        if (inflight_req_idx != INFLIGHT_INVALID) {
+            // Neighbour has in-flight occupancy from the previous frame's
+            // prep batch. Read from staging.previous(1) instead.
+            nbr = g_staging_occ_prev[inflight_req_idx];
+        } else {
+            uint mslot = direntry_get_material_slot(d);
+            nbr = g_material_pool[mslot];
+        }
+    }
+#else
+    {
+        uint mslot = direntry_get_material_slot(d);
+        nbr = g_material_pool[mslot];
+    }
+#endif
 
     // We are testing exposure in direction `dir_idx` from *our* side; the
     // neighbour's face that meets ours is the opposite direction.

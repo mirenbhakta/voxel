@@ -639,7 +639,7 @@ mod tests {
             staging_request_idx: 2,
             transition:          TransitionKind::UniformToSparse,
             allocated_slot:      Some(80),
-            new_entry:           DirEntry::empty(),
+            new_entry:           DirEntry::empty([0, 0, 0]),
         });
         rec.patch_copies_issued.push(PatchCopy {
             staging_request_idx: 2,
@@ -713,7 +713,7 @@ mod tests {
             staging_request_idx: 0,
             transition:          TransitionKind::UniformFirstTime,
             allocated_slot:      None,
-            new_entry:           DirEntry::empty(),
+            new_entry:           DirEntry::empty([0, 0, 0]),
         });
 
         let mut buf = Vec::<u8>::new();

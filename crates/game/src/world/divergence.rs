@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn identical_snapshots_report_no_divergence() {
-        let cpu = vec![DirEntry::empty(), DirEntry::resident([0, 0, 0], 0x3F, false, 0)];
+        let cpu = vec![DirEntry::empty([0, 0, 0]), DirEntry::resident([0, 0, 0], 0x3F, false, 0)];
         let gpu = cpu.clone();
         let mut sink = Vec::<u8>::new();
         let report = compare_directory_snapshots(frame(1), &cpu, &gpu, &mut sink);
@@ -299,11 +299,7 @@ mod tests {
         // GPU says non-resident at [7,8,9] — both residency AND coord AND
         // material_slot differ, but classifier must prefer Residency.
         let cpu = vec![DirEntry::resident([1, 2, 3], 0x3F, false, 2)];
-        let gpu = vec![{
-            let mut e = DirEntry::empty();
-            e.coord = [7, 8, 9];
-            e
-        }];
+        let gpu = vec![DirEntry::empty([7, 8, 9])];
         let mut sink = Vec::<u8>::new();
         let r = compare_directory_snapshots(frame(0), &cpu, &gpu, &mut sink);
         assert_eq!(r.divergent, 1);
@@ -380,8 +376,8 @@ mod tests {
 
     #[test]
     fn mismatched_lengths_compare_over_the_shorter() {
-        let cpu = vec![DirEntry::empty(), DirEntry::resident([1, 1, 1], 0x3F, false, 1)];
-        let gpu = vec![DirEntry::empty()]; // shorter
+        let cpu = vec![DirEntry::empty([0, 0, 0]), DirEntry::resident([1, 1, 1], 0x3F, false, 1)];
+        let gpu = vec![DirEntry::empty([0, 0, 0])]; // shorter
         let mut sink = Vec::<u8>::new();
         let r = compare_directory_snapshots(frame(0), &cpu, &gpu, &mut sink);
         assert_eq!(r.total, 1, "comparison truncates to the shorter slice");
@@ -393,7 +389,7 @@ mod tests {
         // Two reports with the same divergent indices must fingerprint
         // identically; changing which indices disagree must change the
         // fingerprint. This is what the console-collapse logic keys on.
-        let cpu = vec![DirEntry::empty(); 4];
+        let cpu = vec![DirEntry::empty([0, 0, 0]); 4];
         let mut gpu_a = cpu.clone();
         let mut gpu_b = cpu.clone();
 
@@ -422,7 +418,7 @@ mod tests {
 
     #[test]
     fn log_output_is_empty_when_clean() {
-        let cpu = vec![DirEntry::empty(); 3];
+        let cpu = vec![DirEntry::empty([0, 0, 0]); 3];
         let gpu = cpu.clone();
         let mut sink = Vec::<u8>::new();
         let _ = compare_directory_snapshots(frame(0), &cpu, &gpu, &mut sink);
@@ -432,7 +428,7 @@ mod tests {
     #[test]
     fn log_output_mentions_frame_and_counts() {
         let cpu = vec![DirEntry::resident([0, 0, 0], 0x3F, false, 0)];
-        let gpu = vec![DirEntry::empty()];
+        let gpu = vec![DirEntry::empty([0, 0, 0])];
         let mut sink = Vec::<u8>::new();
         let r = compare_directory_snapshots(frame(1247), &cpu, &gpu, &mut sink);
         assert_eq!(r.divergent, 1);

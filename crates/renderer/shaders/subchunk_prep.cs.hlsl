@@ -130,11 +130,41 @@
 #include "include/material.hlsl"
 [[vk::binding(6, 0)]] RWStructuredBuffer<MaterialBlock> g_staging_material_ids;
 
-// The shared neighbour-aware-exposure helper depends on `g_directory` +
-// `g_material_pool` being in scope as globals, so include it after their
-// declarations. Used by both this shader and `subchunk_exposure.cs.hlsl`
-// to keep the 6-bit exposure mask bit-for-bit consistent between the
-// full-prep dispatch and the exposure-only refresh dispatch.
+// Multi-source neighbour read (step-2 commit-2 of the directory-pipeline
+// cleanup). The prep shader consults two occupancy sources for neighbour
+// resolution, in priority order:
+//
+//   1. g_staging_occ_prev — previous frame's staging ring slot. Contains
+//      the freshly-voxelized occupancy for any sub-chunk that was dispatched
+//      in frame F-1 but whose patch hasn't landed yet. The lookup
+//      g_inflight_request_idx[nbr_slot] maps a neighbour's directory slot to
+//      its request index in g_staging_occ_prev, or INFLIGHT_INVALID if it
+//      was not in-flight last frame.
+//
+//   2. g_material_pool — committed occupancy (patched through frame F-2 and
+//      earlier). Fallback when the neighbour was not in-flight last frame.
+//
+// This closes the 3-5 frame "cross-boundary conservatism window" that
+// existed because prep@F previously only read from material_pool and missed
+// the 1-frame-old in-flight batch. See `log-multi-source-prep-neighbour-read`.
+//
+// Both buffers are StructuredBuffer<Occupancy> (read-only). The lookup is
+// StructuredBuffer<uint> (read-only), CPU-authored via queue.write_buffer.
+//
+// Define the feature macro before including exposure.hlsl so
+// `neighbour_opposing_face` there picks up the conditional path.
+#define PREP_INFLIGHT_STAGING
+[[vk::binding(7, 0)]] StructuredBuffer<uint>      g_inflight_request_idx;
+[[vk::binding(8, 0)]] StructuredBuffer<Occupancy> g_staging_occ_prev;
+
+// The shared neighbour-aware-exposure helper depends on `g_directory`,
+// `g_material_pool`, and (when PREP_INFLIGHT_STAGING is defined)
+// `g_inflight_request_idx` + `g_staging_occ_prev` being in scope as
+// globals, so include it after their declarations. Used by both this
+// shader and `subchunk_exposure.cs.hlsl` to keep the 6-bit exposure mask
+// bit-for-bit consistent between the full-prep dispatch and the
+// exposure-only refresh dispatch (the exposure dispatch does not define
+// PREP_INFLIGHT_STAGING and uses the material_pool path only).
 #include "include/exposure.hlsl"
 
 static const float SUBCHUNK_VOXELS = 8.0;

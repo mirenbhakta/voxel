@@ -16,11 +16,13 @@
 //!
 //! # Initial state
 //!
-//! All entries start as [`DirEntry::empty`] but the dirty set starts
-//! *full* — the first flush populates every slot on the GPU side, which
-//! matches the invariant that the GPU buffer is zero-initialised: writing
-//! `DirEntry::empty` (also all-zero) is redundant but cheap, and avoids a
-//! special case for "first frame" inside the residency wiring.
+//! All entries start as [`DirEntry::empty([0,0,0])`] (the canonical
+//! pre-seeded state) and the dirty set starts *full*. The caller
+//! (e.g. `WorldView::new`) immediately overwrites every slot with
+//! `DirEntry::empty(canonical_coord)` via the seed pass — those writes land
+//! in the dirty set and are flushed to the GPU on the first frame. The
+//! initial `empty([0,0,0])` bit pattern is never GPU-observable because the
+//! seed pass always fires before the first drain.
 
 #![allow(dead_code)]
 
@@ -46,14 +48,15 @@ pub struct SlotDirectory {
 
 impl SlotDirectory {
     /// Construct a directory sized to `capacity` entries, all initialised
-    /// to [`DirEntry::empty`]. Every entry is flagged dirty so the first
-    /// [`SlotDirectory::drain_dirty`] produces a full `(index, empty)`
-    /// batch — ensuring the GPU buffer is in a known state on the first
-    /// flush even if a platform ever ships without BufferUsage zero-init
-    /// semantics.
+    /// to [`DirEntry::empty([0,0,0])`] (the pre-seed placeholder). Every
+    /// entry is flagged dirty so the caller's seed pass (which writes
+    /// `DirEntry::empty(canonical_coord)` for every slot) flows through the
+    /// dirty set and reaches the GPU on the first flush. The initial
+    /// `empty([0,0,0])` bit pattern is never GPU-observable: the seed pass
+    /// always runs before the first drain.
     pub fn new(capacity: u32) -> Self {
         let capacity_usize = capacity as usize;
-        let entries = vec![DirEntry::empty(); capacity_usize];
+        let entries = vec![DirEntry::empty([0, 0, 0]); capacity_usize];
 
         // One bit per entry, rounded up to a multiple of 64.
         let words = capacity_usize.div_ceil(64);
@@ -204,7 +207,7 @@ mod tests {
         let mut d = SlotDirectory::new(4);
         let _ = d.drain_dirty().count();
 
-        d.set(1, DirEntry::empty());
+        d.set(1, DirEntry::empty([0, 0, 0]));
         d.set(1, DirEntry::resident([0, 0, 0], 1, false, 0));
         d.set(1, DirEntry::resident([0, 0, 0], 2, false, 0));
 
@@ -219,8 +222,8 @@ mod tests {
         let mut d = SlotDirectory::new(4);
         let _ = d.drain_dirty().count();
 
-        d.set(0, DirEntry::empty());
-        d.set(3, DirEntry::empty());
+        d.set(0, DirEntry::empty([0, 0, 0]));
+        d.set(3, DirEntry::empty([0, 0, 0]));
 
         let first: Vec<_> = d.drain_dirty().collect();
         assert_eq!(first.len(), 2);
@@ -238,7 +241,7 @@ mod tests {
         // Hit indices spanning two full dirty words + the tail.
         let indices = [0u32, 1, 63, 64, 65, 127, 128, 129];
         for &i in &indices {
-            d.set(i, DirEntry::empty());
+            d.set(i, DirEntry::empty([0, 0, 0]));
         }
 
         let drained: Vec<u32> = d.drain_dirty().map(|(i, _)| i).collect();

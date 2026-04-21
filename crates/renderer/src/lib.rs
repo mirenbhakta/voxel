@@ -48,6 +48,7 @@ pub use subchunk::{
     DirtyEntry,
     DirtyReport,
     EXPOSURE_STAGING_REQUEST_IDX_SENTINEL,
+    INFLIGHT_INVALID,
     LodMaskUniform,
     MATERIAL_DATA_SLOT_INVALID,
     MATERIAL_SLOT_INVALID,

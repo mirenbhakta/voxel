@@ -47,15 +47,18 @@
 //! - 6: depth       (SampledTexture, Depth32Float)         — COMPUTE
 //!
 //! **Prep bind group** (set 0 for `subchunk_prep.cs.hlsl`):
-//! - 0: gpu_consts     (UniformBuffer, sizeof GpuConstsData) — COMPUTE.
+//! - 0: gpu_consts             (UniformBuffer, sizeof GpuConstsData) — COMPUTE.
 //!   Implicit, supplied via `create_bind_group`'s `gpu_consts` argument
 //!   (the HLSL side pins this slot via `include/gpu_consts.hlsl`).
-//! - 1: prep_requests  (StorageReadOnly, stride=32) — COMPUTE
-//! - 2: material_pool  (StorageReadOnly, stride=64) — COMPUTE
-//!   (diff source + neighbour-face source)
-//! - 3: staging_occ    (StorageRW,       stride=64) — COMPUTE
-//! - 4: dirty_list     (StorageRW, byte-addressed)  — COMPUTE
-//! - 5: directory      (StorageReadOnly, stride=24) — COMPUTE
+//! - 1: prep_requests          (StorageReadOnly, stride=32)  — COMPUTE
+//! - 2: material_pool          (StorageReadOnly, stride=64)  — COMPUTE
+//!   (diff source + neighbour-face fallback)
+//! - 3: staging_occ            (StorageRW,       stride=64)  — COMPUTE
+//! - 4: dirty_list             (StorageRW, byte-addressed)   — COMPUTE
+//! - 5: directory              (StorageReadOnly, stride=24)  — COMPUTE
+//! - 6: staging_material_ids   (StorageRW,       stride=1024)— COMPUTE
+//! - 7: inflight_request_idx   (StorageReadOnly, stride=4)   — COMPUTE
+//! - 8: staging_occ_prev       (StorageReadOnly, stride=64)  — COMPUTE
 //!
 //! Cull's indirect output rides on its own set-1 bind group, assembled
 //! inside `nodes::cull`.
@@ -547,6 +550,17 @@ const _: () = assert!(
 /// an unrelated `staging_request_idx`.
 pub const EXPOSURE_STAGING_REQUEST_IDX_SENTINEL: u32 = 0xFFFF_FFFF;
 
+/// Sentinel stored in the CPU-authored `inflight_request_idx` lookup when
+/// no prep request was issued for a given directory slot in the previous
+/// frame's batch.
+///
+/// The prep shader checks this value before reading from the previous
+/// frame's staging ring slot: `INFLIGHT_INVALID` means the directory slot
+/// has no in-flight occupancy and the fallback `material_pool` read applies.
+///
+/// Matches the `INFLIGHT_INVALID` constant in `subchunk_prep.cs.hlsl`.
+pub const INFLIGHT_INVALID: u32 = 0xFFFF_FFFF;
+
 // --- DirtyReport ---
 
 /// GPU→CPU readback payload for one prep dispatch.
@@ -679,56 +693,32 @@ const _: () = assert!(
 );
 
 impl DirEntry {
-    /// All-zero non-resident entry except for `material_data_slot`, which
-    /// starts at [`MATERIAL_DATA_SLOT_INVALID`] so the shade shader emits
-    /// magenta rather than dereferencing a stale slot. `bits == 0`
-    /// implies `resident = 0`, `is_solid = 0`, `exposure = 0`, and the
-    /// packed `material_slot` (occupancy pool) is `0`; callers must not
-    /// read those fields without first checking `resident`.
+    /// Coord-stamped non-resident entry: `bits == 0` (`resident = 0`,
+    /// `is_solid = 0`, `exposure = 0`) and `coord` set to the canonical
+    /// owner of this directory slot. Use when a slot is confirmed to hold
+    /// no occupancy (shell-build seeding, uniform-empty retirement, eviction
+    /// before the new owner's prep completes).
+    ///
+    /// The `coord` stamp is load-bearing for secondary-ray DDAs
+    /// (`resolve_and_verify`): `coord` match + `resident = 0` means "this
+    /// level confirmed empty at this coord → advance at level". A mismatch
+    /// means the ray has left the shell → promote to coarser LOD. Without
+    /// a correct coord stamp both states look identical (coord=(0,0,0) in
+    /// every slot), and the DDA promotes incorrectly into coarser OR-reduced
+    /// occupancy — producing phantom shadow / GI hits.
+    ///
+    /// Every slot in every shell-resident region must carry either
+    /// `DirEntry::empty(canonical_coord)` or `DirEntry::resident(...)` at
+    /// all times. Zero-init of the underlying buffer (coord=(0,0,0)) is not
+    /// an allowed observable state; callers must seed each slot explicitly at
+    /// shell-build and recenter time.
     ///
     /// Note: a zero `material_slot` is *not* [`MATERIAL_SLOT_INVALID`]; the
-    /// resident bit is the authoritative gate. Constructing a
-    /// non-resident entry where shader code might speculatively read
-    /// `material_slot` should go through [`DirEntry::non_resident`].
-    pub const fn empty() -> Self {
-        Self {
-            coord:              [0, 0, 0],
-            bits:               0,
-            content_version:    0,
-            last_synth_version: 0,
-            material_data_slot: MATERIAL_DATA_SLOT_INVALID,
-        }
-    }
-
-    /// Coord-stamped empty entry: same cleared bits as [`DirEntry::empty`],
-    /// but `coord` matches the retired sub-chunk's world coord. Use at
-    /// retirement of a uniformly-empty prep result so secondary-ray DDAs
-    /// can distinguish "coord confirmed empty" (coord matches, resident
-    /// clear → advance at the current level) from "ray exited this level's
-    /// shell" (coord mismatch → promote to coarser LOD). Using bare
-    /// [`DirEntry::empty`] conflates the two and causes shadow / GI rays
-    /// to promote into OR-reduced occupancy that lights up false occluders
-    /// at coarser granularity.
-    pub const fn empty_at(coord: [i32; 3]) -> Self {
+    /// resident bit is the authoritative gate.
+    pub const fn empty(coord: [i32; 3]) -> Self {
         Self {
             coord,
             bits:               0,
-            content_version:    0,
-            last_synth_version: 0,
-            material_data_slot: MATERIAL_DATA_SLOT_INVALID,
-        }
-    }
-
-    /// Explicit non-resident entry: `resident` bit clear, `material_slot`
-    /// set to [`MATERIAL_SLOT_INVALID`], and `material_data_slot` set to
-    /// [`MATERIAL_DATA_SLOT_INVALID`]. Use when the caller wants the
-    /// sentinel slot values to be present for diagnostic readability or
-    /// to match a shader that panics on a non-INVALID slot under a clear
-    /// resident bit.
-    pub const fn non_resident() -> Self {
-        Self {
-            coord:              [0, 0, 0],
-            bits:               MATERIAL_SLOT_INVALID << BITS_MATERIAL_SLOT_SHIFT,
             content_version:    0,
             last_synth_version: 0,
             material_data_slot: MATERIAL_DATA_SLOT_INVALID,
@@ -807,10 +797,8 @@ impl DirEntry {
     }
 
     /// Unpacked 24-bit material-slot field. Returns
-    /// [`MATERIAL_SLOT_INVALID`] for non-resident entries built via
-    /// [`DirEntry::non_resident`] or [`DirEntry::empty`] (the latter
-    /// returns `0`, which is also not a resident slot — use
-    /// [`DirEntry::is_resident`] to gate).
+    /// Returns `0` for non-resident entries (both `is_resident == false` cases).
+    /// Use [`DirEntry::is_resident`] to gate before trusting the slot value.
     pub const fn material_slot(&self) -> u32 {
         (self.bits >> BITS_MATERIAL_SLOT_SHIFT) & MATERIAL_SLOT_INVALID
     }
@@ -919,6 +907,37 @@ pub struct WorldRenderer {
     /// [`EXPOSURE_STAGING_REQUEST_IDX_SENTINEL`] in
     /// [`DirtyEntry::staging_request_idx`] as a structural marker.
     exposure_dirty_list_buf: wgpu::Buffer,
+
+    // --- In-flight request-index lookup ring (Step 2, commit 2) ---
+    //
+    // At frame F, after the prep request list is built, the CPU writes a
+    // flat `u32[MAX_CANDIDATES]` lookup into
+    // `inflight_request_idx_ring.current(F + 1)`: for each directory_slot
+    // `d` that received a request at index `i`, `lookup[d] = i`; all
+    // other slots contain [`INFLIGHT_INVALID`].
+    //
+    // Prep@F+1 reads `inflight_request_idx_ring.current(F+1)` (the slot
+    // the CPU just populated). If `lookup[d] != INFLIGHT_INVALID`, the
+    // neighbour at `d` has in-flight staging from frame F; the shader reads
+    // its occupancy from `staging_occ_ring.previous(F+1, 1)` (= frame F's
+    // staging slot) rather than from `material_pool`. This closes the
+    // cross-boundary conservatism window for the 1-frame-old in-flight
+    // batch.
+    //
+    // Ring depth = FrameCount (= 2 under FIF=2): prep@F+1 reads slot
+    // `(F+1) % 2`; prep@F+2 reads slot `(F+2) % 2` (which the CPU will
+    // have overwritten with F+1's batch), so the ring doesn't need more
+    // than two slots.
+    /// CPU-authored lookup buffer: `directory_slot → staging_request_idx`
+    /// for the previous frame's prep batch.
+    ///
+    /// Each `u32` entry is either a request index into
+    /// `staging_occ_ring.previous(frame, 1)` (if that directory slot was
+    /// dispatched in the previous frame) or [`INFLIGHT_INVALID`] (if not).
+    /// Flat array sized to [`MAX_CANDIDATES`] — the maximum directory
+    /// capacity — so a direct `lookup[directory_slot]` index is safe.
+    inflight_request_idx_ring: MultiBufferRing<u32>,
+
     /// CPU-authored directory mapping `directory_index -> DirEntry`.
     /// Sized to `MAX_CANDIDATES` entries today (trivial 1:1 directory ↔
     /// material-slot mapping). The cull shader reads it via the set-0
@@ -963,8 +982,8 @@ impl WorldRenderer {
     /// rather than undefined behavior — the instance buffer is zeroed, so
     /// every entry has `slot_mask = 0` (slot 0, level 0, padding bit
     /// clear). Those entries fetch `g_directory[0]`, which is zero
-    /// (= `DirEntry::empty()` — `resident = 0`, `exposure = 0`), so the
-    /// cull shader's exposure rejection drops them.
+    /// (`resident = 0`, `exposure = 0`), so the cull shader's exposure
+    /// rejection drops them.
     pub fn new(ctx: &RendererContext, pool: &mut BufferPool) -> Self {
         // Assert a windowed context up front — the draw/shade path writes
         // into transients whose extents come from the swapchain size, and
@@ -1189,14 +1208,34 @@ impl WorldRenderer {
             mapped_at_creation: false,
         });
 
+        // In-flight request-index lookup ring. CPU writes this once per
+        // frame (after building the prep request list) into the slot for
+        // the *next* frame: `current(frame + 1)`. Prep@(frame+1) reads it
+        // as `current(frame+1)`. Sized to `MAX_CANDIDATES` u32 entries —
+        // one per directory slot. Entries are [`INFLIGHT_INVALID`] unless
+        // the corresponding directory slot received a prep request. Written
+        // via `queue.write_buffer`; COPY_DST only, never read back to CPU,
+        // never written by the GPU.
+        let inflight_lookup_size =
+            (std::mem::size_of::<u32>() * MAX_CANDIDATES) as u64;
+        let inflight_request_idx_ring = MultiBufferRing::<u32>::new(
+            ctx,
+            pool,
+            "subchunk_inflight_request_idx",
+            BufferDesc {
+                size:  inflight_lookup_size,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            },
+        );
+
         // Slot directory: CPU-authored contract mapping `directory_index`
         // to a packed `DirEntry`. Sized to [`MAX_CANDIDATES`] entries —
         // trivial 1:1 mapping against the material-storage pool at Step 1.
         // `STORAGE | COPY_DST` so future shader ports can read it via a
         // bind group, and the CPU can patch in per-entry updates via
         // `queue.write_buffer`. The buffer starts zero-initialised
-        // (implicit `DirEntry::empty()`); the first frame's directory
-        // flush populates whatever the residency has decided is resident.
+        // (non-resident, exposure=0); the first frame's directory flush
+        // writes the coord-seeded entries that WorldView::new populated.
         // `COPY_SRC` is load-bearing only for the `debug-state-history`
         // diagnostics path in the game crate: it blits this buffer to a
         // `ReadbackChannel<DirectorySnapshot>` slot each frame so the CPU
@@ -1344,6 +1383,7 @@ impl WorldRenderer {
             prep_request_buf,
             exposure_request_buf,
             exposure_dirty_list_buf,
+            inflight_request_idx_ring,
             slot_directory_buf,
             material_desc_buf,
             material_segment_bufs,
@@ -1670,6 +1710,50 @@ impl WorldRenderer {
         &self.staging_material_ids_ring
     }
 
+    /// Borrow the in-flight request-index lookup ring.
+    ///
+    /// At frame F the CPU writes `current(F + 1)` — the lookup that
+    /// prep@F+1 will read. Prep@F+1 imports `current(frame)` (same slot)
+    /// to find which of its neighbour directory slots were in-flight from
+    /// the previous frame, so it can read their occupancy from the
+    /// previous staging slot instead of from `material_pool`.
+    pub(crate) fn inflight_request_idx_ring(&self) -> &MultiBufferRing<u32> {
+        &self.inflight_request_idx_ring
+    }
+
+    /// Upload the in-flight request-index lookup for the next frame.
+    ///
+    /// `lookup[d]` is the `staging_request_idx` (= `gid.x`) of the prep
+    /// request that targeted directory slot `d` in this frame's batch, or
+    /// [`INFLIGHT_INVALID`] if slot `d` received no request this frame.
+    ///
+    /// The buffer is written into `inflight_request_idx_ring.current(
+    /// frame.plus(1))` — the slot that prep@(frame+1) will read as its
+    /// `current(frame+1)`, following the FIF rotation invariant.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `lookup.len() != MAX_CANDIDATES`.
+    pub fn write_inflight_request_idx(
+        &self,
+        ctx   : &RendererContext,
+        frame : FrameIndex,
+        lookup: &[u32],
+    )
+    {
+        assert_eq!(
+            lookup.len(), MAX_CANDIDATES,
+            "write_inflight_request_idx: lookup must have exactly \
+             {MAX_CANDIDATES} entries (got {})",
+            lookup.len(),
+        );
+        ctx.queue().write_buffer(
+            self.inflight_request_idx_ring.current(frame.plus(1)),
+            0,
+            bytemuck::cast_slice(lookup),
+        );
+    }
+
     pub(crate) fn dirty_list_buf(&self) -> &wgpu::Buffer {
         &self.dirty_list_buf
     }
@@ -1959,14 +2043,15 @@ pub fn subchunk_world(
 /// Register the sub-chunk prep compute pass + dirty-list readback copy
 /// into `graph`.
 ///
-/// Imports the five persistent buffers (prep-requests, material pool,
-/// dirty list, directory, and the current ring slot of staging
-/// occupancy), clears the dirty-list `count` header, dispatches the prep
-/// compute with one workgroup per request, then records a
-/// `copy_buffer_to_buffer` into `readback_dst` — an imported handle
-/// whose destination is typically a
-/// [`ReadbackChannel`](crate::readback::ReadbackChannel) slot reserved for
-/// this frame.
+/// Imports the persistent buffers (prep-requests, material pool, dirty
+/// list, directory, the current ring slot of staging occupancy, the
+/// in-flight request-index lookup for this frame, and the previous
+/// frame's staging occupancy), clears the dirty-list `count` header,
+/// dispatches the prep compute with one workgroup per request, then
+/// records a `copy_buffer_to_buffer` into `readback_dst` — an imported
+/// handle whose destination is typically a
+/// [`ReadbackChannel`](crate::readback::ReadbackChannel) slot reserved
+/// for this frame.
 ///
 /// `gpu_consts` lands at the reflected slot 0 of the prep pipeline. The
 /// prep shader reads `g_consts.levels[level_idx]` through
@@ -1977,13 +2062,18 @@ pub fn subchunk_world(
 /// The caller must:
 /// - Upload `request_count` entries via
 ///   [`WorldRenderer::write_prep_requests`] before graph compile.
+/// - Populate `inflight_request_idx_ring.current(frame)` via
+///   `queue.write_buffer` before graph compile (CPU-authored lookup from
+///   the previous frame's prep batch).
 /// - Size `readback_dst` to at least `size_of::<DirtyReport>()` bytes.
 ///
 /// The material-pool buffer is read by the compute pass as a diff source
-/// *and* as the neighbour-face source for the exposure computation;
-/// callers should be aware that running prep and render in the same graph
-/// produces a read-after-write or write-after-read dependency on
-/// `material_pool_buf` and the current staging ring slot — the graph
+/// *and* as the neighbour-face fallback for the exposure computation;
+/// `staging_occ_ring.previous(frame, 1)` (the previous frame's staging
+/// slot) is consulted first for in-flight neighbours identified via the
+/// lookup. Callers should be aware that running prep and render in the
+/// same graph produces a read-after-write or write-after-read dependency
+/// on `material_pool_buf` and the current staging ring slot — the graph
 /// handles the barrier automatically.
 ///
 /// `frame` selects which slot of the staging ring this dispatch writes
@@ -2011,6 +2101,24 @@ pub fn subchunk_prep(
     let dirty_list_h     = graph.import_buffer(renderer.dirty_list_buf().clone());
     let directory_h      = graph.import_buffer(renderer.slot_directory_buf().as_ref().clone());
 
+    // In-flight lookup for this frame: written by the CPU at frame F-1
+    // into ring slot `current(F)`. Prep@F reads it to discover which
+    // neighbour directory slots have in-flight staging from frame F-1.
+    let inflight_idx_h = graph.import_buffer(
+        renderer.inflight_request_idx_ring().current(frame).clone(),
+    );
+
+    // Previous frame's staging occupancy. Prep@F reads
+    // `staging_occ_ring.previous(F, 1)` — that is slot `(F-1) % N`,
+    // which is exactly the slot prep@(F-1) wrote to. Safe to read here
+    // because the FIF fence guarantees frame F-1's GPU work is complete
+    // before frame F's command buffer executes, and the ring's slot
+    // separation ensures frame F's own write goes to slot `F % N ≠
+    // (F-1) % N` under FIF=2.
+    let staging_occ_prev_h = graph.import_buffer(
+        renderer.staging_occ_ring().previous(frame, 1).clone(),
+    );
+
     // Clear the dirty-list count header. The shader's `InterlockedAdd` on
     // offset 0 accumulates across workgroups, so the count must start at 0
     // every dispatch. Clearing only the 16-byte header (count + 12 pad
@@ -2036,6 +2144,8 @@ pub fn subchunk_prep(
             (4, dirty_list_cleared.into()),
             (5, directory_h.into()),
             (6, staging_mat_ids_h.into()),
+            (7, inflight_idx_h.into()),
+            (8, staging_occ_prev_h.into()),
         ],
     );
 
@@ -2192,7 +2302,7 @@ pub struct PatchCopy {
 /// Register a CPU-scheduled staging→material-pool patch pass into `graph`.
 ///
 /// For each `PatchCopy` in `copies`, records a 64-byte occupancy copy
-/// from `staging_occ_ring[staging_frame][staging_request_idx]` into
+/// from `staging_occ_ring[frame][staging_request_idx]` into
 /// `material_pool_buf[dst_material_slot]`. The copy set is produced by
 /// the CPU retirement logic that walked a previously-completed prep
 /// dispatch's [`DirtyReport`](crate::subchunk::DirtyReport) and made the
@@ -2206,20 +2316,20 @@ pub struct PatchCopy {
 /// A call with an empty `copies` is a no-op and records nothing —
 /// callers do not need to guard at the call site.
 ///
-/// `staging_frame` is the [`FrameIndex`] the retiring dirty list was
-/// dispatched on — typically the `FrameIndex` returned alongside the
-/// dirty report from `ReadbackChannel::take_ready`. It selects the
-/// staging-ring slot that holds the shader-written payloads this patch
-/// will lift into the material pool. Passing the *current* frame here
-/// (instead of the retired frame) routes the copy at a slot whose
-/// contents belong to the *current* frame's prep dispatch — the exact
-/// cross-frame data corruption `failure-staging-not-ringed-after-gid-x-reindexing`
-/// captures.
+/// `frame` is the current [`FrameIndex`] as of the graph build in which
+/// this patch is recorded. The staging-ring slot it selects is identical
+/// to the one that prep wrote when its dirty list was dispatched, by the
+/// FIF rotation invariant: prep at frame F wrote slot `F % N`; patch runs
+/// at frame `F + N`, and `(F + N) % N == F % N`. Passing a stale or
+/// invented frame index is therefore unnecessary — callers supply the
+/// current frame, which the ring maps to the same underlying buffer.
+/// See `knowledge-fif-swapchain-depth-decoupling` and
+/// `failure-staging-not-ringed-after-gid-x-reindexing`.
 pub fn subchunk_patch(
-    graph         : &mut RenderGraph,
-    renderer      : &Arc<WorldRenderer>,
-    copies        : &[PatchCopy],
-    staging_frame : FrameIndex,
+    graph    : &mut RenderGraph,
+    renderer : &Arc<WorldRenderer>,
+    copies   : &[PatchCopy],
+    frame    : FrameIndex,
 )
 {
     if copies.is_empty() {
@@ -2227,7 +2337,7 @@ pub fn subchunk_patch(
     }
 
     let staging_occ_h   = graph.import_buffer(
-        renderer.staging_occ_ring().current(staging_frame).clone(),
+        renderer.staging_occ_ring().current(frame).clone(),
     );
     let material_pool_h = graph.import_buffer(renderer.material_pool_buf().clone());
 
@@ -2284,7 +2394,7 @@ pub struct MaterialPatchCopy {
 ///
 /// For each [`MaterialPatchCopy`], records a 1 KB
 /// [`MATERIAL_BLOCK_BYTES`](MATERIAL_BLOCK_BYTES) copy from
-/// `staging_material_ids_ring[staging_frame][staging_request_idx]` into
+/// `staging_material_ids_ring[frame][staging_request_idx]` into
 /// the appropriate segment buffer at
 /// `(dst_global_slot % SLOTS_PER_SEGMENT) * 1024`. The destination
 /// segment is resolved from `dst_global_slot / SLOTS_PER_SEGMENT` and
@@ -2292,14 +2402,14 @@ pub struct MaterialPatchCopy {
 ///
 /// An empty `copies` slice is a no-op.
 ///
-/// `staging_frame` selects the ring slot; same semantics as
-/// [`subchunk_patch`]'s `staging_frame` — pass the retired frame, not the
-/// current one.
+/// `frame` is the current [`FrameIndex`]. Ring-slot semantics identical to
+/// [`subchunk_patch`]: `current(frame) == current(dispatch_frame)` by the
+/// FIF rotation invariant — see that function's docs for the derivation.
 pub fn subchunk_material_patch(
-    graph         : &mut RenderGraph,
-    renderer      : &Arc<WorldRenderer>,
-    copies        : &[MaterialPatchCopy],
-    staging_frame : FrameIndex,
+    graph    : &mut RenderGraph,
+    renderer : &Arc<WorldRenderer>,
+    copies   : &[MaterialPatchCopy],
+    frame    : FrameIndex,
 )
 {
     if copies.is_empty() {
@@ -2307,7 +2417,7 @@ pub fn subchunk_material_patch(
     }
 
     let staging_mat_ids_h = graph.import_buffer(
-        renderer.staging_material_ids_ring().current(staging_frame).clone(),
+        renderer.staging_material_ids_ring().current(frame).clone(),
     );
 
     // Import every live segment buffer. The pass issues per-copy
@@ -2376,35 +2486,16 @@ mod tests {
     // -- DirEntry bit packing --
 
     #[test]
-    fn dir_entry_empty_is_all_zero() {
-        let e = DirEntry::empty();
-        assert_eq!(e.coord, [0, 0, 0]);
+    fn dir_entry_empty_stamps_coord_with_cleared_bits() {
+        let e = DirEntry::empty([-7, 3, -12]);
+        assert_eq!(e.coord, [-7, 3, -12]);
         assert_eq!(e.bits,  0);
         assert!(!e.is_resident());
         assert_eq!(e.exposure(),      0);
         assert_eq!(e.material_slot(), 0);
         assert_eq!(e.content_version,    0);
         assert_eq!(e.last_synth_version, 0);
-    }
-
-    #[test]
-    fn dir_entry_empty_at_stamps_coord_with_cleared_bits() {
-        let e = DirEntry::empty_at([-7, 3, -12]);
-        assert_eq!(e.coord, [-7, 3, -12]);
-        assert_eq!(e.bits,  0);
-        assert!(!e.is_resident());
-        assert_eq!(e.exposure(),      0);
-        assert_eq!(e.material_slot(), 0);
         assert_eq!(e.material_data_slot, MATERIAL_DATA_SLOT_INVALID);
-    }
-
-    #[test]
-    fn dir_entry_non_resident_carries_invalid_sentinel() {
-        let e = DirEntry::non_resident();
-        assert!(!e.is_resident());
-        assert_eq!(e.material_slot(), MATERIAL_SLOT_INVALID);
-        assert_eq!(e.exposure(),      0);
-        assert!(!e.is_solid());
     }
 
     #[test]
@@ -3192,121 +3283,206 @@ mod tests {
 
     // -- Staging ring rotation (regression: failure-staging-not-ringed-after-gid-x-reindexing) --
     //
-    // Guards the retirement-frame → staging-ring-slot wiring. The bug
-    // this catches: at frame `F + FrameCount`, the retirement for frame
-    // F issues `PatchCopy { staging_request_idx, dst_material_slot }`.
-    // If the patch pass reads staging at the *current* frame's ring
-    // slot instead of frame F's ring slot, it copies the current
-    // frame's prep output (possibly for entirely different coords)
-    // into the retirement's target `material_pool` entries. Under the
-    // pre-ring shape (single buffer), every frame clobbered the same
-    // memory and the bug was structural — hence this test.
+    // Guards the staging-ring slot invariant that makes `subchunk_patch`
+    // correct. The original bug: single staging buffer clobbered across
+    // frames — patch at F+N read F+1's data, not F's. Fix: ring depth N
+    // so each frame owns a distinct slot.
     //
-    // We assert the slot-selection function directly, on the same math
-    // `subchunk_patch` uses (`MultiBufferRing::current(frame)` →
-    // `frame.slot(frame_count)`), because the rest of the wiring is a
-    // thin shell around it. An assertion on the slot index is the
-    // load-bearing property: if the patch pass picks a different slot
-    // than the prep did for the retired frame, the race returns.
+    // The patch node now takes `frame` (the *current* frame at patch
+    // build time) rather than the retired dispatch frame. This is safe
+    // because the ring rotation guarantees
+    //   (F + N) % N  ==  F % N
+    // so `current(patch_frame) == current(dispatch_frame)` — the same
+    // underlying buffer. The load-bearing property is that the
+    // intervening frame F+1 uses the *other* slot, preserving frame F's
+    // staging bytes until the patch at F+N runs.
+    //
+    // We assert the slot-selection arithmetic directly; the rest of the
+    // wiring in `subchunk_patch` is a thin shell around it.
 
-    /// Ring depth N = FIF must place a dispatch's staging write and the
-    /// retirement's read on the *same* ring slot, and that slot must be
-    /// distinct from the slot used by every intervening frame. Written
-    /// against `FrameCount = 2` because that's the pinned FIF for this
-    /// project (see `knowledge-fif-swapchain-depth-decoupling`).
+    /// Ring depth N = FIF places prep's write and patch's read on the
+    /// *same* ring slot (via modular coincidence), while every intervening
+    /// frame uses a distinct slot and cannot clobber the payload.
+    ///
+    /// Written against `FrameCount = 2` (the pinned FIF — see
+    /// `knowledge-fif-swapchain-depth-decoupling`).
     #[test]
     fn staging_ring_slot_for_retired_frame_is_stable_under_fif() {
         use crate::frame::FrameCount;
 
         let fc = FrameCount::new(2).unwrap();
 
-        // Simulate a sequence of frames. At frame F, prep writes ring
-        // slot `F.slot(fc)`. At frame F + FrameCount, the retirement
-        // for frame F is about to run; patch must read the same slot
-        // the prep wrote — `F.slot(fc)` — *not* the current frame's
-        // slot `(F + 2).slot(fc)`.
+        // At frame F, prep writes ring slot `F.slot(fc)`.
+        // Patch builds at frame F + FrameCount and calls
+        // `ring.current(patch_frame)`. Because
+        //   (F + N) % N == F % N,
+        // the patch frame resolves to the same slot as the dispatch
+        // frame — the same wgpu::Buffer.
         //
-        // With FIF=2 the two happen to coincide on the wgpu::Buffer
-        // identity, because the rotation cycles back. But the
-        // intervening frame F+1 uses the *other* slot, so frame F's
-        // staging bytes survive across the FIF window intact. The
-        // buggy "no ring" shape and the "read current frame" shape
-        // both produce different slot indices from this check below,
-        // so the assertion pins the correct relation.
+        // The intervening frame F+1 uses the other slot, so frame F's
+        // staging bytes survive intact across the FIF window.
         for origin in [0u64, 1, 7, 123, u64::MAX - 3] {
-            let dispatch       = FrameIndex::default().plus(origin as u32);
-            let intervening    = dispatch.plus(1);
-            let retire_at      = dispatch.plus(fc.get());
+            let dispatch    = FrameIndex::default().plus(origin as u32);
+            let intervening = dispatch.plus(1);
+            let patch_at    = dispatch.plus(fc.get());
 
-            // Prep at dispatch wrote `dispatch.slot(fc)`. Patch at
-            // retire_at must read the same staging payload, so it
-            // indexes the ring with `dispatch`, not with `retire_at`.
+            // dispatch.slot == patch_at.slot by the FIF modular
+            // invariant: (F + N) % N == F % N.
             assert_eq!(
                 dispatch.slot(fc),
-                retire_at.slot(fc),
-                "FIF=N rotation: dispatch slot and N-later slot must \
-                 coincide by modular arithmetic (guards the ring depth \
-                 invariant)",
+                patch_at.slot(fc),
+                "FIF=N rotation: dispatch slot and N-later (patch) slot \
+                 must coincide by modular arithmetic",
             );
 
-            // But an intervening frame's prep slot must NOT collide
-            // with the dispatch's slot — otherwise frame F's staging
-            // bytes would be clobbered before the retirement reads
-            // them, which is exactly the failure mode.
+            // The intervening frame must use a different slot so it
+            // cannot clobber frame F's staging before patch runs.
             assert_ne!(
                 dispatch.slot(fc),
                 intervening.slot(fc),
                 "intervening frame's ring slot must not clobber \
-                 frame F's staging before retirement consumes it",
+                 frame F's staging before patch consumes it",
             );
-
-            // Witness: the *buggy* "read current frame" version of
-            // patch would use `retire_at.slot(fc)` with the retire
-            // frame's index. Because retire_at == dispatch + N and N =
-            // frame_count, `retire_at.slot(fc) == dispatch.slot(fc)`.
-            // The assertion above already exploits that coincidence.
-            // So the load-bearing check is really the intervening
-            // collision test — if it passes, the ring depth is >= 2.
-            let _ = retire_at;
         }
     }
 
-    /// `subchunk_patch` imports the ring slot for the retirement's
-    /// dispatch frame, *not* the current frame. This test makes the
-    /// wiring visible as a compile-time check on the
-    /// `MultiBufferRing::current(frame)` shape — the function picks
-    /// the staging buffer by the frame the retirement originated on.
-    /// If somebody re-plumbs the patch pass to use a different
-    /// `FrameIndex`, the contract for "which frame's staging does the
-    /// patch read" flips and the test's assertion on slot identity
-    /// fires.
+    /// Scenario-level check of the FIF slot identity for frames 10/11/12.
+    /// Prep dispatches at frame 10; patch builds at frame 12 (10 + FIF).
+    /// Frame 11 is the intervening prep that must not collide.
     #[test]
     fn retired_dispatch_frame_selects_correct_staging_slot() {
         use crate::frame::FrameCount;
 
         let fc = FrameCount::new(2).unwrap();
 
-        // Scenario modelled by the failure: dispatch at frame 10,
-        // retirement at frame 12 (10 + FIF). Between them, frame 11
-        // also dispatched prep (coord C_b) and wrote its own slot.
-        let dispatch   = FrameIndex::default().plus(10);
-        let retire_at  = FrameIndex::default().plus(12);
-        let collision  = FrameIndex::default().plus(11);
+        let dispatch    = FrameIndex::default().plus(10);
+        let patch_at    = FrameIndex::default().plus(12);
+        let intervening = FrameIndex::default().plus(11);
 
-        assert_eq!(dispatch.slot(fc), retire_at.slot(fc));
-        assert_ne!(dispatch.slot(fc), collision.slot(fc));
+        // patch_at and dispatch map to the same slot — so passing either
+        // the current (patch) frame or the dispatch frame into
+        // `ring.current()` yields the same buffer.
+        assert_eq!(dispatch.slot(fc), patch_at.slot(fc));
 
-        // The patch pass must address the ring slot via the
-        // `dispatch` frame index (the frame whose dirty list is
-        // retiring). If it were to use `retire_at` that also happens
-        // to name the same slot under a size-FIF ring — but the
-        // invariant is about *intent*: ring.current(dispatch) ≡
-        // "staging bytes from frame 10's prep". Using a third-frame
-        // index or the intervening `collision` frame would produce a
-        // different slot and surface the bug.
-        assert_ne!(collision.slot(fc), dispatch.slot(fc),
-                   "reading the intervening frame's slot returns coord \
-                    C_b's staging, not C_a's — the old single-buffer bug");
+        // The intervening frame maps to the other slot, proving it
+        // cannot have overwritten frame 10's staging data.
+        assert_ne!(dispatch.slot(fc), intervening.slot(fc),
+                   "intervening frame's ring slot must not alias the \
+                    dispatch slot — the old single-buffer bug");
+    }
+
+    /// New regression: patch at frame F+N using `current(F+N)` must
+    /// resolve to the same ring slot as prep at frame F using `current(F)`.
+    /// This is the FIF rotation invariant that justifies dropping the
+    /// separate `staging_frame` parameter from the patch API.
+    ///
+    /// The invariant holds for any ring depth N and any starting frame F,
+    /// not just FIF=2 — tested across several depths to guard against
+    /// accidental coincidence.
+    #[test]
+    fn patch_frame_equals_dispatch_frame_slot_for_any_fif() {
+        use crate::frame::FrameCount;
+
+        // Test ring depths 2, 3, 4 (the valid FrameCount range, min=2).
+        // Depth 2 is the operational FIF=2 case; 3 and 4 exercise the
+        // general formula without relying on depth-2 coincidence.
+        for depth in [2u32, 3, 4] {
+            let fc = FrameCount::new(depth).unwrap();
+
+            for origin in [0u64, 1, 10, 99, 1000] {
+                let dispatch_frame = FrameIndex::default().plus(origin as u32);
+                let patch_frame    = dispatch_frame.plus(depth); // F + N
+
+                // (F + N) % N == F % N — same slot.
+                assert_eq!(
+                    dispatch_frame.slot(fc),
+                    patch_frame.slot(fc),
+                    "depth={depth}, origin={origin}: \
+                     patch_frame slot must match dispatch_frame slot \
+                     (FIF rotation invariant for dropping staging_frame param)",
+                );
+
+                // Every strictly-between frame uses a different slot
+                // (only meaningful when depth > 1).
+                for k in 1..depth {
+                    let between = dispatch_frame.plus(k);
+                    assert_ne!(
+                        dispatch_frame.slot(fc),
+                        between.slot(fc),
+                        "depth={depth}, origin={origin}, k={k}: \
+                         intervening frame slot must not alias dispatch slot",
+                    );
+                }
+            }
+        }
+    }
+
+    // -- In-flight request-index lookup --
+
+    /// Helper: build a lookup vec as the CPU-side loop in world_view.rs does,
+    /// given a slice of `(directory_index, request_idx)` pairs. Slots not
+    /// mentioned by `entries` receive INFLIGHT_INVALID.
+    fn build_inflight_lookup(
+        capacity : usize,
+        entries  : &[(usize, u32)],
+    )
+        -> Vec<u32>
+    {
+        let mut lookup = vec![INFLIGHT_INVALID; capacity];
+        for &(dir_slot, req_idx) in entries {
+            assert!(dir_slot < capacity, "dir_slot out of range");
+            lookup[dir_slot] = req_idx;
+        }
+        lookup
+    }
+
+    /// Slots mentioned in the batch receive the correct request index.
+    #[test]
+    fn inflight_lookup_populated_slots_match_request_index() {
+        let lookup = build_inflight_lookup(256, &[
+            (0,   0),
+            (7,   1),
+            (255, 2),
+        ]);
+        assert_eq!(lookup[0],   0);
+        assert_eq!(lookup[7],   1);
+        assert_eq!(lookup[255], 2);
+    }
+
+    /// Slots not mentioned in the batch carry INFLIGHT_INVALID.
+    #[test]
+    fn inflight_lookup_unpopulated_slots_are_sentinel() {
+        let lookup = build_inflight_lookup(256, &[(5, 0)]);
+        for (i, &v) in lookup.iter().enumerate() {
+            if i == 5 {
+                assert_eq!(v, 0, "slot 5 should be request index 0");
+            } else {
+                assert_eq!(v, INFLIGHT_INVALID, "slot {i} should be INFLIGHT_INVALID");
+            }
+        }
+    }
+
+    /// An empty batch produces an all-INFLIGHT_INVALID lookup.
+    #[test]
+    fn inflight_lookup_empty_batch_is_all_invalid() {
+        let lookup = build_inflight_lookup(256, &[]);
+        assert!(lookup.iter().all(|&v| v == INFLIGHT_INVALID));
+    }
+
+    /// The lookup is a flat array whose size equals MAX_CANDIDATES, confirming
+    /// it can be uploaded directly to `inflight_request_idx_ring` whose GPU
+    /// buffer is sized to MAX_CANDIDATES * size_of::<u32>() bytes.
+    #[test]
+    fn inflight_lookup_capacity_equals_max_candidates() {
+        let lookup = build_inflight_lookup(MAX_CANDIDATES, &[]);
+        assert_eq!(lookup.len(), MAX_CANDIDATES);
+    }
+
+    /// INFLIGHT_INVALID matches the sentinel value the HLSL shader tests for.
+    /// If either side changes, the behaviour contract breaks silently.
+    #[test]
+    fn inflight_invalid_sentinel_is_all_ones_u32() {
+        assert_eq!(INFLIGHT_INVALID, u32::MAX);
     }
 }
 
