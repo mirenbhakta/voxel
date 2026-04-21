@@ -238,25 +238,172 @@ uint2 synthesize_coarser_face(
     return face;
 }
 
-// Resolve neighbour face at the appropriate LOD with same-level →
-// coarser super-sample fallback. This is the cross-LOD frontend used by
-// `compute_exposure_mask`; encapsulates the priority order so the loop
-// over directions stays tight.
+// Sub-sample fallback for the *inner* boundary of the L_n shell: where
+// the L_{n-1} shell covers the neighbour cell, L_{n-1} sub-chunks are the
+// ones actually rasterising the visible surface, not the L_n OR-reduction
+// that `neighbour_opposing_face` would surface. Reading the L_n face there
+// under-reports exposure — a coarse face bit is 1 whenever *any* fine
+// child is solid, yet the fine rasterisation may still have gaps through
+// which my L_n face is visible, and those gaps should re-expose my face.
 //
-// Sub-sample (finer-LOD fallback) is intentionally NOT implemented here.
-// Under the current nested-shell topology (every L_{n-1} shell is fully
-// contained in its L_n shell — see `decision-lod-nested-shells-
-// hierarchical-occupancy`), the same-level neighbour always exists at
-// an L_n sub-chunk's *inner* boundary against L_{n-1} (the L_n entry is
-// resident, just culled from rendering), so the finer-LOD fallback case
-// never fires. The decision doc lists sub-sample for completeness;
-// adding it without a topology change would be dead code. Revisit if
-// the shell layout ever becomes annular or per-level non-nested.
+// Builds a synthesised L_n-resolution face by AND-reducing each 2×2 block
+// of L_{n-1} face cells. The polarity is inverse to `synthesize_coarser_
+// face`: the coarse OR-reduction says "solid if any fine is solid" (right
+// for primary visibility), but for my-face exposure we need "coarse face
+// blocks me iff *every* fine cover is solid" — the AND. A single empty
+// fine cell in the 2×2 leaves a gap, which is what the exposure test must
+// see.
+//
+// Returns `false` (and leaves `face` zeroed) when `my_level == 0` (no
+// finer level) or when any of the four face-plane L_{n-1} sub-chunks
+// fails `resolve_and_verify`. The all-four-resident requirement matches
+// the nested-shell invariant: inside the L_{n-1} shell, all four are
+// resident; outside it, none are. The partial-coverage case (shell edge
+// crossing an L_n face) is not reachable under axis-aligned nested shells,
+// so the all-or-nothing check is complete for the current topology.
+//
+// # Coordinate mapping
+//
+// Each L_n sub-chunk covers 2×2×2 L_{n-1} sub-chunks. The four L_{n-1}
+// sub-chunks on the face plane of my neighbour (the ones whose own face
+// meets mine) are at coord `nbr_coord_Ln * 2 + axis_offset_{along_axis}
+// + (i, j)_{free_axes}` for i, j ∈ {0, 1}. `axis_offset = 1 - (dir_idx &
+// 1)` pins the L_{n-1} sub-chunk to the side of the L_n neighbour that
+// meets me. Within each L_{n-1} sub-chunk, the row/column of face cells
+// meeting me is at within-axis coord `0` or `7` (same polarity).
+//
+// Each L_n face cell (a, b) ∈ [0, 8)² covers L_{n-1} face cells at
+// (2a..2a+1, 2b..2b+1). Those four fine cells all belong to the single
+// L_{n-1} sub-chunk at (i = a >> 2, j = b >> 2) — since each L_{n-1}
+// contributes 8 L_{n-1} face cells = 4 L_n face cells along each free
+// axis. Within that sub-chunk, the four cells are at within-free-axis
+// coords ((a & 3) << 1, (a & 3) << 1 + 1) × ((b & 3) << 1, (b & 3) << 1
+// + 1).
+bool sub_sample_finer_face(
+    int3 nbr_coord_Ln,
+    uint my_level,
+    uint dir_idx,
+    out uint2 face
+) {
+    face = uint2(0u, 0u);
+    if (my_level == 0u) {
+        return false;
+    }
+
+    uint finer_level = my_level - 1u;
+    int3 base        = nbr_coord_Ln * 2;
+    uint axis        = dir_idx >> 1u;            // 0=X, 1=Y, 2=Z
+    uint axis_offset = 1u - (dir_idx & 1u);      // 1 on -dir (nbr's +axis face), 0 on +dir
+    uint within_axis = axis_offset == 1u ? 7u : 0u;
+
+    // Resolve all four face-plane finer sub-chunks, keyed by (i, j) ∈
+    // {0, 1}² mapping onto the two free axes of this direction. The
+    // `i * 2 + j` flattening avoids HLSL's patchy support for
+    // multi-dimensional arrays of user-defined structs.
+    DirEntry fe[4];
+    [unroll] for (uint i = 0u; i < 2u; ++i) {
+        [unroll] for (uint j = 0u; j < 2u; ++j) {
+            int3 off;
+            if (axis == 0u) {
+                off = int3(int(axis_offset), int(i), int(j));
+            } else if (axis == 1u) {
+                off = int3(int(i), int(axis_offset), int(j));
+            } else {
+                off = int3(int(i), int(j), int(axis_offset));
+            }
+            int3 finer_coord = base + off;
+            uint finer_slot;
+            if (!resolve_and_verify(
+                    finer_coord, finer_level, g_directory, finer_slot)) {
+                return false;
+            }
+            fe[i * 2u + j] = g_directory[finer_slot];
+        }
+    }
+
+    // Build the 8×8 L_n face by AND-reducing 2×2 L_{n-1} face cells into
+    // each L_n face bit.
+    [loop] for (uint b = 0u; b < 8u; ++b) {
+        [loop] for (uint a = 0u; a < 8u; ++a) {
+            uint     i = a >> 2u;
+            uint     j = b >> 2u;
+            DirEntry e = fe[i * 2u + j];
+
+            uint all_solid;
+            if (direntry_is_solid(e)) {
+                all_solid = 1u;
+            } else if (!direntry_has_material(e)) {
+                all_solid = 0u;
+            } else {
+                uint      mslot = direntry_get_material_slot(e);
+                Occupancy o     = g_material_pool[mslot];
+                uint      wa0   = (a & 3u) << 1u;
+                uint      wb0   = (b & 3u) << 1u;
+                uint      acc   = 1u;
+                [unroll] for (uint db = 0u; db < 2u; ++db) {
+                    [unroll] for (uint da = 0u; da < 2u; ++da) {
+                        uint wa = wa0 + da;
+                        uint wb = wb0 + db;
+                        uint cx, cy, cz;
+                        if (axis == 0u) {
+                            cx = within_axis; cy = wa; cz = wb;
+                        } else if (axis == 1u) {
+                            cx = wa; cy = within_axis; cz = wb;
+                        } else {
+                            cx = wa; cy = wb; cz = within_axis;
+                        }
+                        if (read_cell_bit(o, cx, cy, cz) == 0u) {
+                            acc = 0u;
+                        }
+                    }
+                }
+                all_solid = acc;
+            }
+
+            if (all_solid != 0u) {
+                uint pos = (b & 3u) * 8u + a;
+                if (b < 4u) { face.x |= (1u << pos); }
+                else        { face.y |= (1u << pos); }
+            }
+        }
+    }
+    return true;
+}
+
+// Resolve the neighbour face at the resolution actually rendered there.
+// Priority:
+//
+//   1. Finer (sub-sample, `my_level > 0`) — the *inner* L_n boundary
+//      case. When the L_{n-1} shell covers this neighbour cell, L_{n-1}
+//      is rasterising it, and the L_n entry (resident for OR-reduction)
+//      is not what's on screen. Read L_{n-1} directly. See
+//      `sub_sample_finer_face` for the AND-reduction rationale.
+//   2. Same-level — the typical case: L_n neighbour is in the L_n shell
+//      but outside the L_{n-1} shell, so L_n is what draws there.
+//   3. Coarser (super-sample) — the *outer* L_n boundary case, where the
+//      L_n neighbour is outside the L_n shell and L_{n+1} takes over.
+//
+// Why finer is checked first and not as a fallback: at the inner
+// boundary the L_n neighbour is resident, so `neighbour_opposing_face`
+// returns `resolved=true` with the stale OR-reduced face. A fallback
+// ordering would never reach the finer path. The cost of the leading
+// check away from the inner boundary is a single `resolve_and_verify` on
+// an L_{n-1} coord that's outside the L_{n-1} shell — it fails and we
+// fall straight through to same-level.
 uint2 resolve_neighbour_face(
     int3 nbr_coord_Ln,
     uint my_level,
     uint dir_idx
 ) {
+    // Inner-boundary path: prefer L_{n-1} when all four face-plane finer
+    // sub-chunks are resident.
+    if (my_level > 0u) {
+        uint2 finer_face;
+        if (sub_sample_finer_face(nbr_coord_Ln, my_level, dir_idx, finer_face)) {
+            return finer_face;
+        }
+    }
+
     NeighbourFace same = neighbour_opposing_face(nbr_coord_Ln, my_level, dir_idx);
     if (same.resolved) {
         return same.face;
