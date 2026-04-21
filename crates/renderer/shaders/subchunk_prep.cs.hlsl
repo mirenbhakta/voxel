@@ -187,18 +187,39 @@ bool terrain_occupied(float3 wp) {
 // cells)` reduction down to its base case: an L-voxel is solid iff any
 // L_0 cell it covers is solid.
 //
-// This fused variant *additionally* returns the **plurality** material
-// ID across all solid L_0 cells in the footprint (ties broken by lower
-// block id), so the caller doesn't need a second pass. Choosing by
-// plurality is position-agnostic — it doesn't privilege any axis, so
-// it works for heightfields, 3D-noise worlds, asteroid fields, caves,
-// and overhangs alike. `out_mat` is `BLOCK_ID_AIR` when the return
-// value is false.
+// This fused variant *additionally* returns a representative material
+// ID so the caller doesn't need a second pass. The picker is:
+//
+//   1. Plurality of **surface-exposed** L_0 cells — cells whose own L_0
+//      neighbour in at least one of the 6 axis directions is empty.
+//   2. Plurality of all solid L_0 cells, as a fallback when no cell is
+//      surface-exposed (fully-interior coarse voxels, which are always
+//      culled as renderables because every axis-aligned coarse neighbour
+//      is also solid; the material only ever surfaces if the view-time
+//      coarse-vs-finer LOD mix draws a face we didn't predict would be
+//      exposed, and any bulk material is acceptable there).
+//
+// Why surface-exposed and not plain plurality:
+//   A coarse voxel is rendered as a cube; what the viewer sees is its
+//   outer face into air. The L_0 cells whose material that face shows
+//   are exactly the ones on the boundary between solid and empty at
+//   L_0. In a heightfield column, that's 1 grass cell vs 2 dirt vs K
+//   stone — plain plurality over all solid cells structurally picks
+//   dirt or stone (thicker layer) and the visible surface never shows
+//   grass at coarse LODs. Selecting from surface-exposed cells only
+//   inverts that: grass dominates because every surface cell *is*
+//   grass, while dirt/stone are never surface-exposed under the grass.
+//   Position-agnostic (no privileged axis) — the same rule handles
+//   asteroid outer shells, player builds, and caves/overhangs without
+//   content-specific heuristics.
 //
 // L_0 cells inside the L-voxel sit at integer world-space lower corners
 // in `[0, 2^lvl)^3` relative to `coarse_base_wp`. Centres are offset by
 // `+ 0.5` along each axis (matching `terrain_occupied`'s "voxel centre"
-// contract on the L_0 grid).
+// contract on the L_0 grid). Neighbour probes cross the footprint
+// boundary freely: `terrain_occupied` is a pure `(coord, seed) → bool`
+// function, so evaluating outside the footprint is correct, not a
+// conservative guess.
 //
 // Property (load-bearing for step 3 — cross-LOD sub/super-sample):
 //   coarse_occupied(lvl, p) == false ⇒ every L_0 cell inside the L-voxel
@@ -206,46 +227,86 @@ bool terrain_occupied(float3 wp) {
 // Equivalently, the predicate is monotone-conservative: an L-voxel is
 // guaranteed to be solid whenever any covered finer cell is solid.
 //
-// Cost: O(8^lvl) density evals per L-voxel. At lvl=0 this collapses to
-// a single eval (extent=1, one iteration). Coarser LODs walk the full
-// footprint without early-out because the plurality needs the full
-// count — this is roughly `64 · 8^lvl` ALU cycles per L-voxel
-// (dominant cost is the FBM evaluation inside `terrain_occupied`). At
-// L=2 that's ~4k cycles per voxel; M1 doesn't go coarser than this.
-// When a future LOD ceiling makes this painful, swap the count loop
-// for a stratified subsample or hash-selected representative cell.
+// Cost: ~7× the pure footprint walk. Each solid L_0 cell does 1 own
+// density eval + up to 6 neighbour density evals (short-circuited via
+// `||`, so most surface-edge cells exit after 1-2 probes). At L=0 the
+// 6-neighbour check still runs on a single-cell footprint — it produces
+// the same single-cell material the prior implementation returned, and
+// the cost is ~7 evals vs the previous 1. At the deepest LOD the
+// material-data pool covers (L=4, extent=16), the worst-case bound is
+// ~28k evals per coarse voxel vs 4k previously; still well inside the
+// per-dispatch cost budget (prep runs on residency events, not per
+// frame). When a future LOD ceiling makes this painful, cache the
+// 2^(3·lvl) footprint occupancies and reuse the cache for neighbour
+// probes of interior cells — internal cells amortise to zero extra
+// evals, the outer shell retains up to 3 outside-footprint probes each.
 bool coarse_occupied(uint lvl, float3 coarse_base_wp, out uint out_mat) {
     uint extent = 1u << lvl;
 
     // Counts per block id. The registry has up to 4 entries in M1
-    // (air / grass / dirt / stone); resize this array if the registry
-    // grows. Index 0 (AIR) is never incremented — air cells fall out
-    // of `terrain_occupied`.
-    uint counts[4] = { 0u, 0u, 0u, 0u };
+    // (air / grass / dirt / stone); resize if the registry grows. Index
+    // 0 (AIR) is never incremented — air cells fall out of
+    // `terrain_occupied`.
+    //
+    // Two parallel counters:
+    //   surface_counts — solid cells with at least one empty L_0 neighbour
+    //   all_counts     — all solid cells (fallback for fully-interior)
+    uint surface_counts[4] = { 0u, 0u, 0u, 0u };
+    uint all_counts[4]     = { 0u, 0u, 0u, 0u };
 
     [loop] for (uint dz = 0u; dz < extent; ++dz) {
         [loop] for (uint dy = 0u; dy < extent; ++dy) {
             [loop] for (uint dx = 0u; dx < extent; ++dx) {
                 float3 wp = coarse_base_wp + float3(dx, dy, dz) + 0.5;
-                if (terrain_occupied(wp)) {
-                    uint mat = terrain_material(wp, g_consts.world_seed);
-                    if (mat < 4u) {
-                        counts[mat] += 1u;
-                    }
+                if (!terrain_occupied(wp)) {
+                    continue;
+                }
+                uint mat = terrain_material(wp, g_consts.world_seed);
+                if (mat >= 4u) {
+                    continue;
+                }
+                all_counts[mat] += 1u;
+
+                // L_0-spacing neighbour probes. `||` short-circuits, so
+                // most surface cells exit after the first or second hit.
+                // +Y leads because the heightfield's surface grass layer
+                // has its empty neighbour directly above; other terrains
+                // will hit a different axis first but the ordering is a
+                // perf hint, not a correctness dependency.
+                bool exposed =
+                       !terrain_occupied(wp + float3( 0.0,  1.0,  0.0))
+                    || !terrain_occupied(wp + float3(-1.0,  0.0,  0.0))
+                    || !terrain_occupied(wp + float3( 1.0,  0.0,  0.0))
+                    || !terrain_occupied(wp + float3( 0.0,  0.0, -1.0))
+                    || !terrain_occupied(wp + float3( 0.0,  0.0,  1.0))
+                    || !terrain_occupied(wp + float3( 0.0, -1.0,  0.0));
+                if (exposed) {
+                    surface_counts[mat] += 1u;
                 }
             }
         }
     }
 
-    // Plurality pick, skipping AIR. A solid L-voxel has at least one
-    // non-AIR count > 0; an empty L-voxel leaves all counts at 0 and
-    // out_mat falls through to AIR + return false.
+    // Plurality pick, skipping AIR. Try surface-exposed first; a non-
+    // empty surface count means some L_0 cell in the footprint actually
+    // faces air and is what the viewer will see. Fall back to all
+    // solid cells only when nothing is exposed (fully-interior coarse
+    // voxel — its face only draws under a cross-LOD mismatch at render
+    // time, and any material choice is acceptable there).
     uint best_mat   = BLOCK_ID_AIR;
     uint best_count = 0u;
     [unroll] for (uint i = 1u; i < 4u; ++i) {
-        if (counts[i] > best_count) {
-            best_count = counts[i];
+        if (surface_counts[i] > best_count) {
+            best_count = surface_counts[i];
             best_mat   = i;
+        }
+    }
+    if (best_count == 0u) {
+        [unroll] for (uint j = 1u; j < 4u; ++j) {
+            if (all_counts[j] > best_count) {
+                best_count = all_counts[j];
+                best_mat   = j;
+            }
         }
     }
 
