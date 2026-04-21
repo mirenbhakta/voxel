@@ -7,11 +7,10 @@ model: sonnet
 
 # Setup
 
-The project has conventions in `CLAUDE.md`, `.claude/context/rust.md` (formatting), and `.claude/context/docs.md` (documentation style). Read these **only when needed** for the task at hand:
+Formatting lives in `.claude/context/rust.md` and documentation style in `.claude/context/docs.md`. Read these **only when needed** for the task at hand:
 - Writing or modifying code → read `rust.md` for formatting conventions.
 - Writing or modifying documentation → read `docs.md` for doc style.
-- Unsure about project structure or conventions → read `CLAUDE.md`.
-Do not read all three upfront. Load what the task requires.
+Do not read both upfront. Load what the task requires.
 
 **Before writing code:** Search for existing APIs and prior decisions before implementing anything.
 - `search_graph(name_pattern)` — find relevant functions/types by name

@@ -16,9 +16,9 @@ You do not edit files. You read what was changed and verify it against rules.
 
 # Setup
 
-**Before doing anything else**, read the project's `CLAUDE.md`,
-`.claude/context/rust.md`, and `.claude/context/docs.md`. All rules defined
-there are your review criteria.
+**Before doing anything else**, read `.claude/context/rust.md` and
+`.claude/context/docs.md`. All rules defined there, together with the
+already-loaded `CLAUDE.md`, are your review criteria.
 
 # Inputs
 

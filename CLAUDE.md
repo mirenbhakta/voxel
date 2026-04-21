@@ -305,7 +305,7 @@ When a pause is warranted, the move is simple: state what you are seeing, state 
 - **Revert failed fixes.** If an attempted fix does not resolve the issue, revert it completely before trying the next approach. One bug, one fix. No accumulation of half-attempts in the code.
 - **Clean up on redirection.** If the user redirects the approach, clean up any partial work before changing direction. Atomic changes give a clearer signal than compounded changes.
 - **Use the right tools.** Use Read and Edit for file operations, not `sed` or `awk`. These dedicated tools are blanket-approved and avoid unnecessary permission prompts. `sed` is only acceptable for batch regex replacements across many files where Edit would be impractical.
-- **Investigate before fixing.** When debugging, understand the system before changing it. Build a mental model of the subsystem, form hypotheses with evidence, and add targeted debug logging to trace runtime state. For non-trivial bugs, use the `debug` agent for a structured investigation-then-fix workflow.
+- **Investigate before fixing.** When debugging, understand the system before changing it. Build a mental model of the subsystem, form hypotheses with evidence, and add targeted debug logging to trace runtime state.
 - **Verify thoroughly.** Run the project's build and test tools before reporting completion. Report the actual output, including failures — they are the most valuable signal for getting to a correct solution. If a check was not run, say that.
 
 ## Agentic Memory

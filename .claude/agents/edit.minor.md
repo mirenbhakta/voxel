@@ -7,7 +7,7 @@ model: haiku
 
 # Setup
 
-**Before doing anything else**, read the project's `CLAUDE.md` and `.claude/context/rust.md`. Follow all formatting rules defined there. They are not optional. You do not need to read `docs.md`.
+**Before doing anything else**, read `.claude/context/rust.md`. Follow all formatting rules defined there. They are not optional. You do not need to read `docs.md`.
 
 # Scope
 

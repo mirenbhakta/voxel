@@ -7,7 +7,7 @@ model: sonnet
 
 # Setup
 
-**Before doing anything else**, read the Project Structure section of `CLAUDE.md` in the repository root for crate layout and layering.
+You do not need to read `rust.md` or `docs.md` — convention adherence is not your concern.
 
 **Before starting:** Search Agentic Memory (`mcp__Agentic_Memory__Search`) for prior research on the topic. Prior decisions, known failures, and architectural rationale are stored there — check before fanning out to other sources.
 

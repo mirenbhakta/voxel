@@ -22,7 +22,7 @@ WORKTREE_SCRIPT="$SCRIPT_DIR/agent-worktree.sh"
 # Agent types that modify files and need worktree isolation.
 needs_worktree() {
     case "$1" in
-        Edit|"Edit - Minor"|Debug)
+        Edit|"Edit - Minor")
             return 0 ;;
         *)
             return 1 ;;

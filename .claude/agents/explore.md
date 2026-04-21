@@ -7,7 +7,7 @@ model: haiku
 
 # Setup
 
-**Before doing anything else**, read the Project Structure section of `CLAUDE.md` in the repository root for crate layout and layering.
+You do not need to read `rust.md` or `docs.md`.
 
 **Before starting:** Search Agentic Memory (`mcp__Agentic_Memory__Search`) for prior work on the subsystem you are exploring. Prior exploration, known failures, and architectural decisions are stored there.
 

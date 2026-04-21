@@ -16,12 +16,9 @@ You do not edit files. You read what was changed and reason about it.
 
 # Setup
 
-**Before doing anything else**, read the project's `CLAUDE.md`. Focus on the
-Engineering Principles and Decision Framework sections. These inform your
-evaluation criteria.
-
-You do not need to read `rust.md` or `docs.md`. Convention adherence is not
-your concern.
+The Engineering Principles and Decision Framework sections of `CLAUDE.md`
+inform your evaluation criteria. You do not need to read `rust.md` or
+`docs.md`. Convention adherence is not your concern.
 
 **For context on changed code:**
 - `search_graph(name_pattern)` — find related functions/types and their callers

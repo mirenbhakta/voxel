@@ -20,8 +20,9 @@ the same thing as nested character classes.
 
 The grammar accepted by this matcher is intentionally narrow:
 
+    toplevel   := pipeline ('&&' pipeline)*
     pipeline   := command ('|' command)*
-    command    := word token*
+    command    := (NAME '=' value)* word token*
     token      := positional | short_flag | long_flag | string | redirect | dashdash
     short_flag := '-' [A-Za-z] [A-Za-z0-9-]* ('=' value)?
     long_flag  := '--' name ('=' value)?
@@ -30,10 +31,17 @@ The grammar accepted by this matcher is intentionally narrow:
     redirect   := '2>&1' | '2>/dev/null'   (whitelist; nothing else)
     dashdash   := '--'
 
-Anything outside this grammar -- '&&', ';', '||', backticks, '$()', '<',
-'>' (other than the whitelisted redirects), or any token containing shell
-metacharacters -- causes parsing to fail and the matcher exits with no
-output (fall through to manual review).
+A toplevel with multiple '&&'-joined pipelines classifies as ALLOW only
+when every pipeline would ALLOW on its own. If any pipeline is NOLOG the
+whole chain is NOLOG; if any pipeline would fall through, the whole chain
+falls through.
+
+Anything outside this grammar -- ';', '||', backticks, '$()', '<',
+'>' (other than the whitelisted redirects), loops like 'for/while ... do
+... done', or any token containing shell metacharacters -- causes parsing
+to fail and the matcher exits with no output (fall through to manual
+review). Loops are additionally caught by a pre-parse NOLOG rule so they
+do not spam the fallthrough corpus.
 """
 
 from __future__ import annotations
@@ -54,6 +62,11 @@ from typing import Iterable, Optional
 # backticks, semicolons, ampersands, pipes, angle brackets, parentheses,
 # braces (except {} which we allow for git revs), brackets.
 SAFE_WORD_RE = re.compile(r"^[A-Za-z0-9_./,=:@#+?~^!{}@-]+$")
+
+# Leading env var prefix like `FOO=bar cmd ...`. The value portion must
+# still match SAFE_WORD_RE, so values containing whitespace, quotes, or
+# shell metacharacters are rejected.
+ENV_VAR_RE = re.compile(r"^[A-Z_][A-Z0-9_]*=")
 
 # Whitelisted redirect tokens. Anything else with > or < fails to parse.
 WHITELIST_REDIRECTS = {"2>&1", "2>/dev/null", "1>/dev/null", "&>/dev/null"}
@@ -112,11 +125,15 @@ class ParseError(Exception):
 VERB_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
 
-def parse(cmd: str) -> Pipeline:
+def parse(cmd: str) -> list[Pipeline]:
     """
-    Parse a bash command string into a typed Pipeline.
+    Parse a bash command string into one or more typed Pipelines.
 
-    Raises ParseError if the command contains constructs outside the
+    The top level is split on unquoted `&&` so each sub-command is parsed
+    independently. Classification then decides per-pipeline, with the
+    chain approved only when every sub-pipeline would be approved.
+
+    Raises ParseError if any sub-command contains constructs outside the
     accepted grammar.
     """
 
@@ -126,9 +143,20 @@ def parse(cmd: str) -> Pipeline:
     if "$(" in cmd or "`" in cmd or "${" in cmd:
         raise ParseError("command substitution not allowed")
 
-    # Reject other shell control constructs (&&, ||, ;, here-docs,
-    # redirects other than the whitelist) when they appear outside
-    # quoted regions.
+    parts = _split_conjoined(cmd)
+    if not parts:
+        raise ParseError("empty command")
+
+    return [_parse_pipeline(part) for part in parts]
+
+
+def _parse_pipeline(cmd: str) -> Pipeline:
+    """Parse one pipeline (no top-level `&&`)."""
+
+    # Reject other shell control constructs (||, ;, here-docs, redirects
+    # other than the whitelist) when they appear outside quoted regions.
+    # `&&` is already consumed by the top-level splitter, so a raw `&&`
+    # reaching here indicates a malformed split and is rejected.
     _reject_unquoted_metas(cmd)
 
     try:
@@ -154,9 +182,71 @@ def parse(cmd: str) -> Pipeline:
     return Pipeline(commands=commands)
 
 
+def _split_conjoined(cmd: str) -> list[str]:
+    """
+    Split a command string on unquoted `&&` boundaries.
+
+    Quoted regions (single- or double-quoted) are treated as opaque, so
+    `echo "a && b"` stays a single command. Backslash escapes inside
+    double quotes are honored; nothing else inside quotes is interpreted.
+
+    Returns the list of trimmed sub-command strings. Empty segments
+    indicate malformed input and are preserved as empty strings for the
+    caller to reject via ParseError.
+    """
+
+    parts: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    i = 0
+    n = len(cmd)
+
+    while i < n:
+        c = cmd[i]
+
+        # Pass through backslash-escaped character inside double quotes.
+        if in_double and c == "\\" and i + 1 < n:
+            current.append(c)
+            current.append(cmd[i + 1])
+            i += 2
+            continue
+
+        if c == "'" and not in_double:
+            in_single = not in_single
+            current.append(c)
+            i += 1
+            continue
+
+        if c == '"' and not in_single:
+            in_double = not in_double
+            current.append(c)
+            i += 1
+            continue
+
+        if (
+            not in_single
+            and not in_double
+            and c == "&"
+            and i + 1 < n
+            and cmd[i + 1] == "&"
+        ):
+            parts.append("".join(current).strip())
+            current = []
+            i += 2
+            continue
+
+        current.append(c)
+        i += 1
+
+    parts.append("".join(current).strip())
+    return [p for p in parts if p]
+
+
 # Patterns of unquoted shell metacharacters that the matcher refuses to
 # touch. We strip quoted regions before scanning so that quoted content can
-# legitimately contain these characters.
+# legitimately contain these characters. `&&` is handled by the top-level
+# splitter; a bare `&&` reaching this check indicates an error.
 _DISALLOWED_UNQUOTED = re.compile(r"(&&|\|\||;|`|\$\(|\$\{|>>|<<|<|>(?!&[12]?$|/dev/null))")
 
 
@@ -187,6 +277,22 @@ def _parse_segment(tokens: list[str]) -> Cmd:
 
     if not tokens:
         raise ParseError("empty segment")
+
+    # Strip leading `NAME=value` env var prefixes. Only well-formed env
+    # names (uppercase + digits + underscore) are consumed; anything else
+    # stays in the token stream and fails the command-name check below.
+    # Values must satisfy SAFE_WORD_RE, which rejects shell metacharacters.
+    i = 0
+    while i < len(tokens) and ENV_VAR_RE.match(tokens[i]):
+        _, _, value = tokens[i].partition("=")
+        if value and not SAFE_WORD_RE.match(value):
+            raise ParseError(f"unsafe env var value: {tokens[i]!r}")
+        i += 1
+
+    if i >= len(tokens):
+        raise ParseError("env var prefix with no command")
+
+    tokens = tokens[i:]
 
     name = tokens[0]
     # The command name itself must be a safe word or absolute path.
@@ -332,7 +438,7 @@ GIT_READ = {
 # but also do NOT log to the fallthrough corpus -- the user always wants
 # to confirm these manually.
 GIT_NOLOG = {
-    "commit", "push", "reset", "rebase", "merge", "cherry-pick", "am",
+    "add", "commit", "push", "reset", "rebase", "merge", "cherry-pick", "am",
     "revert", "gc", "prune", "filter-branch", "filter-repo", "update-ref",
     "update-index", "apply", "format-patch", "send-email", "request-pull",
     "bundle", "svn", "p4",
@@ -366,6 +472,34 @@ SAFE_SYSTEM_INFO = {
     "uname", "lscpu", "free", "df", "nproc", "date", "env", "pwd", "id",
     "whoami", "hostname", "which", "type", "command",
 }
+
+
+def cargo_package(c: Cmd) -> Optional[str]:
+    """
+    Extract the `-p <name>` or `--package <name>` value from a cargo
+    command. Returns None if no package flag is present. Supports both
+    the separate-token (`-p eden-efxc`) and combined (`-p=eden-efxc`,
+    `--package=eden-efxc`) forms.
+    """
+    for i, t in enumerate(c.args):
+        if t.kind == "short_flag" and t.value == "p":
+            if t.flag_value is not None:
+                return t.flag_value
+            if i + 1 < len(c.args) and c.args[i + 1].kind == "positional":
+                return c.args[i + 1].value
+        if t.kind == "long_flag" and t.value == "package":
+            if t.flag_value is not None:
+                return t.flag_value
+            if i + 1 < len(c.args) and c.args[i + 1].kind == "positional":
+                return c.args[i + 1].value
+    return None
+
+
+# Packages for which `cargo run` is auto-approved. These are project-local
+# tools with no side effects beyond their own stdout, so running them is
+# equivalent to running any other read-only command. Adding to this set
+# requires the same scrutiny as adding to CARGO_READ.
+CARGO_RUN_ALLOWED_PACKAGES: set[str] = set()
 
 
 def is_gh_read(c: Cmd) -> bool:
@@ -421,6 +555,12 @@ def classify(p: Pipeline) -> Decision:
     if head.name == "cargo" and head.sub in CARGO_READ and tail_safe:
         return Allow(f"cargo {head.sub}")
 
+    # --- Cargo run, restricted to explicitly whitelisted packages ---
+    if head.name == "cargo" and head.sub == "run" and tail_safe:
+        pkg = cargo_package(head)
+        if pkg in CARGO_RUN_ALLOWED_PACKAGES:
+            return Allow(f"cargo run -p {pkg}")
+
     # --- Bare git read verbs ---
     if head.name == "git" and head.sub in GIT_READ and tail_safe:
         return Allow(f"git {head.sub}")
@@ -458,6 +598,45 @@ def classify(p: Pipeline) -> Decision:
             return Allow(f"exec wrapper: {head.name}")
 
     return None
+
+
+def classify_toplevel(pipelines: list[Pipeline]) -> Decision:
+    """
+    Combine per-pipeline decisions for an `&&`-joined chain.
+
+    Precedence: fallthrough > NOLOG > ALLOW. The chain is auto-approved
+    only when every sub-pipeline is individually ALLOW. Any NOLOG segment
+    demotes the chain to NOLOG (manual approval, no log spam). Any
+    fall-through segment demotes the chain to fall-through.
+    """
+
+    if not pipelines:
+        return None
+
+    decisions = [classify(p) for p in pipelines]
+
+    # Any fall-through drops the whole chain to manual review with logging.
+    if any(d is None for d in decisions):
+        return None
+
+    # Any NOLOG drops the chain to manual review without logging.
+    nolog_reasons = [d.reason for d in decisions if isinstance(d, NoLog)]
+    if nolog_reasons:
+        return NoLog(" && ".join(nolog_reasons))
+
+    # Every segment is ALLOW.
+    reasons = [d.reason for d in decisions if isinstance(d, Allow)]
+    return Allow(" && ".join(reasons))
+
+
+# Shell loop keywords that always require manual review but are common
+# enough in agent workflows that we don't want them cluttering the
+# fallthrough log. Detected pre-parse since the loop grammar (do/done,
+# newlines, `;`) doesn't fit the pipeline parser.
+LOOP_RE = re.compile(
+    r"\b(for|while|until)\b[^\n]*\bdo\b",
+    re.DOTALL,
+)
 
 
 # --- Local exec wrapper rules ----------------------------------------------
@@ -519,13 +698,20 @@ def main() -> int:
 
     _load_local_rules()
 
+    # Shell loops (`for/while/until ... do ... done`) are manual-only but
+    # common enough that we suppress their logging. This check runs before
+    # the parser because the loop grammar doesn't fit the pipeline model.
+    if LOOP_RE.search(cmd):
+        print("NOLOG shell loop")
+        return 0
+
     try:
-        pipeline = parse(cmd)
+        pipelines = parse(cmd)
     except ParseError:
         # Fall through to manual review.
         return 0
 
-    decision = classify(pipeline)
+    decision = classify_toplevel(pipelines)
     if isinstance(decision, Allow):
         print(f"ALLOW {decision.reason}")
     elif isinstance(decision, NoLog):
