@@ -2302,7 +2302,7 @@ pub struct PatchCopy {
 /// Register a CPU-scheduled staging→material-pool patch pass into `graph`.
 ///
 /// For each `PatchCopy` in `copies`, records a 64-byte occupancy copy
-/// from `staging_occ_ring[frame][staging_request_idx]` into
+/// from `staging_occ_ring[staging_frame][staging_request_idx]` into
 /// `material_pool_buf[dst_material_slot]`. The copy set is produced by
 /// the CPU retirement logic that walked a previously-completed prep
 /// dispatch's [`DirtyReport`](crate::subchunk::DirtyReport) and made the
@@ -2316,20 +2316,19 @@ pub struct PatchCopy {
 /// A call with an empty `copies` is a no-op and records nothing —
 /// callers do not need to guard at the call site.
 ///
-/// `frame` is the current [`FrameIndex`] as of the graph build in which
-/// this patch is recorded. The staging-ring slot it selects is identical
-/// to the one that prep wrote when its dirty list was dispatched, by the
-/// FIF rotation invariant: prep at frame F wrote slot `F % N`; patch runs
-/// at frame `F + N`, and `(F + N) % N == F % N`. Passing a stale or
-/// invented frame index is therefore unnecessary — callers supply the
-/// current frame, which the ring maps to the same underlying buffer.
-/// See `knowledge-fif-swapchain-depth-decoupling` and
-/// `failure-staging-not-ringed-after-gid-x-reindexing`.
+/// `staging_frame` is the [`FrameIndex`] at which the retiring prep was
+/// dispatched — it selects the staging-ring slot the prep shader wrote.
+/// Callers must pass the dispatch frame, not the current frame: retirement
+/// fires via `map_async` + non-blocking `device.poll`, which may deliver
+/// the callback at `F_dispatch + N + k` (k ≥ 1) when the GPU lags, which
+/// would index a different ring slot than was written. See
+/// `failure-staging-not-ringed-after-gid-x-reindexing` and
+/// `failure-fif-rotation-invariant-bogus`.
 pub fn subchunk_patch(
-    graph    : &mut RenderGraph,
-    renderer : &Arc<WorldRenderer>,
-    copies   : &[PatchCopy],
-    frame    : FrameIndex,
+    graph         : &mut RenderGraph,
+    renderer      : &Arc<WorldRenderer>,
+    copies        : &[PatchCopy],
+    staging_frame : FrameIndex,
 )
 {
     if copies.is_empty() {
@@ -2337,7 +2336,7 @@ pub fn subchunk_patch(
     }
 
     let staging_occ_h   = graph.import_buffer(
-        renderer.staging_occ_ring().current(frame).clone(),
+        renderer.staging_occ_ring().current(staging_frame).clone(),
     );
     let material_pool_h = graph.import_buffer(renderer.material_pool_buf().clone());
 
@@ -2394,7 +2393,7 @@ pub struct MaterialPatchCopy {
 ///
 /// For each [`MaterialPatchCopy`], records a 1 KB
 /// [`MATERIAL_BLOCK_BYTES`](MATERIAL_BLOCK_BYTES) copy from
-/// `staging_material_ids_ring[frame][staging_request_idx]` into
+/// `staging_material_ids_ring[staging_frame][staging_request_idx]` into
 /// the appropriate segment buffer at
 /// `(dst_global_slot % SLOTS_PER_SEGMENT) * 1024`. The destination
 /// segment is resolved from `dst_global_slot / SLOTS_PER_SEGMENT` and
@@ -2402,14 +2401,14 @@ pub struct MaterialPatchCopy {
 ///
 /// An empty `copies` slice is a no-op.
 ///
-/// `frame` is the current [`FrameIndex`]. Ring-slot semantics identical to
-/// [`subchunk_patch`]: `current(frame) == current(dispatch_frame)` by the
-/// FIF rotation invariant — see that function's docs for the derivation.
+/// `staging_frame` selects the staging-ring slot; same semantics as
+/// [`subchunk_patch`]'s parameter — pass the dispatch frame of the
+/// retiring prep, not the current frame.
 pub fn subchunk_material_patch(
-    graph    : &mut RenderGraph,
-    renderer : &Arc<WorldRenderer>,
-    copies   : &[MaterialPatchCopy],
-    frame    : FrameIndex,
+    graph         : &mut RenderGraph,
+    renderer      : &Arc<WorldRenderer>,
+    copies        : &[MaterialPatchCopy],
+    staging_frame : FrameIndex,
 )
 {
     if copies.is_empty() {
@@ -2417,7 +2416,7 @@ pub fn subchunk_material_patch(
     }
 
     let staging_mat_ids_h = graph.import_buffer(
-        renderer.staging_material_ids_ring().current(frame).clone(),
+        renderer.staging_material_ids_ring().current(staging_frame).clone(),
     );
 
     // Import every live segment buffer. The pass issues per-copy

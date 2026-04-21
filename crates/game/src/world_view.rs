@@ -890,22 +890,24 @@ impl WorldView {
             // Record the patch pass. An empty `copies` is a no-op inside
             // `subchunk_patch`, so we don't guard here.
             //
-            // `frame` (the current frame) selects the staging-ring slot.
-            // This is correct by the FIF rotation invariant: prep at
-            // `ready_frame` wrote slot `ready_frame % N`; patch runs at
-            // frame `ready_frame + N`, so the current frame's slot index
-            // is `(ready_frame + N) % N == ready_frame % N` — the same
-            // underlying buffer. See `subchunk_patch` docs.
-            nodes::subchunk_patch(graph, &self.renderer, &copies, frame);
+            // The staging-ring slot is indexed by `ready_frame` (the
+            // dispatch frame of the retiring prep, as enforced by the
+            // `batch.frame == ready_frame` assertion above). The current
+            // frame would be wrong: retirement uses `map_async` +
+            // non-blocking `device.poll`, so the callback can fire at
+            // `F_dispatch + N + k` (k ≥ 1) when the GPU lags, which
+            // would index a different ring slot than the prep wrote. See
+            // `failure-fif-rotation-invariant-bogus`.
+            nodes::subchunk_patch(graph, &self.renderer, &copies, ready_frame);
 
             // Material-id patch pass. Parallel to the occupancy patch:
             // reads the same `staging_material_ids_ring` slot the prep
-            // shader wrote. Same FIF-rotation invariant as above.
+            // shader wrote, indexed by the same dispatch frame.
             nodes::subchunk_material_patch(
                 graph,
                 &self.renderer,
                 &material_patches,
-                frame,
+                ready_frame,
             );
 
             // Every retired full-prep dirty entry represents a real
@@ -976,22 +978,23 @@ impl WorldView {
         self.evicted_last_update = evictions.len();
         self.evicted_total       = self.evicted_total.saturating_add(evictions.len() as u64);
 
-        // Free CPU-side material resources for each evicted coord.
+        // Free CPU-side material resources for each evicted coord, and
+        // clear the directory entry so the torus-collision guard in the
+        // prep-dispatch loop below does not see a stale `is_resident`
+        // bit and re-free the same allocator slot (double-free panic).
         //
         // `is_resident` gates the allocator release: a coord that rolled
         // out before its prep ever retired has a non-resident directory
-        // entry with no material slot to release. The directory entry is
-        // intentionally NOT updated here — the prep dispatch in step 4
-        // (same `update()` call, same frame) unconditionally writes
-        // `DirEntry::empty(req.coord)` to every slot that was evicted,
-        // stamping the new canonical owner. Between eviction-free and
-        // prep-dispatch the slot briefly holds the evicted coord's data;
-        // this is safe because no CPU or GPU reads occur in that window.
-        // The 1:1 eviction ↔ new-request correspondence is guaranteed by
-        // the toroidal shell geometry: `Shell::recenter` produces
-        // `added.len() == removed.len()` and each removed coord C_old maps
-        // to the same slot as the corresponding added coord C_new via
-        // `rem_euclid(pool_dims)`.
+        // entry with no material slot to release.
+        //
+        // The directory entry is stamped with `DirEntry::empty(evict.coord)`
+        // — the evicted coord, not the incoming one. The paired prep
+        // dispatch in step 4 will rewrite it with `empty(req.coord)` before
+        // any GPU flush, but leaving a coord-matched non-resident marker
+        // here keeps the directory consistent and preserves the
+        // coord-stamping invariant
+        // (`convention-no-coord-sentinels-in-direntry`).
+        // See `failure-eviction-skipping-directory-write-double-frees-material-slot`.
         for evict in &evictions {
             let Some(level_idx) = self.level_index(evict.level) else {
                 debug_assert!(false, "eviction for unknown level {:?}", evict.level);
@@ -1021,6 +1024,9 @@ impl WorldView {
             if existing.material_data_slot != MATERIAL_DATA_SLOT_INVALID {
                 self.material_data_pool.free(existing.material_data_slot);
             }
+            self.directory.set(directory_index, DirEntry::empty([
+                evict.coord.x, evict.coord.y, evict.coord.z,
+            ]));
 
             #[cfg(feature = "debug-state-history")]
             if let Some(b) = self.state_history.builder_mut() {
