@@ -2316,7 +2316,7 @@ pub(crate) fn apply_dirty_entries_traced(
                 de = de.with_material_data_slot(new_mds);
                 de
             }
-            None => DirEntry::empty(),
+            None => DirEntry::empty_at(coord),
         };
         directory.set(e.directory_index, new_entry);
 
@@ -2423,6 +2423,13 @@ mod tests {
         assert!(copies.is_empty(), "uniform-empty must not allocate a material slot");
         let e = dir.get(2);
         assert!(!e.is_resident(), "uniform-empty must clear the resident bit");
+        // Coord stamp is load-bearing: secondary-ray DDAs (shadow, GI) use
+        // `resolve_and_verify` to distinguish "ray exited this level's
+        // shell" (coord mismatch → promote) from "sub-chunk confirmed
+        // empty" (coord matches, resident clear → advance at this level).
+        // A bare `DirEntry::empty()` with coord=(0,0,0) produced phantom
+        // shadow hits via promotion into L_{n+1}'s OR-reduced occupancy.
+        assert_eq!(e.coord, [1, 2, 3], "uniform-empty must stamp the retired coord");
         assert_eq!(alloc.active(), 0, "no material slot allocated");
     }
 
@@ -2631,12 +2638,18 @@ mod tests {
         let mut mpool = fresh_mpool();
         let _ = dir.drain_dirty().count();
 
-        let inputs = vec![retire(2, 0, 0, false, [0, 0, 0])];
+        let inputs = vec![retire(2, 0, 0, false, [-4, 7, -1])];
         let copies = apply_dirty_entries(&inputs, &mut dir, &mut alloc, &mut mpool);
 
         assert!(copies.is_empty(), "uniform-empty must not allocate a material slot");
         let e = dir.get(2);
-        assert!(!e.is_resident(), "uniform-empty retires as DirEntry::empty()");
+        assert!(!e.is_resident(), "uniform-empty retires with resident bit clear");
+        assert_eq!(
+            e.coord, [-4, 7, -1],
+            "uniform-empty must stamp the retired coord so secondary-ray \
+             `resolve_and_verify` advances at this level rather than \
+             promoting into L_{{n+1}} OR-reduced occupancy",
+        );
         assert_eq!(alloc.active(), 0);
     }
 

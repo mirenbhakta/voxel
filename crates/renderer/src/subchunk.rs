@@ -700,6 +700,25 @@ impl DirEntry {
         }
     }
 
+    /// Coord-stamped empty entry: same cleared bits as [`DirEntry::empty`],
+    /// but `coord` matches the retired sub-chunk's world coord. Use at
+    /// retirement of a uniformly-empty prep result so secondary-ray DDAs
+    /// can distinguish "coord confirmed empty" (coord matches, resident
+    /// clear → advance at the current level) from "ray exited this level's
+    /// shell" (coord mismatch → promote to coarser LOD). Using bare
+    /// [`DirEntry::empty`] conflates the two and causes shadow / GI rays
+    /// to promote into OR-reduced occupancy that lights up false occluders
+    /// at coarser granularity.
+    pub const fn empty_at(coord: [i32; 3]) -> Self {
+        Self {
+            coord,
+            bits:               0,
+            content_version:    0,
+            last_synth_version: 0,
+            material_data_slot: MATERIAL_DATA_SLOT_INVALID,
+        }
+    }
+
     /// Explicit non-resident entry: `resident` bit clear, `material_slot`
     /// set to [`MATERIAL_SLOT_INVALID`], and `material_data_slot` set to
     /// [`MATERIAL_DATA_SLOT_INVALID`]. Use when the caller wants the
@@ -2366,6 +2385,17 @@ mod tests {
         assert_eq!(e.material_slot(), 0);
         assert_eq!(e.content_version,    0);
         assert_eq!(e.last_synth_version, 0);
+    }
+
+    #[test]
+    fn dir_entry_empty_at_stamps_coord_with_cleared_bits() {
+        let e = DirEntry::empty_at([-7, 3, -12]);
+        assert_eq!(e.coord, [-7, 3, -12]);
+        assert_eq!(e.bits,  0);
+        assert!(!e.is_resident());
+        assert_eq!(e.exposure(),      0);
+        assert_eq!(e.material_slot(), 0);
+        assert_eq!(e.material_data_slot, MATERIAL_DATA_SLOT_INVALID);
     }
 
     #[test]
