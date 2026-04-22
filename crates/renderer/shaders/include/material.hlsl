@@ -21,18 +21,12 @@
 #ifndef RENDERER_MATERIAL_HLSL
 #define RENDERER_MATERIAL_HLSL
 
-// -----------------------------------------------------------------------
-// Capacity constants — must stay in lockstep with their Rust-side pairs:
-//
-//   MATERIAL_DESC_CAPACITY            → crates/renderer/src/subchunk.rs
-//   SLOTS_PER_SEGMENT                 → crates/game/src/world/material_data_pool.rs
-//   MAX_MATERIAL_POOL_SEGMENTS        → crates/renderer/src/subchunk.rs
-//   MATERIAL_DATA_SLOT_INVALID        → crates/renderer/src/subchunk.rs
-// -----------------------------------------------------------------------
-#define MATERIAL_DESC_CAPACITY       256u
-#define SLOTS_PER_SEGMENT            65536u
-#define MAX_MATERIAL_POOL_SEGMENTS   16u
-#define MATERIAL_DATA_SLOT_INVALID   0xFFFFFFFFu
+// Capacity constants (MATERIAL_DESC_CAPACITY, SLOTS_PER_SEGMENT,
+// MAX_MATERIAL_POOL_SEGMENTS, MATERIAL_DATA_SLOT_INVALID) are authored in
+// Rust (`crates/renderer/src/subchunk.rs`) and emitted to this header by
+// `crates/renderer/build.rs`. The DXC invocation adds `${OUT_DIR}/shaders`
+// to its include path so the unqualified include resolves.
+#include "gpu_constants.hlsl"
 
 // -----------------------------------------------------------------------
 // MaterialDesc — 32-byte global descriptor table entry.

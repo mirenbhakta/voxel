@@ -153,6 +153,13 @@ pub const MAX_MATERIAL_POOL_SEGMENTS: u32 = 16;
 /// per u16 ID = 1 KiB. Byte-identical to HLSL `MaterialBlock`.
 pub const MATERIAL_BLOCK_BYTES: u64 = 1024;
 
+// Drift guard for the four constants that `build.rs` emits into
+// `shaders/gpu_constants.hlsl`. If any Rust value above disagrees with the
+// value baked into the HLSL header, this file fails to compile with an
+// assert message that points at the offending constant. See `build.rs ::
+// GPU_CONSTANTS` for the emitted table.
+include!(concat!(env!("OUT_DIR"), "/gpu_constants_assert.rs"));
+
 /// Byte size of one 64 MB material-data pool segment =
 /// `MATERIAL_POOL_SLOTS_PER_SEGMENT × MATERIAL_BLOCK_BYTES`.
 pub const MATERIAL_SEGMENT_BYTES: u64 =
