@@ -89,11 +89,14 @@ if [ "$EVENT" = "PostToolUse" ]; then
         exit 0
     fi
 
-    # Collect changes back into the spawning worktree.
-    COLLECT_OUTPUT=$(cd "$CWD" && bash "$WORKTREE_SCRIPT" collect "$NAME" 2>&1) || true
-
-    # Clean up the worktree.
-    (cd "$CWD" && bash "$WORKTREE_SCRIPT" cleanup "$NAME" 2>/dev/null) || true
+    # Collect changes back into the spawning worktree. Clean up ONLY on
+    # clean success — conflicts or errors leave the worktree and baseline
+    # in place so nothing is silently destroyed.
+    if COLLECT_OUTPUT=$(cd "$CWD" && bash "$WORKTREE_SCRIPT" collect "$NAME" 2>&1); then
+        (cd "$CWD" && bash "$WORKTREE_SCRIPT" cleanup "$NAME" 2>/dev/null) || true
+    else
+        echo "agent-isolate: collect failed or reported conflicts — worktree preserved at $WORKTREE_DIR" >&2
+    fi
 
     # Log what was collected (visible in hook output if needed).
     if [ -n "$COLLECT_OUTPUT" ]; then

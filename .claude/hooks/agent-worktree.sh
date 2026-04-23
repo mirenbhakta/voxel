@@ -10,7 +10,11 @@
 # The spawning worktree's uncommitted state is copied into the agent
 # worktree. A baseline snapshot of the modified files is saved so that
 # after the agent runs, we can diff against it to extract exactly the
-# agent's changes — no commits needed.
+# agent's changes — no commits needed. For files that were clean at
+# create time, the baseline is recovered at collect time from the base
+# commit via `git show $BASE_SHA:$file`, so the fallback does not depend
+# on the spawning worktree's current state (which other agents or the
+# main session may have changed concurrently).
 
 set -euo pipefail
 
@@ -51,24 +55,35 @@ do_create() {
         cp "$REPO_ROOT/.claude/settings.local.json" "$AGENT_DIR/.claude/settings.local.json"
     fi
 
+    mkdir -p "$BASELINE_DIR"
+
+    # Record the base commit SHA. Collect uses this to recover the
+    # baseline for files that were clean at create time.
+    git -C "$REPO_ROOT" rev-parse HEAD > "$BASELINE_DIR/.base-sha"
+
     # --- Copy uncommitted state from spawning worktree ---
 
-    # Staged + unstaged changes.
+    # Staged + unstaged changes. Prefer strict apply; fall back to
+    # --3way (which can merge around small offsets by consulting the
+    # blob objects). Loudly report any failure so a silent partial
+    # state cannot mask missing work.
     diff_output="$(git diff HEAD)" || true
     if [ -n "$diff_output" ]; then
-        echo "$diff_output" | (cd "$AGENT_DIR" && git apply --allow-empty 2>/dev/null) || {
-            echo "warning: some hunks failed to apply, continuing" >&2
-        }
+        if ! echo "$diff_output" | (cd "$AGENT_DIR" && git apply --allow-empty 2>/dev/null); then
+            if ! echo "$diff_output" | (cd "$AGENT_DIR" && git apply --allow-empty --3way >&2); then
+                echo "error: could not apply spawning tree's uncommitted diff; agent runs on HEAD only" >&2
+            else
+                echo "warning: spawning diff applied via --3way; worktree may contain conflict markers" >&2
+            fi
+        fi
     fi
 
     # Untracked files (excluding the worktrees directory itself).
-    git ls-files --others --exclude-standard -z | \
-        grep -zv '^\.claude/worktrees/' | \
-        while IFS= read -r -d '' file; do
-            dir="$(dirname "$file")"
-            mkdir -p "$AGENT_DIR/$dir"
-            cp "$file" "$AGENT_DIR/$file"
-        done
+    while IFS= read -r -d '' file; do
+        dir="$(dirname "$file")"
+        mkdir -p "$AGENT_DIR/$dir"
+        cp "$file" "$AGENT_DIR/$file"
+    done < <(git ls-files --others --exclude-standard -z | grep -zv '^\.claude/worktrees/' || true)
 
     # --- Snapshot baseline for diffing later ---
     #
@@ -76,28 +91,31 @@ do_create() {
     # After the agent runs, `git diff --no-index baseline/ worktree/`
     # gives us exactly the agent's changes.
 
-    mkdir -p "$BASELINE_DIR"
-
     # Modified/added tracked files.
-    (cd "$AGENT_DIR" && git diff --name-only HEAD) | while read -r file; do
+    while read -r file; do
         if [ -f "$AGENT_DIR/$file" ]; then
             dir="$(dirname "$file")"
             mkdir -p "$BASELINE_DIR/$dir"
             cp "$AGENT_DIR/$file" "$BASELINE_DIR/$file"
         fi
-    done
+    done < <(cd "$AGENT_DIR" && git diff --name-only HEAD)
 
     # Untracked files.
-    (cd "$AGENT_DIR" && git ls-files --others --exclude-standard) | while read -r file; do
+    while read -r file; do
         if [ -f "$AGENT_DIR/$file" ]; then
             dir="$(dirname "$file")"
             mkdir -p "$BASELINE_DIR/$dir"
             cp "$AGENT_DIR/$file" "$BASELINE_DIR/$file"
         fi
-    done
+    done < <(cd "$AGENT_DIR" && git ls-files --others --exclude-standard)
 
-    # Also save the list of all files at baseline for deletion detection.
-    (cd "$AGENT_DIR" && git ls-files && git ls-files --others --exclude-standard) | \
+    # Save the list of all files at baseline for deletion detection.
+    # Filter by filesystem existence — `git ls-files` alone reports files
+    # still in the index even if deleted from the working tree, which would
+    # suppress deletion detection at collect time.
+    while IFS= read -r file; do
+        [ -n "$file" ] && [ -e "$AGENT_DIR/$file" ] && printf '%s\n' "$file"
+    done < <(cd "$AGENT_DIR" && git ls-files && git ls-files --others --exclude-standard) | \
         sort -u > "$BASELINE_DIR/.filelist"
 
     echo "$AGENT_DIR"
@@ -113,91 +131,165 @@ do_collect() {
     fi
 
     local had_conflicts=0
+    local had_errors=0
+    local file dir
 
-    # --- Find files the agent modified ---
-    #
-    # For files that exist in the baseline, use git diff --no-index
-    # to get a proper patch. For new files (not in baseline), copy
-    # directly. For deleted files, remove from spawning worktree.
+    # Load the base commit SHA for clean-at-baseline file lookups.
+    local base_sha=""
+    if [ -f "$BASELINE_DIR/.base-sha" ]; then
+        base_sha="$(cat "$BASELINE_DIR/.base-sha")"
+    fi
 
-    # Collect the set of files currently in the agent worktree.
-    (cd "$AGENT_DIR" && git ls-files && git ls-files --others --exclude-standard) | \
+    # Produce the baseline content for $file into $out_path. Returns 0
+    # on success, 1 if no baseline is available (e.g., agent-created file).
+    get_baseline() {
+        local _file="$1"
+        local _out="$2"
+        if [ -f "$BASELINE_DIR/$_file" ]; then
+            cp "$BASELINE_DIR/$_file" "$_out"
+            return 0
+        fi
+        if [ -n "$base_sha" ]; then
+            if git -C "$REPO_ROOT" show "$base_sha:$_file" > "$_out" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        return 1
+    }
+
+    local tmp_base tmp_ours
+    tmp_base="$(mktemp)"
+    tmp_ours="$(mktemp)"
+
+    # Collect the set of files currently present in the agent worktree.
+    # Filter by filesystem existence so that files deleted from the
+    # working tree (but still listed by git ls-files via the index)
+    # correctly fall out of the final set and are detected as deletions.
+    while IFS= read -r file; do
+        [ -n "$file" ] && [ -e "$AGENT_DIR/$file" ] && printf '%s\n' "$file"
+    done < <(cd "$AGENT_DIR" && git ls-files && git ls-files --others --exclude-standard) | \
         sort -u > "$BASELINE_DIR/.filelist-final"
 
-    # Files deleted by the agent (in baseline but not in final).
-    { grep -Fxv -f "$BASELINE_DIR/.filelist-final" "$BASELINE_DIR/.filelist" || true; } | while read -r file; do
-        if [ -f "$REPO_ROOT/$file" ]; then
-            rm "$REPO_ROOT/$file"
+    # --- Deletions (in baseline but not in final) ---
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        [ -f "$REPO_ROOT/$file" ] || continue
+
+        # If the spawner has modified the file since baseline while the
+        # agent deleted it, don't silently drop the spawner's work.
+        if get_baseline "$file" "$tmp_base" && ! cmp -s "$tmp_base" "$REPO_ROOT/$file"; then
+            echo "C  $file (agent deleted, spawner modified — keeping spawner version)" >&2
+            had_conflicts=1
+            continue
+        fi
+
+        if rm "$REPO_ROOT/$file" 2>/dev/null; then
             echo "D  $file"
+        else
+            echo "error: failed to delete $file" >&2
+            had_errors=1
         fi
-    done
+    done < <(grep -Fxv -f "$BASELINE_DIR/.filelist-final" "$BASELINE_DIR/.filelist" 2>/dev/null || true)
 
-    # Files created by the agent (in final but not in baseline).
-    { grep -Fxv -f "$BASELINE_DIR/.filelist" "$BASELINE_DIR/.filelist-final" || true; } | while read -r file; do
-        if [ -f "$AGENT_DIR/$file" ]; then
-            dir="$(dirname "$file")"
-            mkdir -p "$REPO_ROOT/$dir"
-            cp "$AGENT_DIR/$file" "$REPO_ROOT/$file"
-            echo "A  $file"
-        fi
-    done
-
-    # Files that existed in both — check for modifications.
-    { grep -Fx -f "$BASELINE_DIR/.filelist" "$BASELINE_DIR/.filelist-final" || true; } | while read -r file; do
+    # --- Creations (in final but not in baseline) ---
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
         [ -f "$AGENT_DIR/$file" ] || continue
 
-        # Determine the baseline version of this file. Files that were
-        # modified from HEAD at baseline time have a copy in the baseline
-        # dir. Files that were clean at baseline time don't — use the
-        # spawning worktree's copy as the reference (it had the same
-        # content at creation time).
-        if [ -f "$BASELINE_DIR/$file" ]; then
-            baseline_file="$BASELINE_DIR/$file"
-        elif [ -f "$REPO_ROOT/$file" ]; then
-            baseline_file="$REPO_ROOT/$file"
+        # If the spawner also created this file (e.g., a concurrent agent),
+        # don't overwrite — flag as a conflict unless contents match.
+        if [ -f "$REPO_ROOT/$file" ]; then
+            if cmp -s "$AGENT_DIR/$file" "$REPO_ROOT/$file"; then
+                continue
+            fi
+            echo "C  $file (created in both agent and spawner)" >&2
+            had_conflicts=1
+            continue
+        fi
+
+        dir="$(dirname "$file")"
+        if mkdir -p "$REPO_ROOT/$dir" && cp "$AGENT_DIR/$file" "$REPO_ROOT/$file"; then
+            echo "A  $file"
         else
+            echo "error: failed to create $file" >&2
+            had_errors=1
+        fi
+    done < <(grep -Fxv -f "$BASELINE_DIR/.filelist" "$BASELINE_DIR/.filelist-final" 2>/dev/null || true)
+
+    # --- Intersection — files present in both baseline and final ---
+    while IFS= read -r file; do
+        [ -z "$file" ] && continue
+        [ -f "$AGENT_DIR/$file" ] || continue
+
+        if ! get_baseline "$file" "$tmp_base"; then
+            # No baseline available. Only propagate if the agent's version
+            # genuinely differs from what's currently in the repo.
+            if [ -f "$REPO_ROOT/$file" ] && ! cmp -s "$AGENT_DIR/$file" "$REPO_ROOT/$file"; then
+                if cp "$AGENT_DIR/$file" "$REPO_ROOT/$file"; then
+                    echo "M  $file (no baseline)"
+                else
+                    echo "error: failed to copy $file" >&2
+                    had_errors=1
+                fi
+            fi
             continue
         fi
 
-        # Skip if unchanged from baseline.
-        if cmp -s "$baseline_file" "$AGENT_DIR/$file"; then
+        # Agent didn't touch this file — nothing to do.
+        if cmp -s "$tmp_base" "$AGENT_DIR/$file"; then
             continue
         fi
 
-        # Check if the spawning worktree also changed this file since
-        # we created the baseline (another agent merged changes).
-        if [ -f "$REPO_ROOT/$file" ] && ! cmp -s "$baseline_file" "$REPO_ROOT/$file"; then
-            # Both sides changed. Attempt 3-way merge.
-            # git merge-file modifies the first file in place.
-            # Args: ours base theirs — writes result into ours.
-            cp "$REPO_ROOT/$file" "$REPO_ROOT/$file.ours"
-            cp "$baseline_file" "$REPO_ROOT/$file.base"
-            if git merge-file \
-                "$REPO_ROOT/$file.ours" \
-                "$REPO_ROOT/$file.base" \
-                "$AGENT_DIR/$file" 2>/dev/null
-            then
-                mv "$REPO_ROOT/$file.ours" "$REPO_ROOT/$file"
-                rm -f "$REPO_ROOT/$file.base"
-                echo "M  $file (merged)"
+        if [ -f "$REPO_ROOT/$file" ] && ! cmp -s "$tmp_base" "$REPO_ROOT/$file"; then
+            # Both agent and repo diverged from baseline — 3-way merge.
+            if ! cp "$REPO_ROOT/$file" "$tmp_ours"; then
+                echo "error: failed to stage $file for merge" >&2
+                had_errors=1
+                continue
+            fi
+            if git merge-file "$tmp_ours" "$tmp_base" "$AGENT_DIR/$file" 2>/dev/null; then
+                if cp "$tmp_ours" "$REPO_ROOT/$file"; then
+                    echo "M  $file (merged)"
+                else
+                    echo "error: failed to write merged $file" >&2
+                    had_errors=1
+                fi
             else
-                mv "$REPO_ROOT/$file.ours" "$REPO_ROOT/$file"
-                rm -f "$REPO_ROOT/$file.base"
-                echo "C  $file (conflicts — resolve manually)"
-                had_conflicts=1
+                # git merge-file returns >0 when conflicts remain; $tmp_ours
+                # now contains the file with conflict markers. Write it so
+                # the user can resolve in place.
+                if cp "$tmp_ours" "$REPO_ROOT/$file"; then
+                    echo "C  $file (conflicts — resolve manually)"
+                    had_conflicts=1
+                else
+                    echo "error: failed to write conflicted $file" >&2
+                    had_errors=1
+                fi
             fi
         else
-            # Only the agent changed it. Direct copy.
-            cp "$AGENT_DIR/$file" "$REPO_ROOT/$file"
-            echo "M  $file"
+            # Only the agent changed it relative to baseline. Direct copy.
+            if cp "$AGENT_DIR/$file" "$REPO_ROOT/$file"; then
+                echo "M  $file"
+            else
+                echo "error: failed to copy $file" >&2
+                had_errors=1
+            fi
         fi
-    done
+    done < <(grep -Fx -f "$BASELINE_DIR/.filelist" "$BASELINE_DIR/.filelist-final" 2>/dev/null || true)
+
+    rm -f "$tmp_base" "$tmp_ours"
 
     if [ "$had_conflicts" -ne 0 ]; then
-        echo ""
-        echo "Some files have merge conflicts. Resolve them before continuing."
+        echo "" >&2
+        echo "Some files have merge conflicts. Resolve them before continuing." >&2
+    fi
+    if [ "$had_errors" -ne 0 ]; then
+        echo "Some operations failed during collect; worktree preserved for inspection." >&2
+    fi
+    if [ "$had_conflicts" -ne 0 ] || [ "$had_errors" -ne 0 ]; then
         return 1
     fi
+    return 0
 }
 
 # -----------------------------------------------------------------------
